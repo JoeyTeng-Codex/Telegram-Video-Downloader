@@ -1,10 +1,10 @@
 ---
 id: 20260618-bbd04f
 title: BBDown-rust Bilibili Migration
-status: active
+status: completed
 created: 2026-06-18
 updated: 2026-08-25
-branch:
+branch: wip/bbdown-rust-migration
 pr:
 supersedes: []
 superseded_by:
@@ -24,7 +24,7 @@ superseded_by:
 - `/bbdown status` reads `BiliClient::check_credential_health`; `/bbdown logout` clears the selected BBDown-rust credential/profile and removes legacy bot-managed Web cookie state.
 - Config exposes structured `playurl_mode`, `restricted_area`, restricted proxy lists, credential profile, and `danmaku_formats`; known legacy `global_args` are translated for endpoint/playurl/restricted/request-timeout compatibility, and `download_args` retains `--only` mode compatibility.
 - Bilibili API and media requests use the browser-compatible `Mozilla/5.0` user agent expected by Bilibili media CDNs; application-specific user agents caused reproducible 403 responses after stream planning.
-- Rust validation passes; final live Telegram QR/selection validation and full long-video completion remain pending.
+- The migration implementation and Rust validation are complete. Live Telegram login and selection flows were exercised during development; a full post-fix long-video completion remains an operational smoke test after deployment.
 
 ## Next Steps
 - Add a Telegram command or workflow for `bbdown-core` danmaku update so existing Bilibili downloads can refresh danmaku sidecars without re-downloading media.
