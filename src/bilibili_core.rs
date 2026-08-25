@@ -14,6 +14,7 @@ use crate::config::AppConfig;
 use crate::router::BilibiliSelection;
 
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
+const BILIBILI_BROWSER_USER_AGENT: &str = "Mozilla/5.0";
 const DEFAULT_ACCESS_KEY_AUTH_BASE: &str = "https://www.biliplus.com";
 const DEFAULT_ACCESS_KEY_CALLBACK_ORIGIN: &str = "https://www.bilibili.com";
 const BALH_LOGIN_CREDENTIALS_PREFIX: &str = "balh-login-credentials:";
@@ -177,7 +178,7 @@ fn client_config(config: &AppConfig, credentials: Credentials) -> Result<ClientC
     Ok(ClientConfig::new(endpoint_config(config)?, credentials)
         .with_restricted_area(restricted_area_config(config)?)
         .with_playurl_mode(playurl_mode(config)?)
-        .with_user_agent("telegram-video-downloader/0.1 bbdown-core")
+        .with_user_agent(BILIBILI_BROWSER_USER_AGENT)
         .with_request_timeout(request_timeout(config)?))
 }
 
@@ -623,5 +624,13 @@ mod tests {
             restricted_area_config(&config).unwrap().area_hint,
             Some(RestrictedArea::Th)
         );
+    }
+
+    #[test]
+    fn uses_browser_user_agent_for_bilibili_media_requests() {
+        let config = crate::config::AppConfig::for_test();
+        let client_config = client_config(&config, Credentials::default()).unwrap();
+
+        assert_eq!(client_config.user_agent, BILIBILI_BROWSER_USER_AGENT);
     }
 }
