@@ -36,7 +36,7 @@ cp config.example.toml config.toml
 
 `video.subtitle_languages` 默认按中文、英文、日语优先。YouTube 会先找人工字幕；如果这些语言没有人工字幕，再使用自动字幕。`write_nfo = true` 会为视频生成同 basename 的 `.nfo`，`keep_sidecars = true` 会让 yt-dlp 保留 `.info.json`、`.description` 和封面 sidecar。
 
-重复视频检测会单次扫描视频文件名与同 basename sidecar，建立媒体 ID 索引后复用。YouTube 使用 URL 中的 video id；Bilibili 会先使用 URL 中的 `BV...` / `av...` / `ep...`，再通过 `bbdown-core` plan API 解析 bvid、aid、cid 和 epid，因此 `b23.tv` 短链和番剧条目也可以在下载前弹出重复选择。Bilibili 的 bvid/aid 可能同时对应多个分 P，只用于提示存在相关文件；只有单条下载计划的 cid/epid 唯一匹配一个现有文件时才允许覆盖。全集和歧义匹配不会显示覆盖按钮，服务端也会再次拒绝不安全的覆盖请求。检测失败时任务仍走 staging keep-both 移动，避免直接覆盖最终目录里的同名文件。
+重复视频检测会单次扫描视频文件名与同 basename sidecar，建立媒体 ID 索引后复用。YouTube 使用 URL 中的 video id；Bilibili 会先使用 URL 中的 `BV...` / `av...` / `ep...`，再通过 `bbdown-core` plan API 解析 bvid、aid、cid 和 epid，因此 `b23.tv` 短链和番剧条目也可以在下载前弹出重复选择。Bilibili 的 bvid/aid 可能同时对应多个分 P，只用于提示存在相关文件；只有单条下载计划的 cid/epid 唯一匹配一个现有文件时才允许覆盖。全集和歧义匹配不会显示覆盖按钮，服务端也会再次拒绝不安全的覆盖请求。真正备份旧文件前，bot 会重新建立严格身份索引，确认同一 provider 和条目 ID 仍唯一映射到原目标；目标缺失、metadata 不可读、身份变化或新增歧义都会拒绝覆盖。检测失败时任务仍走 staging keep-both 移动，避免直接覆盖最终目录里的同名文件。
 
 Bilibili 下载和登录不需要本机 `bbdown` 可执行文件；项目直接依赖 `BBDown-rust` 的 `bbdown-core` crate。`tools.ffmpeg` 仍会传给 crate 用于 mux，bot 负责 NFO、staging 和重复文件处理。
 
