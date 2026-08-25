@@ -76,6 +76,14 @@ struct PendingBilibiliAccessKeyLogin {
     auth_generation: u64,
     ticket: AccessKeyLoginTicket,
     created_at: Instant,
+    in_progress: bool,
+}
+
+#[derive(Debug, Clone)]
+enum PendingBilibiliAccessKeyLoginClaim {
+    Claimed(PendingBilibiliAccessKeyLogin),
+    InProgress,
+    Missing,
 }
 
 #[derive(Debug, Clone)]
@@ -609,6 +617,7 @@ async fn start_bbdown_access_key_login(
                 auth_generation,
                 ticket,
                 created_at: Instant::now(),
+                in_progress: false,
             },
         );
     }
@@ -648,13 +657,14 @@ async fn maybe_complete_pending_bilibili_access_key_login(
     if !bilibili_core::looks_like_access_key_login_input(text) {
         return false;
     }
-    let pending = {
+    let claim = {
         let mut logins = pending_bilibili_access_key_logins().lock().await;
-        prune_expired_pending_bilibili_access_key_logins(&mut logins, Instant::now());
-        logins.remove(&chat_id)
+        claim_pending_bilibili_access_key_login(&mut logins, chat_id, Instant::now())
     };
-    let Some(pending) = pending else {
-        return false;
+    let pending = match claim {
+        PendingBilibiliAccessKeyLoginClaim::Claimed(pending) => pending,
+        PendingBilibiliAccessKeyLoginClaim::InProgress => return true,
+        PendingBilibiliAccessKeyLoginClaim::Missing => return false,
     };
     let input = text.to_string();
     tokio::spawn(async move {
@@ -678,14 +688,26 @@ async fn complete_bbdown_access_key_login(
     .await;
     let result = complete_bbdown_access_key_login_inner(&config, &pending, &input).await;
     let message = match result {
-        Ok(summary) => format!(
-            "BBDown access-key login saved.\n{}",
-            format_bbdown_credential_summary(&summary)
-        ),
-        Err(err) => format!(
-            "BBDown access-key login failed:\n{}",
-            summarize_bbdown_auth_error(&err)
-        ),
+        Ok(summary) => {
+            clear_pending_bilibili_access_key_login(chat_id, pending.auth_generation).await;
+            format!(
+                "BBDown access-key login saved.\n{}",
+                format_bbdown_credential_summary(&summary)
+            )
+        }
+        Err(err) => {
+            let retryable =
+                release_pending_bilibili_access_key_login(chat_id, pending.auth_generation).await;
+            let retry_hint = if retryable {
+                "; send a corrected callback to retry"
+            } else {
+                ""
+            };
+            format!(
+                "BBDown access-key login failed{retry_hint}:\n{}",
+                summarize_bbdown_auth_error(&err)
+            )
+        }
     };
     send_or_log(&telegram, chat_id, message).await;
 }
@@ -928,6 +950,54 @@ fn credential_health_status_label(status: CredentialHealthStatus) -> &'static st
 fn pending_bilibili_access_key_logins()
 -> &'static Mutex<HashMap<i64, PendingBilibiliAccessKeyLogin>> {
     PENDING_BILIBILI_ACCESS_KEY_LOGINS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn claim_pending_bilibili_access_key_login(
+    logins: &mut HashMap<i64, PendingBilibiliAccessKeyLogin>,
+    chat_id: i64,
+    now: Instant,
+) -> PendingBilibiliAccessKeyLoginClaim {
+    prune_expired_pending_bilibili_access_key_logins(logins, now);
+    let Some(login) = logins.get_mut(&chat_id) else {
+        return PendingBilibiliAccessKeyLoginClaim::Missing;
+    };
+    if login.in_progress {
+        return PendingBilibiliAccessKeyLoginClaim::InProgress;
+    }
+    login.in_progress = true;
+    PendingBilibiliAccessKeyLoginClaim::Claimed(login.clone())
+}
+
+async fn release_pending_bilibili_access_key_login(chat_id: i64, auth_generation: u64) -> bool {
+    let mut logins = pending_bilibili_access_key_logins().lock().await;
+    let current_auth_generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+    release_claimed_bilibili_access_key_login(
+        &mut logins,
+        chat_id,
+        auth_generation,
+        current_auth_generation,
+        Instant::now(),
+    )
+}
+
+fn release_claimed_bilibili_access_key_login(
+    logins: &mut HashMap<i64, PendingBilibiliAccessKeyLogin>,
+    chat_id: i64,
+    auth_generation: u64,
+    current_auth_generation: u64,
+    now: Instant,
+) -> bool {
+    prune_expired_pending_bilibili_access_key_logins(logins, now);
+    if current_auth_generation != auth_generation {
+        return false;
+    }
+    if let Some(login) = logins.get_mut(&chat_id)
+        && login.auth_generation == auth_generation
+    {
+        login.in_progress = false;
+        return true;
+    }
+    false
 }
 
 async fn clear_pending_bilibili_access_key_login(chat_id: i64, auth_generation: u64) {
@@ -2081,6 +2151,80 @@ mod tests {
         assert!(message.contains("cookie=yes"));
         assert!(message.contains("access_key=no"));
         assert!(message.contains("tv_access_key (tv): valid code=0"));
+    }
+
+    #[test]
+    fn failed_access_key_callback_releases_same_ticket_for_retry() {
+        let chat_id = 123;
+        let auth_generation = 42;
+        let created_at = Instant::now();
+        let mut logins = HashMap::from([(
+            chat_id,
+            PendingBilibiliAccessKeyLogin {
+                auth_generation,
+                ticket: bilibili_core::create_access_key_ticket()
+                    .expect("access-key ticket should be created"),
+                created_at,
+                in_progress: false,
+            },
+        )]);
+
+        let first = match claim_pending_bilibili_access_key_login(&mut logins, chat_id, created_at)
+        {
+            PendingBilibiliAccessKeyLoginClaim::Claimed(pending) => pending,
+            claim => panic!("expected first claim, got {claim:?}"),
+        };
+        assert!(
+            bilibili_core::access_key_login_credentials(&first.ticket, r#"{"access_key":"#)
+                .is_err()
+        );
+        assert!(matches!(
+            claim_pending_bilibili_access_key_login(&mut logins, chat_id, created_at),
+            PendingBilibiliAccessKeyLoginClaim::InProgress
+        ));
+
+        assert!(release_claimed_bilibili_access_key_login(
+            &mut logins,
+            chat_id,
+            auth_generation,
+            auth_generation,
+            created_at,
+        ));
+        let second = match claim_pending_bilibili_access_key_login(&mut logins, chat_id, created_at)
+        {
+            PendingBilibiliAccessKeyLoginClaim::Claimed(pending) => pending,
+            claim => panic!("expected retry claim, got {claim:?}"),
+        };
+
+        assert_eq!(second.auth_generation, first.auth_generation);
+        assert_eq!(second.created_at, first.created_at);
+    }
+
+    #[test]
+    fn stale_access_key_callback_does_not_release_newer_generation() {
+        let chat_id = 123;
+        let auth_generation = 42;
+        let now = Instant::now();
+        let mut logins = HashMap::from([(
+            chat_id,
+            PendingBilibiliAccessKeyLogin {
+                auth_generation,
+                ticket: bilibili_core::create_access_key_ticket()
+                    .expect("access-key ticket should be created"),
+                created_at: now,
+                in_progress: true,
+            },
+        )]);
+
+        assert!(!release_claimed_bilibili_access_key_login(
+            &mut logins,
+            chat_id,
+            auth_generation,
+            auth_generation + 1,
+            now,
+        ));
+
+        assert!(logins[&chat_id].in_progress);
     }
 
     #[tokio::test]

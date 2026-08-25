@@ -26,7 +26,8 @@ keep_sidecars = true
 
 [bilibili]
 # Legacy CLI passthrough fields are kept for config compatibility.
-# Direct bbdown-core integration reads known global args and --only download modes only.
+# Direct bbdown-core integration reads supported global flags from extra_args, with
+# global_args and the structured fields below taking precedence for single values.
 extra_args = []
 global_args = []
 plan_args = []

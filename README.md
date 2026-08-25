@@ -40,7 +40,7 @@ cp config.example.toml config.toml
 
 Bilibili 下载和登录不需要本机 `bbdown` 可执行文件；项目直接依赖 `BBDown-rust` 的 `bbdown-core` crate。`tools.ffmpeg` 仍会传给 crate 用于 mux，bot 负责 NFO、staging 和重复文件处理。
 
-区域受限或 intl 番剧可以配置 `playurl_mode`、`restricted_area`、`restricted_area_proxies`、`restricted_api_proxies`。为兼容旧配置，`bilibili.global_args` 里的已知 BBDown-rust 全局项也会被 direct API 读取：endpoint base、`--playurl-mode`、`--restricted-area`、restricted proxy 和 `--request-timeout-seconds`。`bilibili.plan_args` 不再用于主路径；`bilibili.download_args` 仅保留 `--only audio|video|subtitle|danmaku|cover` 这类下载模式迁移。
+区域受限或 intl 番剧可以配置 `playurl_mode`、`restricted_area`、`restricted_area_proxies`、`restricted_api_proxies`。为兼容旧配置，`bilibili.extra_args` 和 `bilibili.global_args` 里的已知 BBDown-rust 全局项也会被 direct API 读取：endpoint base、`--playurl-mode`、`--restricted-area`、restricted proxy 和 `--request-timeout-seconds`。单值参数按 `extra_args`、`global_args`、结构化字段的顺序覆盖；restricted proxy 参数保持累加。`bilibili.plan_args` 不再用于主路径；`bilibili.download_args` 仅保留 `--only audio|video|subtitle|danmaku|cover` 这类下载模式迁移。
 
 `bilibili.danmaku.enabled = true` 时，bot 会让 `bbdown-core` 写出配置里的弹幕格式，默认是 `.xml` 和 `.ass` sidecar，并让它们跟随 staging、覆盖和两者并存流程移动。后续会接入 `bbdown-core` 的 danmaku update API，用于只更新已有视频的弹幕 sidecar；暂时不做 PGO/PGS 图形字幕预渲染。
 

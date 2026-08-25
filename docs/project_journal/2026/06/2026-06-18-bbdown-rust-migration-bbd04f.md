@@ -22,7 +22,8 @@ superseded_by:
 - Downloads use `BiliClient::download_plan_with_progress`; the bot converts the structured report into its existing NFO, staging, and duplicate-handling flow.
 - `/bbdown login [web|tv|access-key]` uses direct QR/access-key APIs; access-key login is a two-step Telegram flow that waits for the callback URL or `balh-login-credentials:` message.
 - `/bbdown status` reads `BiliClient::check_credential_health`; `/bbdown logout` clears the selected BBDown-rust credential/profile and removes legacy bot-managed Web cookie state.
-- Config exposes structured `playurl_mode`, `restricted_area`, restricted proxy lists, credential profile, and `danmaku_formats`; known legacy `global_args` are translated for endpoint/playurl/restricted/request-timeout compatibility, and `download_args` retains `--only` mode compatibility.
+- Config exposes structured `playurl_mode`, `restricted_area`, restricted proxy lists, credential profile, and `danmaku_formats`; known legacy flags in both `extra_args` and `global_args` are translated for endpoint/playurl/restricted/request-timeout compatibility, with new fields taking precedence, and `download_args` retains `--only` mode compatibility.
+- Access-key callback tickets remain reserved while an attempt is running, are removed only after credentials save successfully, and become retryable after a parse or save failure while the auth generation and TTL remain valid.
 - Bilibili API and media requests use the browser-compatible `Mozilla/5.0` user agent expected by Bilibili media CDNs; application-specific user agents caused reproducible 403 responses after stream planning.
 - The migration implementation and Rust validation are complete. Live Telegram login and selection flows were exercised during development; a full post-fix long-video completion remains an operational smoke test after deployment.
 
@@ -34,4 +35,5 @@ superseded_by:
 - Auth validation added on 2026-06-18: direct health formatting tests and Telegram secret redaction tests. Live Telegram/Bilibili QR E2E has not been run.
 - Internal review evidence: prior `codex-readonly` review found duplicate-overwrite and BBDown-rust legacy/output edge cases; those findings were fixed and covered by tests. Final readonly reruns timed out without a final artifact and were terminated/cleaned up.
 - 2026-08-25 403 diagnosis reproduced immediate media-request failures for `BV1XhM96FEM8` and `BV1xhBDBUEse` with the prior `telegram-video-downloader/0.1 bbdown-core` user agent. Short post-fix replays reached `video started` for both 1080p streams and stopped only at the intentional 15-second debug timeout.
-- 2026-08-25 validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` (194 passed).
+- 2026-08-25 pre-merge review identified ignored legacy global flags in `extra_args` and premature access-key ticket consumption. The compatibility mapping, precedence rules, failure retry state, and stale-generation behavior now have regression coverage.
+- 2026-08-25 validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (198 passed), `uv run ruff format --check`, `uv run ruff check`, and `uv run python -m unittest discover -s tests` (20 passed).

@@ -187,7 +187,7 @@ fn playurl_mode(config: &AppConfig) -> Result<PlayurlMode> {
         .bilibili
         .playurl_mode
         .as_deref()
-        .or_else(|| last_global_arg_value(config, "--playurl-mode").map(str::trim));
+        .or_else(|| last_bilibili_arg_value(config, "--playurl-mode").map(str::trim));
     Ok(match mode {
         Some("web") | None => PlayurlMode::Web,
         Some("tv") => PlayurlMode::Tv,
@@ -200,50 +200,50 @@ fn endpoint_config(config: &AppConfig) -> Result<EndpointConfig> {
     let default_endpoints = EndpointConfig::default();
     let mut endpoints = EndpointConfig::default()
         .with_api_base(
-            last_global_arg_value(config, "--api-base")
+            last_bilibili_arg_value(config, "--api-base")
                 .unwrap_or(default_endpoints.api_base.as_str())
                 .to_string(),
         )
         .with_pgc_base(
-            last_global_arg_value(config, "--pgc-base")
+            last_bilibili_arg_value(config, "--pgc-base")
                 .unwrap_or(default_endpoints.pgc_base.as_str())
                 .to_string(),
         )
         .with_intl_base(
-            last_global_arg_value(config, "--intl-base")
+            last_bilibili_arg_value(config, "--intl-base")
                 .unwrap_or(default_endpoints.intl_base.as_str())
                 .to_string(),
         )
         .with_comment_base(
-            last_global_arg_value(config, "--comment-base")
+            last_bilibili_arg_value(config, "--comment-base")
                 .unwrap_or(default_endpoints.comment_base.as_str())
                 .to_string(),
         )
         .with_passport_base(
-            last_global_arg_value(config, "--passport-base")
+            last_bilibili_arg_value(config, "--passport-base")
                 .unwrap_or(default_endpoints.passport_base.as_str())
                 .to_string(),
         )
         .with_tv_api_base(
-            last_global_arg_value(config, "--tv-api-base")
+            last_bilibili_arg_value(config, "--tv-api-base")
                 .unwrap_or(default_endpoints.tv_api_base.as_str())
                 .to_string(),
         )
         .with_app_grpc_base(
-            last_global_arg_value(config, "--app-grpc-base")
+            last_bilibili_arg_value(config, "--app-grpc-base")
                 .unwrap_or(default_endpoints.app_grpc_base.as_str())
                 .to_string(),
         )
         .with_app_pgc_grpc_base(
-            last_global_arg_value(config, "--app-pgc-grpc-base")
+            last_bilibili_arg_value(config, "--app-pgc-grpc-base")
                 .unwrap_or(default_endpoints.app_pgc_grpc_base.as_str())
                 .to_string(),
         );
-    let tv_passport_base = last_global_arg_value(config, "--tv-passport-base")
+    let tv_passport_base = last_bilibili_arg_value(config, "--tv-passport-base")
         .unwrap_or(default_endpoints.tv_passport_base.as_str())
         .to_string();
-    let tv_passport_poll_base = last_global_arg_value(config, "--tv-passport-poll-base")
-        .or_else(|| last_global_arg_value(config, "--tv-passport-base"))
+    let tv_passport_poll_base = last_bilibili_arg_value(config, "--tv-passport-poll-base")
+        .or_else(|| last_bilibili_arg_value(config, "--tv-passport-base"))
         .unwrap_or(default_endpoints.tv_passport_poll_base.as_str())
         .to_string();
     endpoints = endpoints
@@ -253,7 +253,7 @@ fn endpoint_config(config: &AppConfig) -> Result<EndpointConfig> {
 }
 
 fn request_timeout(config: &AppConfig) -> Result<Duration> {
-    let seconds = match last_global_arg_value(config, "--request-timeout-seconds") {
+    let seconds = match last_bilibili_arg_value(config, "--request-timeout-seconds") {
         Some(value) => value
             .parse::<u64>()
             .with_context(|| format!("invalid --request-timeout-seconds value `{value}`"))?,
@@ -271,7 +271,7 @@ fn restricted_area_config(config: &AppConfig) -> Result<RestrictedAreaConfig> {
         .bilibili
         .restricted_area
         .as_deref()
-        .or_else(|| last_global_arg_value(config, "--restricted-area").map(str::trim))
+        .or_else(|| last_bilibili_arg_value(config, "--restricted-area").map(str::trim))
         .map(parse_restricted_area)
         .transpose()?;
     let mut proxies = Vec::new();
@@ -291,7 +291,7 @@ fn restricted_area_config(config: &AppConfig) -> Result<RestrictedAreaConfig> {
             )?);
         }
     }
-    for spec in global_arg_values(config, "--restricted-area-proxy") {
+    for spec in bilibili_arg_values(config, "--restricted-area-proxy") {
         for value in spec.split(',').filter(|value| !value.trim().is_empty()) {
             proxies.push(parse_restricted_proxy_spec(
                 value,
@@ -299,7 +299,7 @@ fn restricted_area_config(config: &AppConfig) -> Result<RestrictedAreaConfig> {
             )?);
         }
     }
-    for spec in global_arg_values(config, "--restricted-api-proxy") {
+    for spec in bilibili_arg_values(config, "--restricted-api-proxy") {
         for value in spec.split(',').filter(|value| !value.trim().is_empty()) {
             proxies.push(parse_restricted_proxy_spec(
                 value,
@@ -483,17 +483,23 @@ fn parse_bool_token(value: &str) -> Option<bool> {
     }
 }
 
-fn last_global_arg_value<'a>(config: &'a AppConfig, flag: &str) -> Option<&'a str> {
-    global_arg_values(config, flag).last().copied()
+fn last_bilibili_arg_value<'a>(config: &'a AppConfig, flag: &str) -> Option<&'a str> {
+    bilibili_arg_values(config, flag).last().copied()
 }
 
-fn global_arg_values<'a>(config: &'a AppConfig, flag: &str) -> Vec<&'a str> {
+fn bilibili_arg_values<'a>(config: &'a AppConfig, flag: &str) -> Vec<&'a str> {
+    let mut values = arg_values(&config.bilibili.extra_args, flag);
+    values.extend(arg_values(&config.bilibili.global_args, flag));
+    values
+}
+
+fn arg_values<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
     let mut values = Vec::new();
     let mut index = 0;
-    while index < config.bilibili.global_args.len() {
-        let arg = &config.bilibili.global_args[index];
+    while index < args.len() {
+        let arg = &args[index];
         if arg == flag
-            && let Some(value) = config.bilibili.global_args.get(index + 1)
+            && let Some(value) = args.get(index + 1)
         {
             values.push(value.as_str());
             index += 2;
@@ -602,9 +608,9 @@ mod tests {
     }
 
     #[test]
-    fn reads_known_legacy_global_args() {
+    fn reads_supported_global_args_from_legacy_extra_args() {
         let mut config = crate::config::AppConfig::for_test();
-        config.bilibili.global_args = vec![
+        config.bilibili.extra_args = vec![
             "--api-base".to_string(),
             "https://api.example.test".to_string(),
             "--playurl-mode=app".to_string(),
@@ -612,6 +618,8 @@ mod tests {
             "th".to_string(),
             "--request-timeout-seconds".to_string(),
             "7".to_string(),
+            "--restricted-area-proxy".to_string(),
+            "th=https://proxy.example.test".to_string(),
         ];
 
         assert_eq!(playurl_mode(&config).unwrap(), PlayurlMode::App);
@@ -623,6 +631,56 @@ mod tests {
         assert_eq!(
             restricted_area_config(&config).unwrap().area_hint,
             Some(RestrictedArea::Th)
+        );
+        assert_eq!(
+            bilibili_arg_values(&config, "--restricted-area-proxy"),
+            vec!["th=https://proxy.example.test"]
+        );
+    }
+
+    #[test]
+    fn new_global_args_override_legacy_extra_args() {
+        let mut config = crate::config::AppConfig::for_test();
+        config.bilibili.extra_args = vec![
+            "--api-base=https://legacy-api.example.test".to_string(),
+            "--playurl-mode=app".to_string(),
+            "--restricted-area=th".to_string(),
+            "--request-timeout-seconds=7".to_string(),
+        ];
+        config.bilibili.global_args = vec![
+            "--api-base=https://api.example.test".to_string(),
+            "--playurl-mode=tv".to_string(),
+            "--restricted-area=hk".to_string(),
+            "--request-timeout-seconds=9".to_string(),
+        ];
+
+        assert_eq!(playurl_mode(&config).unwrap(), PlayurlMode::Tv);
+        assert_eq!(request_timeout(&config).unwrap(), Duration::from_secs(9));
+        assert_eq!(
+            endpoint_config(&config).unwrap().api_base,
+            "https://api.example.test"
+        );
+        assert_eq!(
+            restricted_area_config(&config).unwrap().area_hint,
+            Some(RestrictedArea::Hk)
+        );
+    }
+
+    #[test]
+    fn structured_fields_override_legacy_and_global_args() {
+        let mut config = crate::config::AppConfig::for_test();
+        config.bilibili.extra_args = vec!["--playurl-mode=app".to_string()];
+        config.bilibili.global_args = vec![
+            "--playurl-mode=tv".to_string(),
+            "--restricted-area=hk".to_string(),
+        ];
+        config.bilibili.playurl_mode = Some("web".to_string());
+        config.bilibili.restricted_area = Some("cn".to_string());
+
+        assert_eq!(playurl_mode(&config).unwrap(), PlayurlMode::Web);
+        assert_eq!(
+            restricted_area_config(&config).unwrap().area_hint,
+            Some(RestrictedArea::Cn)
         );
     }
 
