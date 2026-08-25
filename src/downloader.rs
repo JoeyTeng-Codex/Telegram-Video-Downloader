@@ -1,10 +1,12 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -25,8 +27,11 @@ use crate::config::AppConfig;
 use crate::router::{BilibiliSelection, JobRequest};
 
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
+static OVERWRITE_BACKUP_COUNTER: AtomicU64 = AtomicU64::new(1);
 const VIDEO_STAGING_DIR_NAME: &str = ".telegram-video-downloader-staging";
-const BILIBILI_FFMPEG_CONCAT_FILE_NAME: &str = "ffmpeg-concat.txt";
+const BILIBILI_FFMPEG_CONCAT_FILE_PREFIX: &str = ".telegram-video-downloader-ffmpeg-concat";
+const OVERWRITE_BACKUP_DIR_PREFIX: &str = ".telegram-video-downloader-overwrite";
 const VIDEO_SIDECAR_EXTENSIONS: &[&str] = &[
     "nfo",
     "json",
@@ -100,6 +105,9 @@ impl VideoDuplicate {
             (JobRequest::Bilibili { selection, .. }, VideoProvider::Bilibili) => {
                 !matches!(selection, Some(BilibiliSelection::All))
                     && is_bilibili_entry_identity(&self.identity.id)
+                    && self.existing_videos.first().is_some_and(|video| {
+                        metadata_sidecars_match_identity(video, &self.identity)
+                    })
             }
             _ => false,
         }
@@ -440,6 +448,7 @@ fn find_video_duplicate_for_identities(
 #[derive(Debug, Default)]
 struct VideoIdentityIndex {
     videos_by_identity: BTreeMap<VideoIdentity, Vec<PathBuf>>,
+    overwrite_videos_by_identity: BTreeMap<VideoIdentity, Vec<PathBuf>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -450,18 +459,39 @@ enum IdentityIndexReadPolicy {
 
 impl VideoIdentityIndex {
     fn insert(&mut self, identity: VideoIdentity, video: &Path) {
-        let videos = self.videos_by_identity.entry(identity).or_default();
-        if !videos.iter().any(|existing| existing == video) {
-            videos.push(video.to_path_buf());
-        }
+        insert_identity_path(&mut self.videos_by_identity, identity, video);
+    }
+
+    fn insert_overwrite_evidence(&mut self, identity: VideoIdentity, video: &Path) {
+        self.insert(identity.clone(), video);
+        insert_identity_path(&mut self.overwrite_videos_by_identity, identity, video);
     }
 
     fn videos(&self, identity: &VideoIdentity) -> &[PathBuf] {
-        self.videos_by_identity
-            .get(identity)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+        identity_paths(&self.videos_by_identity, identity)
     }
+
+    fn overwrite_videos(&self, identity: &VideoIdentity) -> &[PathBuf] {
+        identity_paths(&self.overwrite_videos_by_identity, identity)
+    }
+}
+
+fn insert_identity_path(
+    index: &mut BTreeMap<VideoIdentity, Vec<PathBuf>>,
+    identity: VideoIdentity,
+    video: &Path,
+) {
+    let videos = index.entry(identity).or_default();
+    if !videos.iter().any(|existing| existing == video) {
+        videos.push(video.to_path_buf());
+    }
+}
+
+fn identity_paths<'a>(
+    index: &'a BTreeMap<VideoIdentity, Vec<PathBuf>>,
+    identity: &VideoIdentity,
+) -> &'a [PathBuf] {
+    index.get(identity).map(Vec::as_slice).unwrap_or_default()
 }
 
 fn build_video_identity_index(config: &AppConfig, job: &JobRequest) -> Result<VideoIdentityIndex> {
@@ -494,7 +524,7 @@ fn find_video_duplicate_in_index(
     let mut exact_identity = None;
     let mut exact_videos = BTreeSet::new();
     for identity in overwrite_identities {
-        let videos = index.videos(identity);
+        let videos = index.overwrite_videos(identity);
         if !videos.is_empty() && exact_identity.is_none() {
             exact_identity = Some(identity.clone());
         }
@@ -759,6 +789,23 @@ struct BilibiliMediaInput {
     path: PathBuf,
 }
 
+#[derive(Debug)]
+struct OwnedTemporaryFile {
+    path: PathBuf,
+}
+
+impl OwnedTemporaryFile {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for OwnedTemporaryFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 async fn mux_bilibili_report_media(
     config: &AppConfig,
     cwd: &Path,
@@ -782,21 +829,17 @@ async fn mux_bilibili_report_media(
             entry.title.as_str()
         };
         let output_path = unique_bilibili_mux_output_path(&entry_dir, title, "mp4", since);
-        let (spec, concat_path) =
+        let (spec, concat_file) =
             bilibili_local_mux_command_spec(config, &media_inputs, &entry_dir, &output_path)?;
-        let output_result = match run_command(config, &spec, progress.clone()).await {
+        let output_result = run_command(config, &spec, progress.clone()).await;
+        drop(concat_file);
+        let output_result = match output_result {
             Ok(output_result) => output_result,
             Err(err) => {
-                if let Some(concat_path) = concat_path {
-                    let _ = fs::remove_file(concat_path);
-                }
                 let _ = fs::remove_file(&output_path);
                 return Err(err);
             }
         };
-        if let Some(concat_path) = concat_path {
-            let _ = fs::remove_file(concat_path);
-        }
         if !output_result.status.success() {
             let _ = fs::remove_file(&output_path);
             bail!(
@@ -840,29 +883,26 @@ fn bilibili_local_mux_command_spec(
     media_inputs: &[BilibiliMediaInput],
     entry_dir: &Path,
     output: &Path,
-) -> Result<(CommandSpec, Option<PathBuf>)> {
+) -> Result<(CommandSpec, Option<OwnedTemporaryFile>)> {
     let mut args = vec![
         "-hide_banner".to_string(),
         "-y".to_string(),
         "-nostdin".to_string(),
     ];
-    let concat_path = if only_bilibili_flv_segments(media_inputs) {
-        let concat_path = entry_dir.join(BILIBILI_FFMPEG_CONCAT_FILE_NAME);
-        fs::write(&concat_path, ffmpeg_concat_file_list(media_inputs)).with_context(|| {
-            format!(
-                "failed to write Bilibili ffmpeg concat list {}",
-                concat_path.display()
-            )
-        })?;
+    let concat_file = if only_bilibili_flv_segments(media_inputs) {
+        let concat_file = create_bilibili_concat_file(
+            entry_dir,
+            ffmpeg_concat_file_list(media_inputs).as_bytes(),
+        )?;
         args.extend([
             "-f".to_string(),
             "concat".to_string(),
             "-safe".to_string(),
             "0".to_string(),
             "-i".to_string(),
-            command_path_arg(&concat_path),
+            command_path_arg(concat_file.path()),
         ]);
-        Some(concat_path)
+        Some(concat_file)
     } else {
         for media_input in media_inputs {
             args.push("-i".to_string());
@@ -889,8 +929,46 @@ fn bilibili_local_mux_command_spec(
             activity_dir: Some(entry_dir.to_path_buf()),
             cleanup_paths: Vec::new(),
         },
-        concat_path,
+        concat_file,
     ))
+}
+
+fn create_bilibili_concat_file(entry_dir: &Path, contents: &[u8]) -> Result<OwnedTemporaryFile> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for _ in 0..128 {
+        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = entry_dir.join(format!(
+            "{BILIBILI_FFMPEG_CONCAT_FILE_PREFIX}-{}-{stamp:x}-{counter:x}.txt",
+            std::process::id()
+        ));
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to create Bilibili ffmpeg concat list {}",
+                        path.display()
+                    )
+                });
+            }
+        };
+        if let Err(err) = file.write_all(contents) {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to write Bilibili ffmpeg concat list {}",
+                    path.display()
+                )
+            });
+        }
+        return Ok(OwnedTemporaryFile { path });
+    }
+    bail!("failed to allocate a unique Bilibili ffmpeg concat list")
 }
 
 fn only_bilibili_flv_segments(media_inputs: &[BilibiliMediaInput]) -> bool {
@@ -929,32 +1007,6 @@ fn cleanup_bilibili_mux_input_files(cwd: &Path, report: &BilibiliDownloadReport)
                     });
                 }
             }
-        }
-        cleanup_bilibili_mux_support_files(cwd, entry)?;
-    }
-    Ok(())
-}
-
-fn cleanup_bilibili_mux_support_files(
-    cwd: &Path,
-    entry: &BilibiliEntryDownloadReport,
-) -> Result<()> {
-    let Some(mux) = &entry.mux else {
-        return Ok(());
-    };
-    let mux_output = resolve_command_output_path(cwd, &mux.output_path);
-    let support_dir = mux_output.parent().unwrap_or(cwd);
-    let concat_path = support_dir.join(BILIBILI_FFMPEG_CONCAT_FILE_NAME);
-    match fs::remove_file(&concat_path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "failed to remove Bilibili mux support file {}",
-                    concat_path.display()
-                )
-            });
         }
     }
     Ok(())
@@ -3435,47 +3487,77 @@ fn index_video_identities(
     video: &Path,
     read_policy: IdentityIndexReadPolicy,
 ) -> Result<()> {
-    for id in video_file_identity_ids(video) {
-        for provider in [VideoProvider::Bilibili, VideoProvider::Youtube] {
-            index.insert(
-                VideoIdentity {
-                    provider,
-                    id: id.clone(),
-                },
-                video,
-            );
-        }
-    }
+    index_video_filename_identities(index, video);
 
     for path in metadata_sidecar_paths(video) {
-        let content = match fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) if matches!(read_policy, IdentityIndexReadPolicy::BestEffort) => continue,
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "overwrite identity metadata is unreadable: {}",
-                        path.display()
-                    )
-                });
-            }
-        };
-        let identities = match metadata_sidecar_identities(&path, &content) {
-            Ok(identities) => identities,
-            Err(_) if matches!(read_policy, IdentityIndexReadPolicy::BestEffort) => continue,
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("overwrite identity metadata is invalid: {}", path.display())
-                });
-            }
-        };
-        for identity in identities {
-            index.insert(identity, video);
-        }
+        index_metadata_sidecar(index, video, &path, &path, read_policy)?;
     }
 
     Ok(())
+}
+
+fn index_video_filename_identities(index: &mut VideoIdentityIndex, video: &Path) {
+    for id in video_file_identity_ids(video) {
+        for provider in [VideoProvider::Bilibili, VideoProvider::Youtube] {
+            let identity = VideoIdentity {
+                provider,
+                id: id.clone(),
+            };
+            if provider == VideoProvider::Youtube {
+                index.insert_overwrite_evidence(identity, video);
+            } else {
+                index.insert(identity, video);
+            }
+        }
+    }
+}
+
+fn index_metadata_sidecar(
+    index: &mut VideoIdentityIndex,
+    video: &Path,
+    logical_path: &Path,
+    content_path: &Path,
+    read_policy: IdentityIndexReadPolicy,
+) -> Result<()> {
+    let content = match fs::read_to_string(content_path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) if matches!(read_policy, IdentityIndexReadPolicy::BestEffort) => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "overwrite identity metadata is unreadable: {}",
+                    logical_path.display()
+                )
+            });
+        }
+    };
+    let identities = match metadata_sidecar_identities(logical_path, &content) {
+        Ok(identities) => identities,
+        Err(_) if matches!(read_policy, IdentityIndexReadPolicy::BestEffort) => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "overwrite identity metadata is invalid: {}",
+                    logical_path.display()
+                )
+            });
+        }
+    };
+    for identity in identities {
+        index.insert_overwrite_evidence(identity, video);
+    }
+
+    Ok(())
+}
+
+fn metadata_sidecars_match_identity(video: &Path, identity: &VideoIdentity) -> bool {
+    metadata_sidecar_paths(video).into_iter().any(|path| {
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|content| metadata_sidecar_identities(&path, &content).ok())
+            .is_some_and(|identities| identities.contains(identity))
+    })
 }
 
 fn video_file_identity_ids(path: &Path) -> Vec<String> {
@@ -3758,10 +3840,6 @@ fn copy_bbdown_config_for_staging(final_dir: &Path, staging_dir: &Path) -> Resul
 
 fn is_staging_support_file(staging_dir: &Path, path: &Path) -> bool {
     path == staging_dir.join("BBDown.config")
-        || path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name == BILIBILI_FFMPEG_CONCAT_FILE_NAME)
 }
 
 fn collect_regular_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -3790,7 +3868,7 @@ fn collect_regular_files_recursive(path: &Path, files: &mut Vec<PathBuf>) -> Res
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct MoveStep {
     source: PathBuf,
     destination: PathBuf,
@@ -3800,6 +3878,48 @@ struct MoveStep {
 struct FileBackup {
     original: PathBuf,
     backup: PathBuf,
+}
+
+#[derive(Debug)]
+struct AcquiredOverwrite {
+    target: PathBuf,
+    backups: Vec<FileBackup>,
+    backup_dir: PathBuf,
+}
+
+impl AcquiredOverwrite {
+    fn target(&self) -> &Path {
+        &self.target
+    }
+
+    fn backup_for(&self, original: &Path) -> Option<&Path> {
+        self.backups
+            .iter()
+            .find(|backup| backup.original == original)
+            .map(|backup| backup.backup.as_path())
+    }
+
+    fn restore_original(&mut self, original: &Path) -> Result<()> {
+        let index = self
+            .backups
+            .iter()
+            .position(|backup| backup.original == original)
+            .with_context(|| format!("overwrite backup is missing for {}", original.display()))?;
+        let backup = self.backups.remove(index);
+        if let Err(err) = restore_file_backup(&backup) {
+            self.backups.insert(index, backup);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn restore(self) -> Result<()> {
+        restore_backups(&self.backups, &self.backup_dir, &self.target)
+    }
+
+    fn commit(self) -> Result<()> {
+        remove_backups(&self.backups, &self.backup_dir)
+    }
 }
 
 #[derive(Debug)]
@@ -3819,65 +3939,260 @@ impl Drop for RemoveDirOnDrop {
     }
 }
 
-fn revalidate_overwrite_target(
+fn acquire_and_validate_overwrite_target(
     final_dir: &Path,
     duplicate: &VideoDuplicate,
     primary_media_kind: StagedPrimaryMediaKind,
-) -> Result<PathBuf> {
-    // Protect the semantic identity mapping at replacement time; timestamps are not identity.
-    let expected_target = duplicate
+) -> Result<AcquiredOverwrite> {
+    // Protect the semantic identity of the acquired object; timestamps are not identity evidence.
+    let target = duplicate
         .overwrite_target()
-        .context("overwrite target is not an exact unique match")?;
-    let metadata = match fs::symlink_metadata(expected_target) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            bail!("overwrite target is missing: {}", expected_target.display());
-        }
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "failed to inspect overwrite target {}",
-                    expected_target.display()
-                )
-            });
-        }
-    };
-    if !metadata.file_type().is_file()
-        || !is_primary_media_file(expected_target, primary_media_kind)
-    {
+        .context("overwrite target is not an exact unique match")?
+        .clone();
+    if !target.starts_with(final_dir) {
         bail!(
-            "overwrite target is no longer a regular primary media file: {}",
-            expected_target.display()
+            "overwrite target is outside the configured video directory: {}",
+            target.display()
         );
     }
 
-    let index = build_video_identity_index_in_dir(
+    let mut artifacts = existing_video_artifacts(&target)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    artifacts.remove(&target);
+    artifacts.extend(metadata_sidecar_paths(&target));
+    let backup_parent = target.parent().unwrap_or(final_dir);
+    let backup_dir = create_overwrite_backup_dir(backup_parent)?;
+    let mut backups = Vec::new();
+
+    if let Err(err) = acquire_overwrite_path(&target, true, &backup_dir, &mut backups) {
+        if backups.is_empty() {
+            let _ = fs::remove_dir(&backup_dir);
+            return Err(err);
+        }
+        return Err(rollback_acquired_overwrite(
+            err,
+            AcquiredOverwrite {
+                target,
+                backups,
+                backup_dir,
+            },
+        ));
+    }
+    for artifact in artifacts {
+        if let Err(err) = acquire_overwrite_path(&artifact, false, &backup_dir, &mut backups) {
+            return Err(rollback_acquired_overwrite(
+                err,
+                AcquiredOverwrite {
+                    target,
+                    backups,
+                    backup_dir,
+                },
+            ));
+        }
+    }
+
+    let acquired = AcquiredOverwrite {
+        target,
+        backups,
+        backup_dir,
+    };
+    if let Err(err) =
+        validate_acquired_overwrite(final_dir, duplicate, primary_media_kind, &acquired)
+    {
+        return Err(rollback_acquired_overwrite(err, acquired));
+    }
+    Ok(acquired)
+}
+
+fn create_overwrite_backup_dir(parent: &Path) -> Result<PathBuf> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for _ in 0..128 {
+        let counter = OVERWRITE_BACKUP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            "{OVERWRITE_BACKUP_DIR_PREFIX}-{}-{stamp:x}-{counter:x}",
+            std::process::id()
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to create overwrite backup directory {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    bail!("failed to allocate a unique overwrite backup directory")
+}
+
+fn acquire_overwrite_path(
+    original: &Path,
+    required: bool,
+    backup_dir: &Path,
+    backups: &mut Vec<FileBackup>,
+) -> Result<()> {
+    let metadata = match fs::symlink_metadata(original) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && !required => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            bail!("overwrite target is missing: {}", original.display());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to inspect overwrite path {}", original.display())
+            });
+        }
+    };
+    if !metadata.file_type().is_file() {
+        if is_identity_metadata_path(original) {
+            bail!(
+                "overwrite identity metadata is unreadable: {}",
+                original.display()
+            );
+        }
+        bail!(
+            "overwrite path is no longer a regular file: {}",
+            original.display()
+        );
+    }
+
+    let backup = backup_dir.join(format!("{:04x}", backups.len()));
+    fs::rename(original, &backup).with_context(|| {
+        format!(
+            "failed to acquire overwrite path {} as {}",
+            original.display(),
+            backup.display()
+        )
+    })?;
+    backups.push(FileBackup {
+        original: original.to_path_buf(),
+        backup: backup.clone(),
+    });
+    let acquired_metadata = fs::symlink_metadata(&backup).with_context(|| {
+        format!(
+            "failed to inspect acquired overwrite path {}",
+            backup.display()
+        )
+    })?;
+    if !acquired_metadata.file_type().is_file() {
+        bail!(
+            "acquired overwrite path is not a regular file: {}",
+            original.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_acquired_overwrite(
+    final_dir: &Path,
+    duplicate: &VideoDuplicate,
+    primary_media_kind: StagedPrimaryMediaKind,
+    acquired: &AcquiredOverwrite,
+) -> Result<()> {
+    let target_backup = acquired
+        .backup_for(acquired.target())
+        .context("acquired overwrite target backup is missing")?;
+    let metadata = fs::symlink_metadata(target_backup).with_context(|| {
+        format!(
+            "failed to inspect acquired overwrite target {}",
+            target_backup.display()
+        )
+    })?;
+    if !metadata.file_type().is_file()
+        || !is_primary_media_file(acquired.target(), primary_media_kind)
+    {
+        bail!(
+            "acquired overwrite target is not a regular primary media file: {}",
+            acquired.target().display()
+        );
+    }
+
+    let mut acquired_index = VideoIdentityIndex::default();
+    index_video_filename_identities(&mut acquired_index, acquired.target());
+    for logical_path in metadata_sidecar_paths(acquired.target()) {
+        if let Some(content_path) = acquired.backup_for(&logical_path) {
+            index_metadata_sidecar(
+                &mut acquired_index,
+                acquired.target(),
+                &logical_path,
+                content_path,
+                IdentityIndexReadPolicy::Strict,
+            )?;
+        } else if path_entry_exists(&logical_path)? {
+            bail!(
+                "overwrite identity metadata changed during acquisition: {}",
+                logical_path.display()
+            );
+        }
+    }
+    match acquired_index.overwrite_videos(&duplicate.identity) {
+        [current_target] if current_target == acquired.target() => {}
+        [] => bail!(
+            "acquired overwrite target identity no longer matches {}:{}: {}",
+            duplicate.identity.provider.as_str(),
+            duplicate.identity.id,
+            acquired.target().display()
+        ),
+        _ => bail!(
+            "acquired overwrite identity {}:{} is ambiguous",
+            duplicate.identity.provider.as_str(),
+            duplicate.identity.id
+        ),
+    }
+
+    if path_entry_exists(acquired.target())? {
+        bail!(
+            "overwrite target path was recreated during acquisition: {}",
+            acquired.target().display()
+        );
+    }
+    let live_index = build_video_identity_index_in_dir(
         final_dir,
         primary_media_kind,
         IdentityIndexReadPolicy::Strict,
     )
-    .context("failed to rebuild the media identity index before overwrite")?;
-    let current_targets = index.videos(&duplicate.identity);
-    match current_targets {
-        [] => bail!(
-            "overwrite target identity no longer matches {}:{}: {}",
-            duplicate.identity.provider.as_str(),
-            duplicate.identity.id,
-            expected_target.display()
-        ),
-        [current_target] if current_target == expected_target => Ok(current_target.clone()),
-        [current_target] => bail!(
-            "overwrite identity {}:{} now maps to a different target: {}",
-            duplicate.identity.provider.as_str(),
-            duplicate.identity.id,
-            current_target.display()
-        ),
-        _ => bail!(
+    .context("failed to rebuild the media identity index after acquiring overwrite target")?;
+    let live_targets = live_index.overwrite_videos(&duplicate.identity);
+    if !live_targets.is_empty() {
+        bail!(
             "overwrite identity {}:{} is now ambiguous across {} files",
             duplicate.identity.provider.as_str(),
             duplicate.identity.id,
-            current_targets.len()
-        ),
+            live_targets.len() + 1
+        );
+    }
+    Ok(())
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn is_identity_metadata_path(path: &Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()) == Some("nfo")
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".info.json"))
+}
+
+fn rollback_acquired_overwrite(error: anyhow::Error, acquired: AcquiredOverwrite) -> anyhow::Error {
+    match acquired.restore() {
+        Ok(()) => error,
+        Err(restore_error) => {
+            anyhow!("{error:#}\nfailed to restore acquired overwrite files: {restore_error:#}")
+        }
     }
 }
 
@@ -3893,11 +4208,11 @@ fn move_staged_video_files(
         .iter()
         .filter(|path| is_primary_media_file(path, primary_media_kind))
         .count();
-    let overwrite_target = if matches!(action, VideoDuplicateAction::Overwrite) {
+    let acquisition = if matches!(action, VideoDuplicateAction::Overwrite) {
         if staged_media_count != 1 {
             bail!("overwrite requires exactly one staged primary media file");
         }
-        Some(revalidate_overwrite_target(
+        Some(acquire_and_validate_overwrite_target(
             final_dir,
             duplicate,
             primary_media_kind,
@@ -3905,29 +4220,28 @@ fn move_staged_video_files(
     } else {
         None
     };
-    let backups = match overwrite_target.as_ref() {
-        Some(target) => backup_existing_duplicate_artifacts(std::slice::from_ref(target))?,
-        None => Vec::new(),
-    };
+    let overwrite_target = acquisition.as_ref().map(AcquiredOverwrite::target);
 
     let move_result = move_staged_video_files_inner(
         staging_dir,
         final_dir,
         staged_files,
-        overwrite_target.as_deref(),
+        overwrite_target,
         primary_media_kind,
     );
     match move_result {
         Ok(moved_videos) => {
-            if matches!(action, VideoDuplicateAction::Overwrite) {
-                remove_backups(&backups);
+            if let Some(acquisition) = acquisition {
+                acquisition
+                    .commit()
+                    .context("video overwrite succeeded but old-file cleanup failed")?;
             }
             Ok(moved_videos)
         }
-        Err(err) => {
-            restore_backups(&backups);
-            Err(err)
-        }
+        Err(err) => Err(match acquisition {
+            Some(acquisition) => rollback_acquired_overwrite(err, acquisition),
+            None => err,
+        }),
     }
 }
 
@@ -3956,8 +4270,8 @@ fn move_staged_artifact_files(
     duplicate: &VideoDuplicate,
     primary_media_kind: StagedPrimaryMediaKind,
 ) -> Result<Vec<PathBuf>> {
-    let overwrite_target = if matches!(action, VideoDuplicateAction::Overwrite) {
-        Some(revalidate_overwrite_target(
+    let mut acquisition = if matches!(action, VideoDuplicateAction::Overwrite) {
+        Some(acquire_and_validate_overwrite_target(
             final_dir,
             duplicate,
             primary_media_kind,
@@ -3965,29 +4279,41 @@ fn move_staged_artifact_files(
     } else {
         None
     };
-    let plan = staged_artifact_move_plan(
-        staging_dir,
-        final_dir,
-        staged_files,
-        overwrite_target.as_deref(),
-    )?;
-    let backups = if matches!(action, VideoDuplicateAction::Overwrite) {
-        backup_existing_paths(plan.iter().map(|step| step.destination.clone()))?
-    } else {
-        Vec::new()
+    let overwrite_target = acquisition.as_ref().map(AcquiredOverwrite::target);
+    let plan_result =
+        staged_artifact_move_plan(staging_dir, final_dir, staged_files, overwrite_target);
+    let plan = match plan_result {
+        Ok(plan) => plan,
+        Err(err) => {
+            return Err(match acquisition {
+                Some(acquired) => rollback_acquired_overwrite(err, acquired),
+                None => err,
+            });
+        }
     };
+    let moved_pairs = plan
+        .iter()
+        .map(|step| (step.source.clone(), step.destination.clone()))
+        .collect::<Vec<_>>();
     let move_result = execute_artifact_move_plan(plan);
     match move_result {
         Ok(moved_files) => {
-            if matches!(action, VideoDuplicateAction::Overwrite) {
-                remove_backups(&backups);
+            if let Some(mut acquired) = acquisition.take() {
+                let target = acquired.target().to_path_buf();
+                if let Err(err) = acquired.restore_original(&target) {
+                    rollback_moves(&moved_pairs);
+                    return Err(rollback_acquired_overwrite(err, acquired));
+                }
+                acquired
+                    .commit()
+                    .context("artifact overwrite succeeded but old-sidecar cleanup failed")?;
             }
             Ok(moved_files)
         }
-        Err(err) => {
-            restore_backups(&backups);
-            Err(err)
-        }
+        Err(err) => Err(match acquisition {
+            Some(acquired) => rollback_acquired_overwrite(err, acquired),
+            None => err,
+        }),
     }
 }
 
@@ -4003,7 +4329,13 @@ fn staged_artifact_move_plan(
         let preferred = overwrite_video
             .and_then(|video| artifact_overwrite_destination(source, video))
             .unwrap_or_else(|| relative_destination(staging_dir, final_dir, source));
-        let destination = if overwrite_video.is_some() && !reserved.contains(&preferred) {
+        let destination = if overwrite_video.is_some() {
+            if reserved.contains(&preferred) {
+                bail!(
+                    "multiple staged artifacts map to overwrite destination {}",
+                    preferred.display()
+                );
+            }
             preferred
         } else {
             unique_path_avoiding(preferred, &reserved)
@@ -4092,15 +4424,18 @@ fn staged_move_plan(
     let mut video_destinations = Vec::with_capacity(staged_videos.len());
     for staged_video in &staged_videos {
         let preferred = match overwrite_target {
-            Some(existing_video) => unique_path_avoiding(
-                overwrite_video_destination(existing_video, staged_video),
-                &reserved,
-            ),
+            Some(existing_video) => overwrite_video_destination(existing_video, staged_video),
             None => unique_primary_media_path_avoiding(
                 relative_destination(staging_dir, final_dir, staged_video),
                 &reserved,
             ),
         };
+        if reserved.contains(&preferred) {
+            bail!(
+                "multiple staged media files map to overwrite destination {}",
+                preferred.display()
+            );
+        }
         reserved.insert(preferred.clone());
         video_destinations.push((*staged_video, preferred));
     }
@@ -4119,7 +4454,17 @@ fn staged_move_plan(
                 .iter()
                 .map(|(staged_video, destination)| (*staged_video, destination.as_path())),
         ) {
-            unique_path_avoiding(preferred, &reserved)
+            if overwrite_target.is_some() {
+                if reserved.contains(&preferred) {
+                    bail!(
+                        "multiple staged files map to overwrite destination {}",
+                        preferred.display()
+                    );
+                }
+                preferred
+            } else {
+                unique_path_avoiding(preferred, &reserved)
+            }
         } else {
             unique_path_avoiding(
                 relative_destination(staging_dir, final_dir, source),
@@ -4341,40 +4686,6 @@ fn execute_move_plan(
     Ok(moved_videos)
 }
 
-fn backup_existing_duplicate_artifacts(existing_videos: &[PathBuf]) -> Result<Vec<FileBackup>> {
-    let mut artifacts = BTreeSet::new();
-    for video in existing_videos {
-        for path in existing_video_artifacts(video)? {
-            artifacts.insert(path);
-        }
-    }
-
-    backup_existing_paths(artifacts)
-}
-
-fn backup_existing_paths(paths: impl IntoIterator<Item = PathBuf>) -> Result<Vec<FileBackup>> {
-    let mut backups = Vec::new();
-    for original in paths.into_iter().collect::<BTreeSet<_>>() {
-        if !original.exists() {
-            continue;
-        }
-        let backup = unique_backup_path(&original);
-        if let Err(err) = fs::rename(&original, &backup) {
-            restore_backups(&backups);
-            return Err(err).with_context(|| {
-                format!(
-                    "failed to back up existing file {} to {}",
-                    original.display(),
-                    backup.display()
-                )
-            });
-        }
-        backups.push(FileBackup { original, backup });
-    }
-
-    Ok(backups)
-}
-
 fn existing_video_artifacts(video: &Path) -> Result<Vec<PathBuf>> {
     let mut artifacts = vec![video.to_path_buf()];
     let Some(parent) = video.parent() else {
@@ -4439,20 +4750,6 @@ fn is_known_video_sidecar(path: &Path) -> bool {
         })
 }
 
-fn unique_backup_path(original: &Path) -> PathBuf {
-    let parent = original.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = original
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("download");
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let candidate = parent.join(format!("{file_name}.replaced-{stamp}"));
-    unique_path_avoiding(candidate, &BTreeSet::new())
-}
-
 fn rollback_moves(moved: &[(PathBuf, PathBuf)]) {
     for (source, destination) in moved.iter().rev() {
         if destination.exists() && !source.exists() {
@@ -4461,17 +4758,94 @@ fn rollback_moves(moved: &[(PathBuf, PathBuf)]) {
     }
 }
 
-fn restore_backups(backups: &[FileBackup]) {
-    for backup in backups.iter().rev() {
-        if backup.backup.exists() {
-            let _ = fs::rename(&backup.backup, &backup.original);
+fn restore_file_backup(backup: &FileBackup) -> Result<()> {
+    if !path_entry_exists(&backup.backup)? {
+        bail!("overwrite backup is missing: {}", backup.backup.display());
+    }
+    if path_entry_exists(&backup.original)? {
+        bail!(
+            "restore destination is occupied; retained backup {} for {}",
+            backup.backup.display(),
+            backup.original.display()
+        );
+    }
+    fs::rename(&backup.backup, &backup.original).with_context(|| {
+        format!(
+            "failed to restore overwrite backup {} to {}",
+            backup.backup.display(),
+            backup.original.display()
+        )
+    })
+}
+
+fn restore_backups(backups: &[FileBackup], backup_dir: &Path, target: &Path) -> Result<()> {
+    let mut failures = Vec::new();
+    let target_backup = backups
+        .iter()
+        .find(|backup| backup.original == target)
+        .context("overwrite target backup is missing during restore")?;
+    if let Err(err) = restore_file_backup(target_backup) {
+        bail!("{err:#}");
+    }
+    for backup in backups
+        .iter()
+        .rev()
+        .filter(|backup| backup.original != target)
+    {
+        if let Err(err) = restore_file_backup(backup) {
+            failures.push(format!("{err:#}"));
         }
+    }
+    if failures.is_empty() {
+        match fs::remove_dir(backup_dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => failures.push(format!(
+                "failed to remove overwrite backup directory {}: {err}",
+                backup_dir.display()
+            )),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", failures.join("; "))
     }
 }
 
-fn remove_backups(backups: &[FileBackup]) {
+fn remove_backups(backups: &[FileBackup], backup_dir: &Path) -> Result<()> {
+    let mut failures = Vec::new();
     for backup in backups {
-        let _ = fs::remove_file(&backup.backup);
+        if backup.backup.parent() != Some(backup_dir) {
+            failures.push(format!(
+                "refused to remove overwrite backup outside owned directory: {}",
+                backup.backup.display()
+            ));
+            continue;
+        }
+        match fs::remove_file(&backup.backup) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => failures.push(format!(
+                "failed to remove overwrite backup {}: {err}",
+                backup.backup.display()
+            )),
+        }
+    }
+    if failures.is_empty() {
+        match fs::remove_dir(backup_dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => failures.push(format!(
+                "failed to remove overwrite backup directory {}: {err}",
+                backup_dir.display()
+            )),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", failures.join("; "))
     }
 }
 
@@ -4852,6 +5226,21 @@ mod tests {
         .expect("Bilibili identity NFO should write");
     }
 
+    fn overwrite_backup_dirs(root: &Path) -> Vec<PathBuf> {
+        fs::read_dir(root)
+            .expect("test directory should read")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(OVERWRITE_BACKUP_DIR_PREFIX))
+            })
+            .map(|entry| entry.path())
+            .collect()
+    }
+
     fn command_config_path(spec: &CommandSpec) -> Option<PathBuf> {
         spec.args
             .iter()
@@ -5106,6 +5495,38 @@ mod tests {
         assert_eq!(duplicate.identity.id, "BV12TRrBcEP8");
         assert_eq!(duplicate.existing_videos, vec![bvid_path, aid_path]);
         let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn filename_only_bilibili_entry_ids_never_authorize_overwrite() {
+        for id in ["cid123", "ep123"] {
+            let mut config = test_config();
+            let video_dir = temp_test_dir(&format!("duplicate-bilibili-filename-only-{id}"));
+            config.downloads.video_dir = video_dir.clone();
+            let existing = video_dir.join(format!("{id}.mp4"));
+            fs::write(&existing, "unrelated-video").expect("video should write");
+            let job = JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/play/ep123".to_string(),
+                selection: Some(BilibiliSelection::Latest),
+            };
+            let identity = VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: id.to_string(),
+            };
+
+            let index = build_video_identity_index(&config, &job).expect("index should build");
+            let duplicate = find_video_duplicate_in_index(
+                &index,
+                std::slice::from_ref(&identity),
+                std::slice::from_ref(&identity),
+            )
+            .expect("filename should still produce a duplicate prompt");
+
+            assert_eq!(duplicate.existing_videos, vec![existing]);
+            assert!(index.overwrite_videos(&identity).is_empty());
+            assert!(!duplicate.allows_overwrite_for(&job));
+            let _ = fs::remove_dir_all(video_dir);
+        }
     }
 
     #[test]
@@ -6061,12 +6482,7 @@ mod tests {
                 .expect("unrelated part nfo should remain"),
             "part2-nfo"
         );
-        let replaced_files = fs::read_dir(&final_dir)
-            .expect("final dir should read")
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_name().to_string_lossy().contains(".replaced-"))
-            .count();
-        assert_eq!(replaced_files, 0);
+        assert!(overwrite_backup_dirs(&final_dir).is_empty());
         let _ = fs::remove_dir_all(final_dir);
     }
 
@@ -6992,6 +7408,7 @@ mod tests {
             fs::read_to_string(staged).expect("staged file should remain after rejection"),
             "new-video"
         );
+        assert!(overwrite_backup_dirs(&final_dir).is_empty());
         let _ = fs::remove_dir_all(final_dir);
     }
 
@@ -7044,6 +7461,53 @@ mod tests {
             fs::read_to_string(staged).expect("staged file should remain after rejection"),
             "new-video"
         );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn acquired_overwrite_keeps_owned_backups_when_target_is_recreated() {
+        let final_dir = temp_test_dir("overwrite-acquired-target-recreated");
+        let existing = final_dir.join("Episode.mkv");
+        fs::write(&existing, "original-video").expect("existing file should write");
+        write_bilibili_identity_nfo(&existing, "cid123");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+
+        let acquired = acquire_and_validate_overwrite_target(
+            &final_dir,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("overwrite target should be acquired");
+        let backup_dir = acquired.backup_dir.clone();
+        let backup_paths = acquired
+            .backups
+            .iter()
+            .map(|backup| backup.backup.clone())
+            .collect::<Vec<_>>();
+        fs::write(&existing, "replacement-video").expect("replacement should write");
+
+        let error = acquired
+            .restore()
+            .expect_err("occupied target must block restoration");
+
+        assert!(
+            error
+                .to_string()
+                .contains("restore destination is occupied")
+        );
+        assert_eq!(
+            fs::read_to_string(&existing).expect("replacement should remain"),
+            "replacement-video"
+        );
+        assert!(!existing.with_extension("nfo").exists());
+        assert!(backup_dir.is_dir());
+        assert!(backup_paths.iter().all(|path| path.is_file()));
         let _ = fs::remove_dir_all(final_dir);
     }
 
@@ -7259,12 +7723,12 @@ mod tests {
         let audio = entry_dir.join("audio.m4s");
         let mux = entry_dir.join("Episode 1.mkv");
         let danmaku = entry_dir.join("Episode 1.xml");
-        let concat = entry_dir.join(BILIBILI_FFMPEG_CONCAT_FILE_NAME);
+        let concat = entry_dir.join("ffmpeg-concat.txt");
         fs::write(&video, "video").expect("video should write");
         fs::write(&audio, "audio").expect("audio should write");
         fs::write(&mux, "mux").expect("mux should write");
         fs::write(&danmaku, "danmaku").expect("danmaku should write");
-        fs::write(&concat, "concat").expect("concat helper should write");
+        fs::write(&concat, "user-owned").expect("user concat file should write");
         let report = parse_bilibili_download_report(
             r#"
             {"title":"Season","output_dir":".","entries":[{"index":1,"title":"Episode 1","directory":"Episode 1","files":[{"kind":"video","path":"Episode 1/video.m4s"},{"kind":"audio","path":"Episode 1/audio.m4s"},{"kind":"danmaku","path":"Episode 1/Episode 1.xml"}],"mux":{"output_path":"Episode 1/Episode 1.mkv"}}]}
@@ -7276,25 +7740,26 @@ mod tests {
 
         assert!(!video.exists());
         assert!(!audio.exists());
-        assert!(!concat.exists());
+        assert_eq!(
+            fs::read_to_string(concat).expect("user concat file should remain"),
+            "user-owned"
+        );
         assert!(mux.exists());
         assert!(danmaku.exists());
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn staging_support_files_include_bilibili_concat_helper() {
+    fn staging_support_files_only_include_managed_config() {
         let staging_dir = PathBuf::from("/tmp/staging");
 
         assert!(is_staging_support_file(
             &staging_dir,
-            &staging_dir.join(BILIBILI_FFMPEG_CONCAT_FILE_NAME)
+            &staging_dir.join("BBDown.config")
         ));
-        assert!(is_staging_support_file(
+        assert!(!is_staging_support_file(
             &staging_dir,
-            &staging_dir
-                .join("nested")
-                .join(BILIBILI_FFMPEG_CONCAT_FILE_NAME)
+            &staging_dir.join("ffmpeg-concat.txt")
         ));
         assert!(!is_staging_support_file(
             &staging_dir,
@@ -7402,7 +7867,9 @@ mod tests {
     fn builds_bilibili_local_dash_mux_command() {
         let mut config = test_config();
         config.tools.ffmpeg = PathBuf::from("/opt/bin/ffmpeg");
-        let entry_dir = PathBuf::from("/tmp/bilibili/P001");
+        let entry_dir = temp_test_dir("bilibili-local-dash-mux");
+        let user_concat = entry_dir.join("ffmpeg-concat.txt");
+        fs::write(&user_concat, "user-owned").expect("user concat file should write");
         let inputs = vec![
             BilibiliMediaInput {
                 kind: "video".to_string(),
@@ -7415,23 +7882,30 @@ mod tests {
         ];
         let output = entry_dir.join("Episode.mp4");
 
-        let (spec, concat_path) =
+        let (spec, concat_file) =
             bilibili_local_mux_command_spec(&config, &inputs, &entry_dir, &output)
                 .expect("dash mux spec should build");
 
-        assert_eq!(concat_path, None);
+        assert!(concat_file.is_none());
         assert_eq!(spec.program, PathBuf::from("/opt/bin/ffmpeg"));
         assert_eq!(spec.cwd, entry_dir);
         assert!(spec.args.contains(&"-nostdin".to_string()));
         assert!(spec.args.windows(2).any(|args| args == ["-map", "0:0"]));
         assert!(spec.args.windows(2).any(|args| args == ["-map", "1:0"]));
         assert!(!spec.args.windows(2).any(|args| args == ["-f", "concat"]));
+        assert_eq!(
+            fs::read_to_string(user_concat).expect("user concat file should remain"),
+            "user-owned"
+        );
+        let _ = fs::remove_dir_all(entry_dir);
     }
 
     #[test]
     fn builds_bilibili_local_flv_concat_mux_command() {
         let config = test_config();
         let entry_dir = temp_test_dir("bilibili-local-flv-mux");
+        let user_concat = entry_dir.join("ffmpeg-concat.txt");
+        fs::write(&user_concat, "user-owned").expect("user concat file should write");
         let inputs = vec![
             BilibiliMediaInput {
                 kind: "flv_segment".to_string(),
@@ -7444,20 +7918,34 @@ mod tests {
         ];
         let output = entry_dir.join("Episode.mp4");
 
-        let (spec, concat_path) =
+        let (spec, concat_file) =
             bilibili_local_mux_command_spec(&config, &inputs, &entry_dir, &output)
                 .expect("flv mux spec should build");
 
-        let concat_path = concat_path.expect("flv mux should create concat list");
+        let concat_file = concat_file.expect("flv mux should create concat list");
+        let concat_path = concat_file.path().to_path_buf();
         let concat = fs::read_to_string(&concat_path).expect("concat list should read");
         assert!(concat.contains("segment-001.flv"));
         assert!(concat.contains("segment-002.flv"));
+        assert_ne!(concat_path, user_concat);
+        assert!(
+            concat_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(BILIBILI_FFMPEG_CONCAT_FILE_PREFIX))
+        );
         assert!(spec.args.windows(2).any(|args| args == ["-f", "concat"]));
         let concat_arg = command_path_arg(&concat_path);
         assert!(
             spec.args
                 .windows(2)
                 .any(|args| args[0] == "-i" && args[1] == concat_arg)
+        );
+        drop(concat_file);
+        assert!(!concat_path.exists());
+        assert_eq!(
+            fs::read_to_string(user_concat).expect("user concat file should remain"),
+            "user-owned"
         );
         let _ = fs::remove_dir_all(entry_dir);
     }

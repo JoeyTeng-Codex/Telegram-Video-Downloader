@@ -2421,6 +2421,15 @@ mod tests {
 
     #[test]
     fn duplicate_choice_keyboard_can_disable_overwrite() {
+        let root = temp_main_test_dir("duplicate-choice-overwrite");
+        fs::create_dir_all(&root).expect("test directory should create");
+        let existing = root.join("episode.mp4");
+        fs::write(&existing, "video").expect("test video should write");
+        fs::write(
+            existing.with_extension("nfo"),
+            "<movie><uniqueid type=\"bilibili-cid\">cid456</uniqueid></movie>",
+        )
+        .expect("test NFO should write");
         let keyboard = duplicate_choice_keyboard(42, false);
         let data = keyboard
             .inline_keyboard
@@ -2438,7 +2447,7 @@ mod tests {
                 provider: crate::downloader::VideoProvider::Bilibili,
                 id: "cid456".to_string(),
             },
-            existing_videos: vec![PathBuf::from("episode.mp4")],
+            existing_videos: vec![existing.clone()],
         };
         assert!(!job_allows_duplicate_overwrite(
             &JobRequest::Bilibili {
@@ -2459,7 +2468,7 @@ mod tests {
                 provider: crate::downloader::VideoProvider::Bilibili,
                 id: "BV123".to_string(),
             },
-            existing_videos: vec![PathBuf::from("episode.mp4")],
+            existing_videos: vec![existing],
         };
         assert!(!job_allows_duplicate_overwrite(
             &JobRequest::Bilibili {
@@ -2468,6 +2477,7 @@ mod tests {
             },
             &broad_duplicate,
         ));
+        let _ = fs::remove_dir_all(root);
     }
 
     fn pending_duplicate_job(job_id: u64, created_at: Instant) -> PendingDuplicateJob {

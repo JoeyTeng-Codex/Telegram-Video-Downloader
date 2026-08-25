@@ -36,9 +36,9 @@ cp config.example.toml config.toml
 
 `video.subtitle_languages` 默认按中文、英文、日语优先。YouTube 会先找人工字幕；如果这些语言没有人工字幕，再使用自动字幕。`write_nfo = true` 会为视频生成同 basename 的 `.nfo`，`keep_sidecars = true` 会让 yt-dlp 保留 `.info.json`、`.description` 和封面 sidecar。
 
-重复视频检测会单次扫描视频文件名与同 basename sidecar，建立媒体 ID 索引后复用。YouTube 使用 URL 中的 video id；Bilibili 会先使用 URL 中的 `BV...` / `av...` / `ep...`，再通过 `bbdown-core` plan API 解析 bvid、aid、cid 和 epid，因此 `b23.tv` 短链和番剧条目也可以在下载前弹出重复选择。Bilibili 的 bvid/aid 可能同时对应多个分 P，只用于提示存在相关文件；只有单条下载计划的 cid/epid 唯一匹配一个现有文件时才允许覆盖。全集和歧义匹配不会显示覆盖按钮，服务端也会再次拒绝不安全的覆盖请求。真正备份旧文件前，bot 会重新建立严格身份索引，确认同一 provider 和条目 ID 仍唯一映射到原目标；目标缺失、metadata 不可读、身份变化或新增歧义都会拒绝覆盖。检测失败时任务仍走 staging keep-both 移动，避免直接覆盖最终目录里的同名文件。
+重复视频检测会单次扫描视频文件名与同 basename sidecar，建立媒体 ID 索引后复用。YouTube 使用 URL 中的 video id；Bilibili 会先使用 URL 中的 `BV...` / `av...` / `ep...`，再通过 `bbdown-core` plan API 解析 bvid、aid、cid 和 epid，因此 `b23.tv` 短链和番剧条目也可以在下载前弹出重复选择。Bilibili 的 bvid/aid 可能同时对应多个分 P，只用于提示存在相关文件；只有单条下载计划的 cid/epid 能由 NFO 或 info JSON sidecar 证明并唯一匹配一个现有文件时才允许覆盖，文件名里的 cid/epid 只用于重复提示。全集和歧义匹配不会显示覆盖按钮，服务端也会再次拒绝不安全的覆盖请求。覆盖时，bot 会先把旧媒体及其 sidecar 移入本次事务独占的隐藏备份目录，再从已取得的文件重建严格身份索引；目标缺失、metadata 不可读、身份变化、路径被重新占用或新增歧义都会拒绝覆盖并尝试恢复原文件。检测失败时任务仍走 staging keep-both 移动，避免直接覆盖最终目录里的同名文件。
 
-Bilibili 下载和登录不需要本机 `bbdown` 可执行文件；项目直接依赖 `BBDown-rust` 的 `bbdown-core` crate。`tools.ffmpeg` 仍会传给 crate 用于 mux，bot 负责 NFO、staging 和重复文件处理。
+Bilibili 下载和登录不需要本机 `bbdown` 可执行文件；项目直接依赖 `BBDown-rust` 的 `bbdown-core` crate。`tools.ffmpeg` 仍会传给 crate 用于 mux，bot 负责 NFO、staging 和重复文件处理；FLV concat mux 使用每次任务独占的隐藏临时清单，不会覆盖或清理下载目录里同名的用户文件。
 
 区域受限或 intl 番剧可以配置 `playurl_mode`、`restricted_area`、`restricted_area_proxies`、`restricted_api_proxies`。为兼容旧配置，`bilibili.extra_args` 和 `bilibili.global_args` 里的已知 BBDown-rust 全局项也会被 direct API 读取：endpoint base、`--playurl-mode`、`--restricted-area`、restricted proxy 和 `--request-timeout-seconds`。单值参数按 `extra_args`、`global_args`、结构化字段的顺序覆盖；restricted proxy 参数保持累加。`bilibili.plan_args` 不再用于主路径；`bilibili.download_args` 仅保留 `--only audio|video|subtitle|danmaku|cover` 这类下载模式迁移。
 

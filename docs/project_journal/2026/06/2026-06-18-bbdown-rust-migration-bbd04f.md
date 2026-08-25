@@ -3,7 +3,7 @@ id: 20260618-bbd04f
 title: BBDown-rust Bilibili Migration
 status: completed
 created: 2026-06-18
-updated: 2026-08-25
+updated: 2026-08-26
 branch: wip/bbdown-rust-migration
 pr:
 supersedes: []
@@ -26,7 +26,7 @@ superseded_by:
 - Access-key callback tickets remain reserved while an attempt is running, are removed only after credentials save successfully, and become retryable after a parse or save failure while the auth generation and TTL remain valid.
 - Bilibili API and media requests use the browser-compatible `Mozilla/5.0` user agent expected by Bilibili media CDNs; application-specific user agents caused reproducible 403 responses after stream planning.
 - Duplicate detection builds one media identity index per incoming job, so Bilibili plan identities reuse filename, NFO, and info JSON reads instead of rescanning sidecars for every candidate ID.
-- Bilibili bvid/aid matches remain duplicate prompts but cannot authorize overwrite across multipart entries. Overwrite requires one exact cid/epid match for a single-entry plan. Immediately before backing up either media or artifact sidecars, the move path rebuilds a strict identity index and requires the same provider/entry identity to remain uniquely mapped to the original regular media target; missing targets, unreadable metadata, identity changes, and new ambiguity are rejected without replacing files.
+- Bilibili bvid/aid and filename-only cid/epid matches remain duplicate prompts but cannot authorize destructive replacement. Overwrite requires one exact cid/epid match for a single-entry plan that is proven by NFO or info JSON metadata. The move path first acquires the old media and sidecars into an exclusive transaction-owned backup directory, then rebuilds a strict identity index from those acquired files; missing targets, unreadable metadata, identity changes, recreated paths, and new ambiguity are rejected with rollback. FLV concat mux uses a unique transaction-owned temporary list and never removes a pre-existing `ffmpeg-concat.txt`.
 - The migration implementation and Rust validation are complete. Live Telegram login and selection flows were exercised during development; a full post-fix long-video completion remains an operational smoke test after deployment.
 
 ## Next Steps
@@ -41,3 +41,5 @@ superseded_by:
 - 2026-08-25 follow-up review identified cross-entry Bilibili overwrite risk and repeated sidecar reads for multi-entry plans. Exact cid/epid overwrite authorization, server-side move validation, and a one-pass identity index now have regression coverage.
 - 2026-08-25 whole-range review then identified a confirmation-to-replacement race in cached overwrite targets. Media and artifact-only overwrites now revalidate the protected semantic identity immediately before backup; regression tests cover missing, unreadable, changed, and newly ambiguous targets.
 - 2026-08-25 validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (205 passed), `uv run ruff format --check`, `uv run ruff check`, and `uv run python -m unittest discover -s tests` (20 passed).
+- 2026-08-26 formal whole-range review identified three remaining replacement-safety issues: filename-only Bilibili entry IDs could authorize overwrite, the fixed `ffmpeg-concat.txt` path was not transaction-owned, and validation returned a live path that could identify a different object by replacement time. The fixes separate duplicate evidence from destructive overwrite evidence, use exclusive per-run concat files, and validate only after the old media bundle has been acquired into an exclusive backup directory. Regression coverage includes filename-only cid/epid matches, preservation of user-owned concat files, rollback after identity changes, and retained recovery backups when an original path is recreated.
+- 2026-08-26 post-fix local validation: `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (207 passed), `uv run ruff format --check`, `uv run ruff check`, `uv run python -m unittest discover -s tests` (20 passed), project journal validation, and `git diff --check`.
