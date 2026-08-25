@@ -11,7 +11,7 @@
 - `/help` 会显示 bot 支持的命令；启动时也会向 Telegram 注册 slash command 提示。
 - 普通消息中的 YouTube 链接调用 `yt-dlp`，保存到视频下载目录，并尽量写入 metadata、封面、字幕和媒体库 sidecar。
 - 普通消息会从整段文本里扫描 HTTP(S) URL；标题、说明和 URL 外层标点会被忽略。
-- 视频下载会先写入隐藏 staging 目录，成功后再移动到最终目录；如果可从 URL 识别到本地已有相同 YouTube 或 Bilibili 视频，bot 会先提供覆盖、两者并存或取消的按钮选择。
+- 视频下载会先写入隐藏 staging 目录，成功后再移动到最终目录；如果可从 URL 识别到本地已有相同 YouTube 或 Bilibili 视频，bot 会先提供两者并存或取消，只有能唯一定位现有文件时才同时提供覆盖按钮。
 - `/pdf URL` 调用 uv 管理的 Python Playwright helper，使用系统 Chrome 打印 PDF；`pdf.auto_domains` 里的域名会自动走 PDF。
 - 全局并发由配置控制，超出的任务会排队。
 - 外部命令会流式采集 stdout/stderr，并监控输出目录文件大小；长时间无输出且无文件增长会自动失败，避免任务一直停在 `Started`。
@@ -36,7 +36,7 @@ cp config.example.toml config.toml
 
 `video.subtitle_languages` 默认按中文、英文、日语优先。YouTube 会先找人工字幕；如果这些语言没有人工字幕，再使用自动字幕。`write_nfo = true` 会为视频生成同 basename 的 `.nfo`，`keep_sidecars = true` 会让 yt-dlp 保留 `.info.json`、`.description` 和封面 sidecar。
 
-重复视频检测使用媒体 ID 扫描视频文件名与同 basename sidecar。YouTube 使用 URL 中的 video id；Bilibili 会先使用 URL 中的 `BV...` / `av...` / `ep...`，再通过 `bbdown-core` plan API 解析 bvid、aid、cid 和 epid，因此 `b23.tv` 短链和番剧条目也可以在下载前弹出重复选择。检测失败时任务仍走 staging keep-both 移动，避免直接覆盖最终目录里的同名文件。
+重复视频检测会单次扫描视频文件名与同 basename sidecar，建立媒体 ID 索引后复用。YouTube 使用 URL 中的 video id；Bilibili 会先使用 URL 中的 `BV...` / `av...` / `ep...`，再通过 `bbdown-core` plan API 解析 bvid、aid、cid 和 epid，因此 `b23.tv` 短链和番剧条目也可以在下载前弹出重复选择。Bilibili 的 bvid/aid 可能同时对应多个分 P，只用于提示存在相关文件；只有单条下载计划的 cid/epid 唯一匹配一个现有文件时才允许覆盖。全集和歧义匹配不会显示覆盖按钮，服务端也会再次拒绝不安全的覆盖请求。检测失败时任务仍走 staging keep-both 移动，避免直接覆盖最终目录里的同名文件。
 
 Bilibili 下载和登录不需要本机 `bbdown` 可执行文件；项目直接依赖 `BBDown-rust` 的 `bbdown-core` crate。`tools.ffmpeg` 仍会传给 crate 用于 mux，bot 负责 NFO、staging 和重复文件处理。
 

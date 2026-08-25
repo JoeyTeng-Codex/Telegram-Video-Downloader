@@ -1300,7 +1300,7 @@ async fn prompt_duplicate_choice(
 ) {
     let token = next_duplicate_callback_token(job_id);
     let prompt = duplicate_choice_message(job_id, job.label(), &duplicate);
-    let allow_overwrite = job_allows_duplicate_overwrite(&job);
+    let allow_overwrite = job_allows_duplicate_overwrite(&job, &duplicate);
     let now = Instant::now();
     {
         let mut pending_jobs = pending_duplicate_jobs().lock().await;
@@ -1430,7 +1430,7 @@ async fn handle_callback_query(
         }
         DuplicateCallbackAction::Run(action) => {
             if matches!(action, VideoDuplicateAction::Overwrite)
-                && !job_allows_duplicate_overwrite(&pending.job)
+                && !job_allows_duplicate_overwrite(&pending.job, &pending.duplicate)
             {
                 answer_callback_or_log(
                     &telegram,
@@ -1545,14 +1545,8 @@ fn default_run_mode(job: &JobRequest) -> JobRunMode {
     }
 }
 
-fn job_allows_duplicate_overwrite(job: &JobRequest) -> bool {
-    !matches!(
-        job,
-        JobRequest::Bilibili {
-            selection: Some(BilibiliSelection::All),
-            ..
-        }
-    )
+fn job_allows_duplicate_overwrite(job: &JobRequest, duplicate: &VideoDuplicate) -> bool {
+    duplicate.allows_overwrite_for(job)
 }
 
 impl From<DuplicateRun> for JobRunMode {
@@ -2439,14 +2433,41 @@ mod tests {
             data,
             vec!["dup:000000000000002a:keep", "dup:000000000000002a:cancel"]
         );
-        assert!(!job_allows_duplicate_overwrite(&JobRequest::Bilibili {
-            url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
-            selection: Some(BilibiliSelection::All)
-        }));
-        assert!(job_allows_duplicate_overwrite(&JobRequest::Bilibili {
-            url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
-            selection: Some(BilibiliSelection::Latest)
-        }));
+        let exact_duplicate = VideoDuplicate {
+            identity: crate::downloader::VideoIdentity {
+                provider: crate::downloader::VideoProvider::Bilibili,
+                id: "cid456".to_string(),
+            },
+            existing_videos: vec![PathBuf::from("episode.mp4")],
+        };
+        assert!(!job_allows_duplicate_overwrite(
+            &JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
+                selection: Some(BilibiliSelection::All)
+            },
+            &exact_duplicate,
+        ));
+        assert!(job_allows_duplicate_overwrite(
+            &JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
+                selection: Some(BilibiliSelection::Latest)
+            },
+            &exact_duplicate,
+        ));
+        let broad_duplicate = VideoDuplicate {
+            identity: crate::downloader::VideoIdentity {
+                provider: crate::downloader::VideoProvider::Bilibili,
+                id: "BV123".to_string(),
+            },
+            existing_videos: vec![PathBuf::from("episode.mp4")],
+        };
+        assert!(!job_allows_duplicate_overwrite(
+            &JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV123".to_string(),
+                selection: None,
+            },
+            &broad_duplicate,
+        ));
     }
 
     fn pending_duplicate_job(job_id: u64, created_at: Instant) -> PendingDuplicateJob {

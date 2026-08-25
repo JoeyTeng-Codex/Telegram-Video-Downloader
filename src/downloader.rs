@@ -89,15 +89,37 @@ impl VideoDuplicate {
         }
         lines.join("\n")
     }
+
+    pub fn allows_overwrite_for(&self, job: &JobRequest) -> bool {
+        if self.overwrite_target().is_none() {
+            return false;
+        }
+
+        match (job, self.identity.provider) {
+            (JobRequest::Youtube { .. }, VideoProvider::Youtube) => true,
+            (JobRequest::Bilibili { selection, .. }, VideoProvider::Bilibili) => {
+                !matches!(selection, Some(BilibiliSelection::All))
+                    && is_bilibili_entry_identity(&self.identity.id)
+            }
+            _ => false,
+        }
+    }
+
+    fn overwrite_target(&self) -> Option<&PathBuf> {
+        (self.existing_videos.len() == 1
+            && (self.identity.provider == VideoProvider::Youtube
+                || is_bilibili_entry_identity(&self.identity.id)))
+        .then(|| &self.existing_videos[0])
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct VideoIdentity {
     pub provider: VideoProvider,
     pub id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VideoProvider {
     Bilibili,
     Youtube,
@@ -110,6 +132,14 @@ impl VideoProvider {
             Self::Youtube => "youtube",
         }
     }
+}
+
+fn is_bilibili_entry_identity(id: &str) -> bool {
+    ["cid", "ep"].into_iter().any(|prefix| {
+        id.strip_prefix(prefix).is_some_and(|value| {
+            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,6 +335,9 @@ pub async fn run_job_with_duplicate_action(
     ) {
         return run_job(config, job, progress).await;
     }
+    if matches!(action, VideoDuplicateAction::Overwrite) && !duplicate.allows_overwrite_for(job) {
+        bail!("overwrite requires one exact video or Bilibili entry match");
+    }
 
     run_staged_video_job(config, job, action, duplicate, progress).await
 }
@@ -335,12 +368,16 @@ pub async fn find_video_duplicate_with_probe(
     config: &AppConfig,
     job: &JobRequest,
 ) -> Result<Option<VideoDuplicate>> {
+    let index = scan_video_identity_index(config, job).await?;
     let mut identities = video_identity(job).into_iter().collect::<Vec<_>>();
-    let direct_duplicate = if identities.is_empty() {
-        None
-    } else {
-        scan_video_duplicate_for_identities(config, job, identities.clone()).await?
-    };
+    let direct_overwrite_identities = identities
+        .iter()
+        .filter(|identity| identity_is_overwrite_safe(identity))
+        .cloned()
+        .collect::<Vec<_>>();
+    let direct_duplicate =
+        find_video_duplicate_in_index(&index, &identities, &direct_overwrite_identities);
+    let mut overwrite_identities = Vec::new();
 
     if let JobRequest::Bilibili { url, selection } = job {
         let probe_timeout = if direct_duplicate.is_some() {
@@ -349,7 +386,10 @@ pub async fn find_video_duplicate_with_probe(
             BILIBILI_METADATA_PROBE_TIMEOUT
         };
         match probe_bilibili_plan(config, url, *selection, probe_timeout).await {
-            Ok(plan) => push_bilibili_plan_identities(&mut identities, &plan),
+            Ok(plan) => {
+                push_bilibili_plan_identities(&mut identities, &plan);
+                overwrite_identities = bilibili_plan_overwrite_identities(&plan);
+            }
             Err(err) if identities.is_empty() && direct_duplicate.is_none() => {
                 return Err(err).with_context(|| {
                     format!("failed to probe Bilibili plan for duplicate check: {url}")
@@ -367,24 +407,21 @@ pub async fn find_video_duplicate_with_probe(
         return Ok(direct_duplicate);
     }
 
-    match scan_video_duplicate_for_identities(config, job, identities).await? {
+    match find_video_duplicate_in_index(&index, &identities, &overwrite_identities) {
         Some(duplicate) => Ok(Some(duplicate)),
         None => Ok(direct_duplicate),
     }
 }
 
-async fn scan_video_duplicate_for_identities(
+async fn scan_video_identity_index(
     config: &AppConfig,
     job: &JobRequest,
-    identities: Vec<VideoIdentity>,
-) -> Result<Option<VideoDuplicate>> {
+) -> Result<VideoIdentityIndex> {
     let scan_config = config.clone();
     let scan_job = job.clone();
-    tokio::task::spawn_blocking(move || {
-        find_video_duplicate_for_identities(&scan_config, &scan_job, identities)
-    })
-    .await
-    .context("duplicate scan task failed")?
+    tokio::task::spawn_blocking(move || build_video_identity_index(&scan_config, &scan_job))
+        .await
+        .context("duplicate scan task failed")?
 }
 
 fn find_video_duplicate_for_identities(
@@ -396,32 +433,86 @@ fn find_video_duplicate_for_identities(
         return Ok(None);
     }
 
+    let index = build_video_identity_index(config, job)?;
+    Ok(find_video_duplicate_in_index(&index, &identities, &[]))
+}
+
+#[derive(Debug, Default)]
+struct VideoIdentityIndex {
+    videos_by_identity: BTreeMap<VideoIdentity, Vec<PathBuf>>,
+}
+
+impl VideoIdentityIndex {
+    fn insert(&mut self, identity: VideoIdentity, video: &Path) {
+        let videos = self.videos_by_identity.entry(identity).or_default();
+        if !videos.iter().any(|existing| existing == video) {
+            videos.push(video.to_path_buf());
+        }
+    }
+
+    fn videos(&self, identity: &VideoIdentity) -> &[PathBuf] {
+        self.videos_by_identity
+            .get(identity)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+}
+
+fn build_video_identity_index(config: &AppConfig, job: &JobRequest) -> Result<VideoIdentityIndex> {
     let primary_media_kind = staged_primary_media_kind(config, job)?;
     let media_files =
         list_primary_media_files(&duplicate_scan_video_dir(config, job), primary_media_kind)?;
+    let mut index = VideoIdentityIndex::default();
+    for video in media_files {
+        index_video_identities(&mut index, &video);
+    }
+    Ok(index)
+}
+
+fn find_video_duplicate_in_index(
+    index: &VideoIdentityIndex,
+    identities: &[VideoIdentity],
+    overwrite_identities: &[VideoIdentity],
+) -> Option<VideoDuplicate> {
+    let mut exact_identity = None;
+    let mut exact_videos = BTreeSet::new();
+    for identity in overwrite_identities {
+        let videos = index.videos(identity);
+        if !videos.is_empty() && exact_identity.is_none() {
+            exact_identity = Some(identity.clone());
+        }
+        for video in videos {
+            exact_videos.insert(video.clone());
+        }
+    }
+    if exact_videos.len() == 1
+        && let Some(identity) = exact_identity
+    {
+        return Some(VideoDuplicate {
+            identity,
+            existing_videos: exact_videos.into_iter().collect(),
+        });
+    }
+
     let mut matched_identity = None;
     let mut seen_videos = BTreeSet::new();
     let mut existing_videos = Vec::new();
     for identity in identities {
-        let mut matched_this_identity = false;
-        for video in media_files
-            .iter()
-            .filter(|video| video_matches_identity(video, &identity))
-        {
-            matched_this_identity = true;
+        let videos = index.videos(identity);
+        for video in videos {
             if seen_videos.insert(video.clone()) {
                 existing_videos.push(video.clone());
             }
         }
-        if matched_this_identity && matched_identity.is_none() {
-            matched_identity = Some(identity);
+        if !videos.is_empty() && matched_identity.is_none() {
+            matched_identity = Some(identity.clone());
         }
     }
 
-    Ok(matched_identity.map(|identity| VideoDuplicate {
+    matched_identity.map(|identity| VideoDuplicate {
         identity,
         existing_videos,
-    }))
+    })
 }
 
 fn duplicate_scan_video_dir(config: &AppConfig, _job: &JobRequest) -> PathBuf {
@@ -3210,6 +3301,33 @@ fn push_bilibili_plan_identities(identities: &mut Vec<VideoIdentity>, plan: &Bil
     }
 }
 
+fn bilibili_plan_overwrite_identities(plan: &BilibiliDownloadPlan) -> Vec<VideoIdentity> {
+    let [entry] = plan.entries.as_slice() else {
+        return Vec::new();
+    };
+    let mut identities = Vec::new();
+    if entry.cid != 0 {
+        identities.push(VideoIdentity {
+            provider: VideoProvider::Bilibili,
+            id: format!("cid{}", entry.cid),
+        });
+    }
+    if let Some(epid) = entry.epid {
+        identities.push(VideoIdentity {
+            provider: VideoProvider::Bilibili,
+            id: format!("ep{epid}"),
+        });
+    }
+    identities
+}
+
+fn identity_is_overwrite_safe(identity: &VideoIdentity) -> bool {
+    match identity.provider {
+        VideoProvider::Youtube => true,
+        VideoProvider::Bilibili => is_bilibili_entry_identity(&identity.id),
+    }
+}
+
 fn push_unique_video_identity(identities: &mut Vec<VideoIdentity>, identity: VideoIdentity) {
     if identities
         .iter()
@@ -3288,131 +3406,179 @@ fn domain_or_subdomain(host: &str, domain: &str) -> bool {
             .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
-fn video_matches_identity(video: &Path, identity: &VideoIdentity) -> bool {
-    if video_file_stem_matches_id(video, &identity.id) {
-        return true;
+fn index_video_identities(index: &mut VideoIdentityIndex, video: &Path) {
+    for id in video_file_identity_ids(video) {
+        for provider in [VideoProvider::Bilibili, VideoProvider::Youtube] {
+            index.insert(
+                VideoIdentity {
+                    provider,
+                    id: id.clone(),
+                },
+                video,
+            );
+        }
     }
 
-    metadata_sidecar_paths(video).iter().any(|path| {
-        fs::read_to_string(path)
-            .is_ok_and(|content| metadata_sidecar_matches_identity(path, &content, identity))
-    })
+    for path in metadata_sidecar_paths(video) {
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for identity in metadata_sidecar_identities(&path, &content) {
+            index.insert(identity, video);
+        }
+    }
 }
 
-fn video_file_stem_matches_id(path: &Path, id: &str) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            let stem = match path.file_stem().and_then(|stem| stem.to_str()) {
-                Some(stem) => stem,
-                None => name,
-            };
-            stem == id || stem.ends_with(&format!("[{id}]")) || stem.ends_with(&format!("({id})"))
-        })
+fn video_file_identity_ids(path: &Path) -> Vec<String> {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return Vec::new();
+    };
+    let mut ids = vec![stem.to_string()];
+    for (open, close) in [('[', ']'), ('(', ')')] {
+        if let Some(id) = trailing_delimited_identity(stem, open, close)
+            && !ids.iter().any(|existing| existing == id)
+        {
+            ids.push(id.to_string());
+        }
+    }
+    ids
 }
 
-fn metadata_sidecar_matches_identity(path: &Path, content: &str, identity: &VideoIdentity) -> bool {
+fn trailing_delimited_identity(stem: &str, open: char, close: char) -> Option<&str> {
+    let without_close = stem.strip_suffix(close)?;
+    let start = without_close.rfind(open)? + open.len_utf8();
+    let identity = &without_close[start..];
+    (!identity.is_empty()).then_some(identity)
+}
+
+fn metadata_sidecar_identities(path: &Path, content: &str) -> Vec<VideoIdentity> {
     if path
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.ends_with(".info.json"))
     {
         return serde_json::from_str::<serde_json::Value>(content)
-            .is_ok_and(|metadata| info_json_matches_identity(&metadata, identity));
+            .map(|metadata| info_json_identities(&metadata))
+            .unwrap_or_default();
     }
 
     if path.extension().and_then(|extension| extension.to_str()) == Some("nfo") {
-        return nfo_matches_identity(content, identity);
+        return nfo_identities(content);
     }
 
-    false
+    Vec::new()
 }
 
-fn info_json_matches_identity(metadata: &serde_json::Value, identity: &VideoIdentity) -> bool {
-    json_string_field(metadata, "id") == Some(identity.id.as_str())
-        && (["extractor", "extractor_key", "ie_key"]
-            .into_iter()
-            .filter_map(|key| json_string_field(metadata, key))
-            .any(|value| {
-                value
-                    .to_ascii_lowercase()
-                    .contains(identity.provider.as_str())
-            })
-            || json_string_field(metadata, "webpage_url")
-                .is_some_and(|url| provider_url_matches_identity(url, identity.provider)))
+fn info_json_identities(metadata: &serde_json::Value) -> Vec<VideoIdentity> {
+    let Some(id) = json_string_field(metadata, "id").filter(|id| !id.trim().is_empty()) else {
+        return Vec::new();
+    };
+    let mut providers = BTreeSet::new();
+    for value in ["extractor", "extractor_key", "ie_key"]
+        .into_iter()
+        .filter_map(|key| json_string_field(metadata, key))
+    {
+        let value = value.to_ascii_lowercase();
+        for provider in [VideoProvider::Bilibili, VideoProvider::Youtube] {
+            if value.contains(provider.as_str()) {
+                providers.insert(provider);
+            }
+        }
+    }
+    if let Some(provider) = json_string_field(metadata, "webpage_url").and_then(provider_from_url) {
+        providers.insert(provider);
+    }
+    providers
+        .into_iter()
+        .map(|provider| VideoIdentity {
+            provider,
+            id: id.to_string(),
+        })
+        .collect()
 }
 
 fn json_string_field<'a>(metadata: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     metadata.get(key)?.as_str()
 }
 
-fn provider_url_matches_identity(url: &str, provider: VideoProvider) -> bool {
-    let Ok(url) = url::Url::parse(url) else {
-        return false;
-    };
-    let Some(host) = url.host_str().map(|host| host.to_ascii_lowercase()) else {
-        return false;
-    };
-    match provider {
-        VideoProvider::Bilibili => {
-            domain_or_subdomain(&host, "bilibili.com")
-                || domain_or_subdomain(&host, "bilibili.tv")
-                || host == "b23.tv"
-        }
-        VideoProvider::Youtube => {
-            domain_or_subdomain(&host, "youtube.com")
-                || domain_or_subdomain(&host, "youtube-nocookie.com")
-                || host == "youtu.be"
-        }
+fn provider_from_url(raw_url: &str) -> Option<VideoProvider> {
+    let url = url::Url::parse(raw_url).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    if domain_or_subdomain(&host, "bilibili.com")
+        || domain_or_subdomain(&host, "bilibili.tv")
+        || host == "b23.tv"
+    {
+        Some(VideoProvider::Bilibili)
+    } else if domain_or_subdomain(&host, "youtube.com")
+        || domain_or_subdomain(&host, "youtube-nocookie.com")
+        || host == "youtu.be"
+    {
+        Some(VideoProvider::Youtube)
+    } else {
+        None
     }
 }
 
-fn nfo_matches_identity(content: &str, identity: &VideoIdentity) -> bool {
+fn nfo_identities(content: &str) -> Vec<VideoIdentity> {
+    let mut identities = Vec::new();
     for chunk in content.split("<uniqueid").skip(1) {
         let Some((tag, rest)) = chunk.split_once('>') else {
             continue;
         };
-        if !uniqueid_tag_matches_provider(tag, identity.provider) {
+        let tag = tag.to_ascii_lowercase();
+        let Some(unique_id_type) = ['"', '\'']
+            .into_iter()
+            .find_map(|quote| uniqueid_tag_type(&tag, quote))
+        else {
             continue;
-        }
+        };
+        let Some(provider) = unique_id_type_provider(unique_id_type) else {
+            continue;
+        };
         let Some((value, _)) = rest.split_once("</uniqueid>") else {
             continue;
         };
         let value = value.trim();
-        if value == identity.id || legacy_bilibili_aid_nfo_matches(tag, value, identity) {
-            return true;
+        if value.is_empty() {
+            continue;
+        }
+        push_unique_video_identity(
+            &mut identities,
+            VideoIdentity {
+                provider,
+                id: value.to_string(),
+            },
+        );
+        if provider == VideoProvider::Bilibili
+            && matches!(unique_id_type, "bilibili-aid" | "bilibili_aid")
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            push_unique_video_identity(
+                &mut identities,
+                VideoIdentity {
+                    provider,
+                    id: format!("av{value}"),
+                },
+            );
         }
     }
-    false
+    identities
 }
 
-fn legacy_bilibili_aid_nfo_matches(tag: &str, value: &str, identity: &VideoIdentity) -> bool {
-    identity.provider == VideoProvider::Bilibili
-        && uniqueid_tag_has_type(tag, "bilibili-aid")
-        && identity.id.strip_prefix("av") == Some(value)
-}
-
-fn uniqueid_tag_has_type(tag: &str, expected: &str) -> bool {
-    let tag = tag.to_ascii_lowercase();
-    ['"', '\'']
+fn unique_id_type_provider(unique_id_type: &str) -> Option<VideoProvider> {
+    [VideoProvider::Bilibili, VideoProvider::Youtube]
         .into_iter()
-        .any(|quote| uniqueid_tag_type(&tag, quote) == Some(expected))
-}
-
-fn uniqueid_tag_matches_provider(tag: &str, provider: VideoProvider) -> bool {
-    let tag = tag.to_ascii_lowercase();
-    let provider = provider.as_str();
-    ['"', '\''].into_iter().any(|quote| {
-        uniqueid_tag_type(&tag, quote).is_some_and(|value| {
-            value == provider
-                || value.strip_prefix(provider).is_some_and(|suffix| {
-                    matches!(
-                        suffix,
-                        "-aid" | "_aid" | "-cid" | "_cid" | "-epid" | "_epid"
-                    )
-                })
+        .find(|provider| {
+            unique_id_type == provider.as_str()
+                || unique_id_type
+                    .strip_prefix(provider.as_str())
+                    .is_some_and(|suffix| {
+                        matches!(
+                            suffix,
+                            "-aid" | "_aid" | "-cid" | "_cid" | "-epid" | "_epid"
+                        )
+                    })
         })
-    })
 }
 
 fn uniqueid_tag_type(tag: &str, quote: char) -> Option<&str> {
@@ -3616,12 +3782,19 @@ fn move_staged_video_files(
         .iter()
         .filter(|path| is_primary_media_file(path, primary_media_kind))
         .count();
-    let overwritten_existing_videos = duplicate
-        .existing_videos
-        .iter()
-        .take(staged_media_count)
-        .cloned()
-        .collect::<Vec<_>>();
+    let overwritten_existing_videos = if matches!(action, VideoDuplicateAction::Overwrite) {
+        if staged_media_count != 1 {
+            bail!("overwrite requires exactly one staged primary media file");
+        }
+        vec![
+            duplicate
+                .overwrite_target()
+                .context("overwrite target is not an exact unique match")?
+                .clone(),
+        ]
+    } else {
+        Vec::new()
+    };
     let backups = match action {
         VideoDuplicateAction::Overwrite => {
             backup_existing_duplicate_artifacts(&overwritten_existing_videos)?
@@ -3677,7 +3850,7 @@ fn move_staged_artifact_files(
     action: VideoDuplicateAction,
     duplicate: &VideoDuplicate,
 ) -> Result<Vec<PathBuf>> {
-    let plan = staged_artifact_move_plan(staging_dir, final_dir, staged_files, action, duplicate);
+    let plan = staged_artifact_move_plan(staging_dir, final_dir, staged_files, action, duplicate)?;
     let backups = if matches!(action, VideoDuplicateAction::Overwrite) {
         backup_existing_paths(plan.iter().map(|step| step.destination.clone()))?
     } else {
@@ -3704,11 +3877,17 @@ fn staged_artifact_move_plan(
     staged_files: &[PathBuf],
     action: VideoDuplicateAction,
     duplicate: &VideoDuplicate,
-) -> Vec<MoveStep> {
+) -> Result<Vec<MoveStep>> {
     let mut reserved = BTreeSet::new();
-    let overwrite_video = matches!(action, VideoDuplicateAction::Overwrite)
-        .then(|| duplicate.existing_videos.first())
-        .flatten();
+    let overwrite_video = if matches!(action, VideoDuplicateAction::Overwrite) {
+        Some(
+            duplicate
+                .overwrite_target()
+                .context("artifact overwrite target is not an exact unique match")?,
+        )
+    } else {
+        None
+    };
     let mut steps = Vec::with_capacity(staged_files.len());
     for source in staged_files {
         let preferred = overwrite_video
@@ -3727,7 +3906,7 @@ fn staged_artifact_move_plan(
             destination,
         });
     }
-    steps
+    Ok(steps)
 }
 
 fn artifact_overwrite_destination(source: &Path, target_video: &Path) -> Option<PathBuf> {
@@ -3800,14 +3979,26 @@ fn staged_move_plan(
         .iter()
         .filter(|path| is_primary_media_file(path, primary_media_kind))
         .collect::<Vec<_>>();
+    let overwrite_target = if matches!(action, VideoDuplicateAction::Overwrite) {
+        if staged_videos.len() != 1 {
+            bail!("overwrite requires exactly one staged primary media file");
+        }
+        Some(
+            duplicate
+                .overwrite_target()
+                .context("overwrite target is not an exact unique match")?,
+        )
+    } else {
+        None
+    };
     let mut video_destinations = Vec::with_capacity(staged_videos.len());
-    for (index, staged_video) in staged_videos.iter().enumerate() {
-        let preferred = match (&action, duplicate.existing_videos.get(index)) {
-            (VideoDuplicateAction::Overwrite, Some(existing_video)) => unique_path_avoiding(
+    for staged_video in &staged_videos {
+        let preferred = match overwrite_target {
+            Some(existing_video) => unique_path_avoiding(
                 overwrite_video_destination(existing_video, staged_video),
                 &reserved,
             ),
-            _ => unique_primary_media_path_avoiding(
+            None => unique_primary_media_path_avoiding(
                 relative_destination(staging_dir, final_dir, staged_video),
                 &reserved,
             ),
@@ -4812,6 +5003,125 @@ mod tests {
     }
 
     #[test]
+    fn bilibili_overwrite_requires_the_same_entry_identity() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("duplicate-bilibili-cross-entry");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        config.downloads.video_dir = video_dir.clone();
+        let first_entry = video_dir.join("Part 1.mp4");
+        fs::write(&first_entry, "part-1").expect("first entry should write");
+        fs::write(
+            first_entry.with_extension("nfo"),
+            r#"<movie>
+            <uniqueid type="bilibili">BV123</uniqueid>
+            <uniqueid type="bilibili-cid">cid111</uniqueid>
+            </movie>"#,
+        )
+        .expect("first entry nfo should write");
+        let job = JobRequest::Bilibili {
+            url: "https://www.bilibili.com/video/BV123?p=2".to_string(),
+            selection: None,
+        };
+        let plan = BilibiliDownloadPlan {
+            title: "Multi-part video".to_string(),
+            entries: vec![BilibiliDownloadEntry {
+                index: 2,
+                aid: 123,
+                bvid: Some("BV123".to_string()),
+                cid: 222,
+                epid: Some(333),
+                title: "Part 2".to_string(),
+            }],
+        };
+        let mut identities = video_identity(&job).into_iter().collect::<Vec<_>>();
+        push_bilibili_plan_identities(&mut identities, &plan);
+        let overwrite_identities = bilibili_plan_overwrite_identities(&plan);
+
+        let index = build_video_identity_index(&config, &job).expect("index should build");
+        let broad_duplicate =
+            find_video_duplicate_in_index(&index, &identities, &overwrite_identities)
+                .expect("shared BVID should still prompt for a duplicate");
+        assert_eq!(broad_duplicate.identity.id, "BV123");
+        assert_eq!(broad_duplicate.existing_videos, vec![first_entry.clone()]);
+        assert!(!broad_duplicate.allows_overwrite_for(&job));
+
+        let second_entry = video_dir.join("Part 2.mp4");
+        fs::write(&second_entry, "part-2").expect("second entry should write");
+        fs::write(
+            second_entry.with_extension("nfo"),
+            r#"<movie>
+            <uniqueid type="bilibili">BV123</uniqueid>
+            <uniqueid type="bilibili-cid">cid222</uniqueid>
+            <uniqueid type="bilibili-epid">ep333</uniqueid>
+            </movie>"#,
+        )
+        .expect("second entry nfo should write");
+        let index = build_video_identity_index(&config, &job).expect("index should rebuild");
+        let exact_duplicate =
+            find_video_duplicate_in_index(&index, &identities, &overwrite_identities)
+                .expect("same cid should identify the exact duplicate");
+        assert_eq!(exact_duplicate.identity.id, "cid222");
+        assert_eq!(exact_duplicate.existing_videos, vec![second_entry.clone()]);
+        assert!(exact_duplicate.allows_overwrite_for(&job));
+
+        let conflicting_entry = video_dir.join("Conflicting episode identity.mp4");
+        fs::write(&conflicting_entry, "conflict").expect("conflicting entry should write");
+        fs::write(
+            conflicting_entry.with_extension("nfo"),
+            r#"<movie>
+            <uniqueid type="bilibili-epid">ep333</uniqueid>
+            </movie>"#,
+        )
+        .expect("conflicting entry nfo should write");
+        let index = build_video_identity_index(&config, &job).expect("index should rebuild");
+        let ambiguous_duplicate =
+            find_video_duplicate_in_index(&index, &identities, &overwrite_identities)
+                .expect("conflicting entry identities should still prompt");
+        assert!(!ambiguous_duplicate.allows_overwrite_for(&job));
+        assert!(ambiguous_duplicate.existing_videos.contains(&second_entry));
+        assert!(
+            ambiguous_duplicate
+                .existing_videos
+                .contains(&conflicting_entry)
+        );
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn duplicate_identity_index_does_not_reread_sidecars_for_each_query() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("duplicate-identity-index");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        config.downloads.video_dir = video_dir.clone();
+        let video = video_dir.join("Indexed.mp4");
+        let nfo = video.with_extension("nfo");
+        fs::write(&video, "video").expect("video should write");
+        fs::write(
+            &nfo,
+            r#"<movie>
+            <uniqueid type="bilibili">BV123</uniqueid>
+            <uniqueid type="bilibili-cid">cid456</uniqueid>
+            </movie>"#,
+        )
+        .expect("nfo should write");
+        let job = JobRequest::Bilibili {
+            url: "https://www.bilibili.com/video/BV123".to_string(),
+            selection: None,
+        };
+        let index = build_video_identity_index(&config, &job).expect("index should build");
+        fs::remove_file(nfo).expect("sidecar should be removable after indexing");
+
+        for id in ["BV123", "cid456"] {
+            let identity = VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: id.to_string(),
+            };
+            assert_eq!(index.videos(&identity), std::slice::from_ref(&video));
+        }
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
     fn youtube_duplicate_detection_keeps_id_case_sensitive() {
         let mut config = test_config();
         let video_dir = temp_test_dir("duplicate-youtube-id-case");
@@ -5448,7 +5758,7 @@ mod tests {
         let duplicate = VideoDuplicate {
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
-                id: "BV123".to_string(),
+                id: "cid123".to_string(),
             },
             existing_videos: vec![existing.clone()],
         };
@@ -5620,7 +5930,7 @@ mod tests {
         let duplicate = VideoDuplicate {
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
-                id: "BV123".to_string(),
+                id: "cid123".to_string(),
             },
             existing_videos: vec![existing.clone()],
         };
@@ -5673,7 +5983,7 @@ mod tests {
         let duplicate = VideoDuplicate {
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
-                id: "BV123".to_string(),
+                id: "cid123".to_string(),
             },
             existing_videos: vec![existing.clone()],
         };
@@ -5722,7 +6032,7 @@ mod tests {
         let duplicate = VideoDuplicate {
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
-                id: "BV123".to_string(),
+                id: "cid123".to_string(),
             },
             existing_videos: vec![existing.clone()],
         };
@@ -6356,7 +6666,7 @@ mod tests {
     }
 
     #[test]
-    fn overwrite_keeps_unmapped_duplicate_videos() {
+    fn overwrite_rejects_ambiguous_duplicate_videos() {
         let final_dir = temp_test_dir("overwrite-unmapped-duplicates");
         let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
         fs::create_dir_all(&staging_dir).expect("staging dir should create");
@@ -6377,7 +6687,7 @@ mod tests {
         };
         let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
 
-        let moved = move_staged_video_files(
+        let error = move_staged_video_files(
             &staging_dir,
             &final_dir,
             &staged_files,
@@ -6385,12 +6695,12 @@ mod tests {
             &duplicate,
             StagedPrimaryMediaKind::Video,
         )
-        .expect("staged files should overwrite only mapped existing files");
+        .expect_err("ambiguous duplicates must not select an overwrite target by position");
 
-        assert_eq!(moved, vec![first_existing.clone()]);
+        assert!(error.to_string().contains("exact unique match"));
         assert_eq!(
-            fs::read_to_string(first_existing).expect("first existing should be replaced"),
-            "new-video"
+            fs::read_to_string(first_existing).expect("first existing should remain"),
+            "old-first"
         );
         assert_eq!(
             fs::read_to_string(second_existing).expect("second existing should remain"),
@@ -6400,6 +6710,10 @@ mod tests {
             fs::read_to_string(final_dir.join("Second [PHH1wTDF-1M].nfo"))
                 .expect("second nfo should remain"),
             "old-second-nfo"
+        );
+        assert_eq!(
+            fs::read_to_string(staged).expect("staged file should remain after rejection"),
+            "new-video"
         );
         let _ = fs::remove_dir_all(final_dir);
     }
