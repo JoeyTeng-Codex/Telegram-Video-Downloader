@@ -3885,6 +3885,7 @@ struct AcquiredOverwrite {
     target: PathBuf,
     backups: Vec<FileBackup>,
     backup_dir: PathBuf,
+    target_restored: bool,
 }
 
 impl AcquiredOverwrite {
@@ -3910,11 +3911,34 @@ impl AcquiredOverwrite {
             self.backups.insert(index, backup);
             return Err(err);
         }
+        if original == self.target {
+            self.target_restored = true;
+        }
+        Ok(())
+    }
+
+    fn restore_unreplaced(&mut self, replaced_destinations: &BTreeSet<PathBuf>) -> Result<()> {
+        let target = self.target.clone();
+        self.restore_original(&target)?;
+
+        let untouched = self
+            .backups
+            .iter()
+            .filter(|backup| !replaced_destinations.contains(backup.original.as_path()))
+            .map(|backup| backup.original.clone())
+            .collect::<Vec<_>>();
+        for original in untouched {
+            self.restore_original(&original)?;
+        }
         Ok(())
     }
 
     fn restore(self) -> Result<()> {
-        restore_backups(&self.backups, &self.backup_dir, &self.target)
+        if self.target_restored {
+            restore_remaining_backups(&self.backups, &self.backup_dir, &self.target)
+        } else {
+            restore_backups(&self.backups, &self.backup_dir, &self.target)
+        }
     }
 
     fn commit(self) -> Result<()> {
@@ -3976,6 +4000,7 @@ fn acquire_and_validate_overwrite_target(
                 target,
                 backups,
                 backup_dir,
+                target_restored: false,
             },
         ));
     }
@@ -3987,6 +4012,7 @@ fn acquire_and_validate_overwrite_target(
                     target,
                     backups,
                     backup_dir,
+                    target_restored: false,
                 },
             ));
         }
@@ -3996,6 +4022,7 @@ fn acquire_and_validate_overwrite_target(
         target,
         backups,
         backup_dir,
+        target_restored: false,
     };
     if let Err(err) =
         validate_acquired_overwrite(final_dir, duplicate, primary_media_kind, &acquired)
@@ -4295,12 +4322,15 @@ fn move_staged_artifact_files(
         .iter()
         .map(|step| (step.source.clone(), step.destination.clone()))
         .collect::<Vec<_>>();
+    let replaced_destinations = moved_pairs
+        .iter()
+        .map(|(_, destination)| destination.clone())
+        .collect::<BTreeSet<_>>();
     let move_result = execute_artifact_move_plan(plan);
     match move_result {
         Ok(moved_files) => {
             if let Some(mut acquired) = acquisition.take() {
-                let target = acquired.target().to_path_buf();
-                if let Err(err) = acquired.restore_original(&target) {
+                if let Err(err) = acquired.restore_unreplaced(&replaced_destinations) {
                     rollback_moves(&moved_pairs);
                     return Err(rollback_acquired_overwrite(err, acquired));
                 }
@@ -4792,6 +4822,47 @@ fn restore_backups(backups: &[FileBackup], backup_dir: &Path, target: &Path) -> 
         .rev()
         .filter(|backup| backup.original != target)
     {
+        if let Err(err) = restore_file_backup(backup) {
+            failures.push(format!("{err:#}"));
+        }
+    }
+    if failures.is_empty() {
+        match fs::remove_dir(backup_dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => failures.push(format!(
+                "failed to remove overwrite backup directory {}: {err}",
+                backup_dir.display()
+            )),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", failures.join("; "))
+    }
+}
+
+fn restore_remaining_backups(
+    backups: &[FileBackup],
+    backup_dir: &Path,
+    restored_target: &Path,
+) -> Result<()> {
+    let target_metadata = fs::symlink_metadata(restored_target).with_context(|| {
+        format!(
+            "failed to inspect restored overwrite target {}",
+            restored_target.display()
+        )
+    })?;
+    if !target_metadata.file_type().is_file() {
+        bail!(
+            "restored overwrite target is no longer a regular file: {}",
+            restored_target.display()
+        );
+    }
+
+    let mut failures = Vec::new();
+    for backup in backups.iter().rev() {
         if let Err(err) = restore_file_backup(backup) {
             failures.push(format!("{err:#}"));
         }
@@ -6277,6 +6348,11 @@ mod tests {
         let existing = final_dir.join("Existing Title.mkv");
         fs::write(&existing, "video").expect("existing video should write");
         write_bilibili_identity_nfo(&existing, "cid123");
+        let nfo = existing.with_extension("nfo");
+        let description = existing.with_extension("description");
+        let subtitle = final_dir.join("Existing Title.zh-Hans.srt");
+        fs::write(&description, "old-description").expect("old description should write");
+        fs::write(&subtitle, "old-subtitle").expect("old subtitle should write");
         fs::write(existing.with_extension("xml"), "old-xml").expect("old xml should write");
         fs::write(final_dir.join("Existing Title.cover.jpg"), "old-cover")
             .expect("old cover should write");
@@ -6316,6 +6392,29 @@ mod tests {
         assert_eq!(
             fs::read_to_string(existing).expect("video should remain"),
             "video"
+        );
+        assert!(
+            fs::read_to_string(nfo)
+                .expect("identity nfo should remain")
+                .contains("cid123")
+        );
+        assert_eq!(
+            fs::read_to_string(description).expect("description should remain"),
+            "old-description"
+        );
+        assert_eq!(
+            fs::read_to_string(subtitle).expect("subtitle should remain"),
+            "old-subtitle"
+        );
+        assert!(
+            fs::read_dir(&final_dir)
+                .expect("final dir should scan")
+                .all(|entry| !entry
+                    .expect("directory entry should read")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(OVERWRITE_BACKUP_DIR_PREFIX)),
+            "overwrite backup directory should be removed"
         );
         let _ = fs::remove_dir_all(final_dir);
     }

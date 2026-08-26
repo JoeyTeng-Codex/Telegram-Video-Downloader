@@ -733,7 +733,13 @@ async fn save_bbdown_login_credentials(
     ensure_bbdown_login_active(auth_generation)?;
     let summary = bilibili_core::credential_runtime(config)?.save_merged(credentials)?;
     ensure_bbdown_login_active(auth_generation)?;
-    bilibili_auth::delete_auth_state(&config.bilibili.auth.state_path)?;
+    if let Err(err) = bilibili_auth::delete_auth_state(&config.bilibili.auth.state_path) {
+        warn!(
+            error = %err,
+            path = %config.bilibili.auth.state_path.display(),
+            "fresh BBDown credentials saved but legacy auth state cleanup failed"
+        );
+    }
     ensure_bbdown_login_active(auth_generation)?;
     Ok(summary)
 }
@@ -2252,6 +2258,37 @@ mod tests {
             !config.bilibili.auth.state_path.exists(),
             "malformed legacy state should still be cleaned after fresh save"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn fresh_login_save_ignores_legacy_auth_cleanup_failure() {
+        let _guard = TEST_AUTH_GENERATION_LOCK.lock().await;
+        let root = temp_main_test_dir("fresh-login-cleanup-failure");
+        fs::create_dir_all(&root).expect("temp dir should create");
+        let mut config = AppConfig::for_test();
+        config.bilibili.auth.state_path = root.join("legacy-auth-directory");
+        config.bilibili.auth.credential_file = root.join("bbdown-credentials.json");
+        fs::create_dir(&config.bilibili.auth.state_path)
+            .expect("legacy state directory should create");
+        let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+
+        let summary = save_bbdown_login_credentials(
+            &config,
+            generation,
+            bbdown_core::Credentials::default().with_cookie("SESSDATA=fresh"),
+        )
+        .await
+        .expect("saved credentials should outlive legacy cleanup failure");
+
+        assert!(summary.has_cookie);
+        let credentials: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&config.bilibili.auth.credential_file)
+                .expect("credential file should read"),
+        )
+        .expect("credential file should parse");
+        assert_eq!(credentials["cookie"], "SESSDATA=fresh");
+        assert!(config.bilibili.auth.state_path.is_dir());
         let _ = fs::remove_dir_all(root);
     }
 
