@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use rustix::fd::{AsFd, OwnedFd};
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
+use rustix::fs::{AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EntryIdentity {
@@ -22,6 +22,14 @@ impl EntryIdentity {
 
     pub(crate) fn is_dir(self) -> bool {
         self.file_type == FileType::Directory
+    }
+
+    pub(crate) fn device(self) -> u64 {
+        self.device
+    }
+
+    pub(crate) fn inode(self) -> u64 {
+        self.inode
     }
 }
 
@@ -97,6 +105,20 @@ impl BoundFile {
         }
         self.validate_identity()?;
         Ok(contents)
+    }
+
+    pub(crate) fn lock_exclusive(&self) -> Result<()> {
+        rustix::fs::flock(self.fd.as_ref(), FlockOperation::LockExclusive)
+            .map_err(errno_to_io)
+            .context("failed to lock bound file")
+    }
+
+    pub(crate) fn try_lock_exclusive(&self) -> Result<bool> {
+        match rustix::fs::flock(self.fd.as_ref(), FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(true),
+            Err(err) if errno_to_io(err).kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+            Err(err) => Err(errno_to_io(err)).context("failed to lock bound file"),
+        }
     }
 }
 
@@ -190,6 +212,34 @@ impl RootedFs {
         }))
     }
 
+    pub(crate) fn open_or_create_bound_file(&self, path: &Path, mode: u16) -> Result<BoundFile> {
+        let entry = self.bind_entry(path, false)?;
+        let fd = rustix::fs::openat(
+            entry.parent.fd.as_ref(),
+            &entry.leaf,
+            OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::from_raw_mode(mode),
+        )
+        .map_err(errno_to_io)
+        .with_context(|| format!("failed to open bound file {}", path.display()))?;
+        let identity = identity_for_fd(&fd)?;
+        if !identity.is_file() {
+            bail!("bound path is not a regular file: {}", path.display());
+        }
+        if identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(identity) {
+            bail!(
+                "bound file identity changed while opening: {}",
+                path.display()
+            );
+        }
+        self.validate_parent(&entry.parent)?;
+        sync_directory(entry.parent.fd.as_ref())?;
+        Ok(BoundFile {
+            fd: Arc::new(fd),
+            identity,
+        })
+    }
+
     pub(crate) fn create_new_bound_file(
         &self,
         path: &Path,
@@ -222,6 +272,46 @@ impl RootedFs {
         self.validate_parent(&entry.parent)?;
         sync_directory(entry.parent.fd.as_ref())?;
         Ok((entry, identity))
+    }
+
+    pub(crate) fn rewrite_bound_file_if_identity(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+        contents: &[u8],
+    ) -> Result<()> {
+        self.validate_bound_parent(&entry.parent)?;
+        let fd = rustix::fs::openat(
+            entry.parent.fd.as_ref(),
+            &entry.leaf,
+            OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(errno_to_io)
+        .with_context(|| format!("failed to open bound file {}", entry.path.display()))?;
+        if identity_for_fd(&fd)? != expected
+            || identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected)
+        {
+            bail!(
+                "bound file identity changed before rewrite: {}",
+                entry.path.display()
+            );
+        }
+        let mut file = File::from(fd);
+        file.set_len(0)
+            .and_then(|()| file.write_all(contents))
+            .and_then(|()| file.sync_all())
+            .with_context(|| format!("failed to persist bound file {}", entry.path.display()))?;
+        if identity_for_fd(&file)? != expected
+            || identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected)
+        {
+            bail!(
+                "bound file identity changed after rewrite: {}",
+                entry.path.display()
+            );
+        }
+        self.validate_bound_parent(&entry.parent)?;
+        sync_directory(entry.parent.fd.as_ref())
     }
 
     pub(crate) fn list_bound_directory(

@@ -18,7 +18,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::{Mutex, MutexGuard, watch};
-use tokio::time::{Instant, sleep_until, timeout as tokio_timeout};
+use tokio::time::{Instant, sleep, sleep_until, timeout as tokio_timeout};
 use tracing::info;
 
 use crate::bilibili_auth;
@@ -31,10 +31,11 @@ static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static OVERWRITE_BACKUP_COUNTER: AtomicU64 = AtomicU64::new(1);
 const VIDEO_STAGING_DIR_NAME: &str = ".telegram-video-downloader-staging";
+const VIDEO_OUTPUT_LOCK_FILE_NAME: &str = ".telegram-video-downloader.lock";
 const BILIBILI_FFMPEG_CONCAT_FILE_PREFIX: &str = ".telegram-video-downloader-ffmpeg-concat";
 const OVERWRITE_BACKUP_DIR_PREFIX: &str = ".telegram-video-downloader-overwrite";
 const OVERWRITE_RECOVERY_MANIFEST_NAME: &str = ".transaction.json";
-const OVERWRITE_RECOVERY_MANIFEST_VERSION: u32 = 1;
+const OVERWRITE_RECOVERY_MANIFEST_VERSION: u32 = 2;
 const OVERWRITE_RECOVERY_MANIFEST_LIMIT: usize = 16 * 1024;
 const VIDEO_SIDECAR_EXTENSIONS: &[&str] = &[
     "nfo",
@@ -289,6 +290,17 @@ struct BilibiliDownloadedFile {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct BilibiliMuxReport {
     output_path: PathBuf,
+    #[serde(skip)]
+    bound_output: Option<BoundFile>,
+    #[serde(skip)]
+    bound_inputs: Vec<BoundBilibiliMuxInput>,
+}
+
+#[derive(Debug, Clone)]
+struct BoundBilibiliMuxInput {
+    path: PathBuf,
+    entry: BoundEntry,
+    file: BoundFile,
 }
 
 impl From<&bbdown_core::DownloadPlan> for BilibiliDownloadPlan {
@@ -332,6 +344,8 @@ impl From<&DownloadReport> for BilibiliDownloadReport {
                         .collect(),
                     mux: entry.mux.as_ref().map(|mux| BilibiliMuxReport {
                         output_path: mux.output_path.clone(),
+                        bound_output: None,
+                        bound_inputs: Vec::new(),
                     }),
                 })
                 .collect(),
@@ -661,7 +675,12 @@ async fn run_bilibili_job(
     selection: Option<BilibiliSelection>,
     progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
-    let _guard = video_output_lock("Bilibili download", progress.as_ref()).await;
+    let _guard = video_output_lock(
+        &config.downloads.video_dir,
+        "Bilibili download",
+        progress.as_ref(),
+    )
+    .await?;
     let root = RootedFs::new(&config.downloads.video_dir)?;
     run_bilibili_job_locked(config, &root, url, selection, None, progress).await
 }
@@ -894,6 +913,7 @@ async fn mux_bilibili_report_media(
             entry.title.as_str()
         };
         let output_path = unique_bilibili_mux_output_path(&entry_dir, title, "mp4", since);
+        let bound_inputs = bind_bilibili_mux_inputs(root, &media_inputs)?;
         let (spec, concat_file) =
             bilibili_local_mux_command_spec(config, root, &media_inputs, &entry_dir, &output_path)?;
         let output_result = run_command(config, &spec, progress.clone()).await;
@@ -917,18 +937,39 @@ async fn mux_bilibili_report_media(
                 )
             );
         }
-        if !root
-            .entry_identity(&output_path)?
-            .is_some_and(EntryIdentity::is_file)
-        {
-            bail!(
+        let bound_output = root.open_bound_file(&output_path)?.with_context(|| {
+            format!(
                 "Bilibili mux finished without creating {}",
                 output_path.display()
-            );
-        }
-        entry.mux = Some(BilibiliMuxReport { output_path });
+            )
+        })?;
+        entry.mux = Some(BilibiliMuxReport {
+            output_path,
+            bound_output: Some(bound_output),
+            bound_inputs,
+        });
     }
     Ok(())
+}
+
+fn bind_bilibili_mux_inputs(
+    root: &RootedFs,
+    media_inputs: &[BilibiliMediaInput],
+) -> Result<Vec<BoundBilibiliMuxInput>> {
+    media_inputs
+        .iter()
+        .map(|input| {
+            let entry = root.bind_entry(&input.path, false)?;
+            let file = root.open_bound_file(&input.path)?.with_context(|| {
+                format!("Bilibili mux input is missing: {}", input.path.display())
+            })?;
+            Ok(BoundBilibiliMuxInput {
+                path: input.path.clone(),
+                entry,
+                file,
+            })
+        })
+        .collect()
 }
 
 fn bilibili_entry_media_inputs(
@@ -1079,23 +1120,80 @@ fn ffmpeg_concat_file_list(media_inputs: &[BilibiliMediaInput]) -> String {
 
 fn cleanup_bilibili_mux_input_files(
     root: &RootedFs,
-    cwd: &Path,
+    _cwd: &Path,
     report: &BilibiliDownloadReport,
 ) -> Result<()> {
-    for entry in &report.entries {
+    let muxes = report
+        .entries
+        .iter()
+        .filter_map(|entry| entry.mux.as_ref())
+        .filter(|mux| mux.bound_output.is_some())
+        .collect::<Vec<_>>();
+    for mux in &muxes {
+        validate_bilibili_mux_output(root, mux)?;
+        for input in &mux.bound_inputs {
+            input.file.validate_identity()?;
+            if root.bound_entry_identity(&input.entry)? != Some(input.file.identity()) {
+                bail!(
+                    "Bilibili mux input identity changed: {}",
+                    input.path.display()
+                );
+            }
+        }
+    }
+
+    for mux in &muxes {
+        for input in &mux.bound_inputs {
+            for current in &muxes {
+                validate_bilibili_mux_output(root, current)?;
+            }
+            input.file.validate_identity()?;
+            root.remove_bound_file_if_identity(&input.entry, input.file.identity())
+                .with_context(|| {
+                    format!(
+                        "failed to remove raw Bilibili input {}",
+                        input.path.display()
+                    )
+                })?;
+        }
+    }
+    for mux in &muxes {
+        validate_bilibili_mux_output(root, mux)?;
+    }
+    Ok(())
+}
+
+fn validate_bilibili_mux_output(root: &RootedFs, mux: &BilibiliMuxReport) -> Result<()> {
+    let output = mux
+        .bound_output
+        .as_ref()
+        .context("Bilibili mux output was not bound before raw-input cleanup")?;
+    output.validate_identity()?;
+    if root.entry_identity(&mux.output_path)? != Some(output.identity()) {
+        bail!(
+            "Bilibili mux output identity changed before raw-input cleanup: {}",
+            mux.output_path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn bind_existing_bilibili_mux_state(
+    root: &RootedFs,
+    cwd: &Path,
+    report: &mut BilibiliDownloadReport,
+) -> Result<()> {
+    for entry in &mut report.entries {
         if entry.mux.is_none() {
             continue;
         }
-        for file in entry
-            .files
-            .iter()
-            .filter(|file| matches!(file.kind.as_str(), "video" | "audio" | "flv_segment"))
-        {
-            let path = resolve_command_output_path(cwd, &file.path);
-            root.remove_file_if_exists(&path).with_context(|| {
-                format!("failed to remove raw Bilibili input {}", path.display())
-            })?;
-        }
+        let media_inputs = bilibili_entry_media_inputs(cwd, entry);
+        let mux = entry.mux.as_mut().expect("mux presence was checked");
+        mux.bound_inputs = bind_bilibili_mux_inputs(root, &media_inputs)?;
+        let output_path = resolve_command_output_path(cwd, &mux.output_path);
+        mux.output_path = output_path.clone();
+        mux.bound_output = root.open_bound_file(&output_path)?;
     }
     Ok(())
 }
@@ -1680,7 +1778,12 @@ async fn run_youtube_job(
 ) -> Result<JobReport> {
     let metadata = fetch_youtube_metadata(config, url, progress.clone()).await?;
     let subtitle_plan = select_subtitles(&metadata, &config.video.subtitle_languages);
-    let _guard = video_output_lock("YouTube download", progress.as_ref()).await;
+    let _guard = video_output_lock(
+        &config.downloads.video_dir,
+        "YouTube download",
+        progress.as_ref(),
+    )
+    .await?;
     run_youtube_job_locked(config, url, metadata, subtitle_plan, progress).await
 }
 
@@ -1753,7 +1856,12 @@ async fn run_staged_video_job(
     duplicate: &VideoDuplicate,
     progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
-    let _guard = video_output_lock("Staged video download", progress.as_ref()).await;
+    let _guard = video_output_lock(
+        &config.downloads.video_dir,
+        "Staged video download",
+        progress.as_ref(),
+    )
+    .await?;
     let final_dir = config.downloads.video_dir.clone();
     let primary_media_kind = staged_primary_media_kind(config, job)?;
     let root = RootedFs::new(&final_dir)?;
@@ -2499,12 +2607,26 @@ async fn probe_bilibili_metadata(
     Ok(parse_bilibili_metadata(url, &format!("{stdout}\n{stderr}")))
 }
 
+struct VideoOutputGuard {
+    _process_guard: MutexGuard<'static, ()>,
+    _file_guard: BoundFile,
+}
+
+fn video_output_lock_file(root: &RootedFs) -> Result<BoundFile> {
+    root.open_or_create_bound_file(
+        &root.logical_root_path().join(VIDEO_OUTPUT_LOCK_FILE_NAME),
+        0o600,
+    )
+    .context("failed to open the cross-process video output lock")
+}
+
 async fn video_output_lock(
+    video_dir: &Path,
     job_label: &str,
     progress: Option<&JobProgressSender>,
-) -> MutexGuard<'static, ()> {
+) -> Result<VideoOutputGuard> {
     let lock = VIDEO_OUTPUT_LOCK.get_or_init(|| Mutex::new(()));
-    match lock.try_lock() {
+    let process_guard = match lock.try_lock() {
         Ok(guard) => guard,
         Err(_) => {
             send_progress(
@@ -2515,7 +2637,31 @@ async fn video_output_lock(
             send_progress(progress, format!("{job_label}: video output slot acquired"));
             guard
         }
+    };
+
+    let root = RootedFs::new(video_dir)?;
+    let file_guard = video_output_lock_file(&root)?;
+    let mut reported_wait = false;
+    while !file_guard.try_lock_exclusive()? {
+        if !reported_wait {
+            send_progress(
+                progress,
+                format!("{job_label}: waiting for another downloader process"),
+            );
+            reported_wait = true;
+        }
+        sleep(Duration::from_millis(250)).await;
     }
+    if reported_wait {
+        send_progress(
+            progress,
+            format!("{job_label}: cross-process output slot acquired"),
+        );
+    }
+    Ok(VideoOutputGuard {
+        _process_guard: process_guard,
+        _file_guard: file_guard,
+    })
 }
 
 fn send_progress(progress: Option<&JobProgressSender>, message: String) {
@@ -4100,6 +4246,12 @@ struct MovedFile {
 }
 
 #[derive(Debug)]
+struct MovePlanResult {
+    moved: Vec<MovedFile>,
+    moved_videos: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
 struct FileBackup {
     original: PathBuf,
     backup: PathBuf,
@@ -4113,6 +4265,23 @@ struct FileBackup {
 struct OverwriteRecoveryManifest {
     version: u32,
     target_file_name: PathBuf,
+    phase: OverwriteRecoveryPhase,
+    committed_files: Vec<OverwriteCommittedFile>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OverwriteRecoveryPhase {
+    Acquired,
+    Committed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OverwriteCommittedFile {
+    file_name: PathBuf,
+    device: u64,
+    inode: u64,
 }
 
 #[derive(Debug)]
@@ -4123,6 +4292,12 @@ struct OverwriteRecoveryFiles {
     manifest_path: PathBuf,
     manifest_entry: BoundEntry,
     manifest_identity: EntryIdentity,
+}
+
+#[derive(Debug)]
+struct CommittedOverwriteState {
+    manifest: OverwriteRecoveryManifest,
+    files: BTreeMap<PathBuf, BoundFile>,
 }
 
 #[derive(Debug)]
@@ -4196,8 +4371,9 @@ impl AcquiredOverwrite {
         }
     }
 
-    fn commit(self) -> Result<()> {
-        remove_backups(&self.root, &self.backups, &self.recovery)
+    fn commit(self, moved: &[MovedFile]) -> Result<()> {
+        let committed = persist_committed_overwrite_manifest(&self, moved)?;
+        remove_backups(&self.root, &self.backups, &self.recovery, &committed)
     }
 }
 
@@ -4374,6 +4550,8 @@ fn create_overwrite_recovery_manifest(
     let manifest = OverwriteRecoveryManifest {
         version: OVERWRITE_RECOVERY_MANIFEST_VERSION,
         target_file_name,
+        phase: OverwriteRecoveryPhase::Acquired,
+        committed_files: Vec::new(),
     };
     let contents = serde_json::to_vec_pretty(&manifest)
         .context("failed to encode overwrite recovery manifest")?;
@@ -4387,6 +4565,124 @@ fn create_overwrite_recovery_manifest(
             )
         })?;
     Ok((manifest_path, manifest_entry, manifest_identity))
+}
+
+fn persist_committed_overwrite_manifest(
+    acquired: &AcquiredOverwrite,
+    moved: &[MovedFile],
+) -> Result<CommittedOverwriteState> {
+    let transaction_parent = acquired
+        .recovery
+        .backup_dir
+        .parent()
+        .context("overwrite transaction has no parent")?;
+    let mut identities = BTreeMap::new();
+    for moved in moved {
+        if moved.destination.parent() != Some(transaction_parent) {
+            continue;
+        }
+        require_bound_entry_identity(
+            &acquired.root,
+            &moved.destination_entry,
+            moved.identity,
+            "committed overwrite file",
+        )?;
+        insert_committed_file_identity(&mut identities, &moved.destination, moved.identity)?;
+    }
+    if let Some((entry, identity)) = &acquired.target_restored {
+        require_bound_entry_identity(
+            &acquired.root,
+            entry,
+            *identity,
+            "restored artifact-overwrite target",
+        )?;
+        insert_committed_file_identity(&mut identities, entry.path(), *identity)?;
+    }
+
+    let target_file_name = PathBuf::from(
+        acquired
+            .target
+            .file_name()
+            .context("overwrite target has no file name")?,
+    );
+    if !identities.contains_key(&target_file_name) {
+        bail!(
+            "overwrite commit did not retain a bound target object: {}",
+            acquired.target.display()
+        );
+    }
+    let manifest = OverwriteRecoveryManifest {
+        version: OVERWRITE_RECOVERY_MANIFEST_VERSION,
+        target_file_name,
+        phase: OverwriteRecoveryPhase::Committed,
+        committed_files: identities
+            .iter()
+            .map(|(file_name, identity)| OverwriteCommittedFile {
+                file_name: file_name.clone(),
+                device: identity.device(),
+                inode: identity.inode(),
+            })
+            .collect(),
+    };
+    let contents = serde_json::to_vec_pretty(&manifest)
+        .context("failed to encode committed overwrite recovery manifest")?;
+    acquired
+        .root
+        .rewrite_bound_file_if_identity(
+            &acquired.recovery.manifest_entry,
+            acquired.recovery.manifest_identity,
+            &contents,
+        )
+        .with_context(|| {
+            format!(
+                "failed to persist committed overwrite state {}",
+                acquired.recovery.manifest_path.display()
+            )
+        })?;
+
+    let mut files = BTreeMap::new();
+    for (file_name, identity) in identities {
+        let path = transaction_parent.join(&file_name);
+        let file = acquired
+            .root
+            .open_bound_file(&path)?
+            .with_context(|| format!("committed overwrite file is missing: {}", path.display()))?;
+        if file.identity() != identity {
+            bail!(
+                "committed overwrite file identity changed: {}",
+                path.display()
+            );
+        }
+        files.insert(file_name, file);
+    }
+    let committed = CommittedOverwriteState { manifest, files };
+    validate_committed_overwrite_state(
+        &acquired.root,
+        &acquired.backups,
+        &acquired.recovery,
+        &committed,
+    )?;
+    Ok(committed)
+}
+
+fn insert_committed_file_identity(
+    identities: &mut BTreeMap<PathBuf, EntryIdentity>,
+    path: &Path,
+    identity: EntryIdentity,
+) -> Result<()> {
+    let file_name = PathBuf::from(
+        path.file_name()
+            .context("committed overwrite path has no file name")?,
+    );
+    if let Some(previous) = identities.insert(file_name.clone(), identity)
+        && previous != identity
+    {
+        bail!(
+            "multiple committed objects used overwrite file name {}",
+            file_name.display()
+        );
+    }
+    Ok(())
 }
 
 fn acquire_overwrite_path(
@@ -4679,13 +4975,13 @@ fn move_staged_video_files_with_root(
         primary_media_kind,
     );
     match move_result {
-        Ok(moved_videos) => {
+        Ok(moved) => {
             if let Some(acquisition) = acquisition {
                 acquisition
-                    .commit()
+                    .commit(&moved.moved)
                     .context("video overwrite succeeded but old-file cleanup failed")?;
             }
-            Ok(moved_videos)
+            Ok(moved.moved_videos)
         }
         Err(err) => Err(match acquisition {
             Some(acquisition) => rollback_acquired_overwrite(err, acquisition),
@@ -4701,7 +4997,7 @@ fn move_staged_video_files_inner(
     staged_files: &[PathBuf],
     overwrite_target: Option<&Path>,
     primary_media_kind: StagedPrimaryMediaKind,
-) -> Result<Vec<PathBuf>> {
+) -> Result<MovePlanResult> {
     let plan = staged_move_plan(
         staging_dir,
         final_dir,
@@ -4777,7 +5073,7 @@ fn move_staged_artifact_files_with_root(
                     return Err(rollback_acquired_overwrite(err, acquired));
                 }
                 acquired
-                    .commit()
+                    .commit(&moved)
                     .context("artifact overwrite succeeded but old-sidecar cleanup failed")?;
             }
             Ok(moved.into_iter().map(|moved| moved.destination).collect())
@@ -5133,7 +5429,7 @@ fn execute_move_plan(
     root: &RootedFs,
     plan: Vec<MoveStep>,
     primary_media_kind: StagedPrimaryMediaKind,
-) -> Result<Vec<PathBuf>> {
+) -> Result<MovePlanResult> {
     let mut moved = Vec::new();
     let mut moved_videos = Vec::new();
     for step in plan {
@@ -5154,7 +5450,10 @@ fn execute_move_plan(
             }
         }
     }
-    Ok(moved_videos)
+    Ok(MovePlanResult {
+        moved,
+        moved_videos,
+    })
 }
 
 fn move_step_with_bound_parents(root: &RootedFs, step: MoveStep) -> Result<MovedFile> {
@@ -5412,13 +5711,85 @@ fn restore_remaining_backups(
     }
 }
 
+fn validate_committed_overwrite_state(
+    root: &RootedFs,
+    backups: &[FileBackup],
+    recovery: &OverwriteRecoveryFiles,
+    committed: &CommittedOverwriteState,
+) -> Result<()> {
+    if committed.manifest.phase != OverwriteRecoveryPhase::Committed {
+        bail!("overwrite cleanup requires a committed recovery manifest");
+    }
+    let parent = recovery
+        .backup_dir
+        .parent()
+        .context("overwrite recovery directory has no parent")?;
+    let target_file_name = single_recovery_file_name(&committed.manifest.target_file_name)?;
+    if !committed.files.contains_key(Path::new(&target_file_name)) {
+        bail!("committed overwrite manifest does not bind the target file");
+    }
+    if committed.files.len() != committed.manifest.committed_files.len() {
+        bail!("committed overwrite manifest contains duplicate file identities");
+    }
+
+    for record in &committed.manifest.committed_files {
+        let file_name = PathBuf::from(single_recovery_file_name(&record.file_name)?);
+        let file = committed.files.get(&file_name).with_context(|| {
+            format!(
+                "committed overwrite descriptor is missing for {}",
+                file_name.display()
+            )
+        })?;
+        file.validate_identity()?;
+        let identity = file.identity();
+        if identity.device() != record.device || identity.inode() != record.inode {
+            bail!(
+                "committed overwrite descriptor identity changed for {}",
+                file_name.display()
+            );
+        }
+        let path = parent.join(&file_name);
+        if root.entry_identity(&path)? != Some(identity) {
+            bail!(
+                "committed overwrite path identity changed: {}",
+                path.display()
+            );
+        }
+    }
+
+    for backup in backups {
+        if let Some(current) = root.bound_entry_identity(&backup.original_entry)? {
+            let is_committed_object = committed
+                .files
+                .values()
+                .any(|file| file.identity() == current);
+            if !is_committed_object {
+                bail!(
+                    "uncommitted object occupies an overwrite removal path: {}",
+                    backup.original.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn remove_backups(
     root: &RootedFs,
     backups: &[FileBackup],
     recovery: &OverwriteRecoveryFiles,
+    committed: &CommittedOverwriteState,
 ) -> Result<()> {
+    validate_committed_overwrite_state(root, backups, recovery, committed)?;
     let mut failures = Vec::new();
     for backup in backups {
+        if let Err(err) = validate_committed_overwrite_state(root, backups, recovery, committed) {
+            failures.push(format!(
+                "committed overwrite state changed before removing {}: {err:#}",
+                backup.backup.display()
+            ));
+            break;
+        }
         if backup.backup.parent() != Some(recovery.backup_dir.as_path()) {
             failures.push(format!(
                 "refused to remove overwrite backup outside owned directory: {}",
@@ -5433,6 +5804,13 @@ fn remove_backups(
                 backup.backup.display()
             ));
         }
+    }
+    if failures.is_empty()
+        && let Err(err) = validate_committed_overwrite_state(root, backups, recovery, committed)
+    {
+        failures.push(format!(
+            "committed overwrite state changed after backup cleanup: {err:#}"
+        ));
     }
     if failures.is_empty()
         && let Err(err) = remove_overwrite_transaction_dir(root, recovery)
@@ -5450,6 +5828,26 @@ fn remove_overwrite_transaction_dir(
     root: &RootedFs,
     recovery: &OverwriteRecoveryFiles,
 ) -> Result<()> {
+    let unresolved = root
+        .list_bound_directory(&recovery.backup_dir_entry, recovery.backup_dir_identity)?
+        .into_iter()
+        .filter(|(name, identity)| {
+            name != std::ffi::OsStr::new(OVERWRITE_RECOVERY_MANIFEST_NAME)
+                || *identity != recovery.manifest_identity
+        })
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    if !unresolved.is_empty() {
+        bail!(
+            "refused to remove overwrite recovery manifest while unresolved entries remain in {}: {}",
+            recovery.backup_dir.display(),
+            unresolved
+                .iter()
+                .map(|name| name.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     root.remove_bound_file_if_identity(&recovery.manifest_entry, recovery.manifest_identity)
         .with_context(|| {
             format!(
@@ -5468,11 +5866,21 @@ fn remove_overwrite_transaction_dir(
 
 pub fn recover_pending_overwrite_transactions(video_dir: &Path) -> Result<Vec<String>> {
     let root = RootedFs::new(video_dir)?;
+    let recovery_lock = video_output_lock_file(&root)?;
+    recovery_lock
+        .lock_exclusive()
+        .context("failed to serialize overwrite recovery with active downloads")?;
     let mut directories = Vec::new();
-    collect_overwrite_recovery_directories(&root, video_dir, &mut directories)?;
+    let mut recovered = Vec::new();
+    collect_overwrite_recovery_directories(
+        &root,
+        video_dir,
+        video_dir,
+        &mut directories,
+        &mut recovered,
+    )?;
     directories.sort();
 
-    let mut recovered = Vec::new();
     for directory in directories {
         let manifest_path = directory.join(OVERWRITE_RECOVERY_MANIFEST_NAME);
         match root.open_bound_file(&manifest_path) {
@@ -5498,18 +5906,52 @@ pub fn recover_pending_overwrite_transactions(video_dir: &Path) -> Result<Vec<St
 
 fn collect_overwrite_recovery_directories(
     root: &RootedFs,
+    scan_root: &Path,
     directory: &Path,
     recovered: &mut Vec<PathBuf>,
+    issues: &mut Vec<String>,
 ) -> Result<()> {
     root.validate_configured_root()?;
-    for entry in fs::read_dir(directory).with_context(|| {
-        format!(
-            "failed to scan overwrite recovery root {}",
-            directory.display()
-        )
-    })? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(err) if directory != scan_root => {
+            issues.push(format!(
+                "Skipped unreadable directory during overwrite recovery scan {}: {err}",
+                directory.display()
+            ));
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to scan overwrite recovery root {}",
+                    directory.display()
+                )
+            });
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                issues.push(format!(
+                    "Skipped unreadable entry during overwrite recovery scan {}: {err}",
+                    directory.display()
+                ));
+                continue;
+            }
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                issues.push(format!(
+                    "Skipped uninspectable entry during overwrite recovery scan {}: {err}",
+                    entry.path().display()
+                ));
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
             continue;
         }
         let path = entry.path();
@@ -5522,7 +5964,7 @@ fn collect_overwrite_recovery_directories(
         if name == VIDEO_STAGING_DIR_NAME {
             continue;
         }
-        collect_overwrite_recovery_directories(root, &path, recovered)?;
+        collect_overwrite_recovery_directories(root, scan_root, &path, recovered, issues)?;
     }
     root.validate_configured_root()
 }
@@ -5595,15 +6037,8 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
     }
     backups.sort_by_key(|(name, _)| name == &target_file_name);
 
-    let target_identity = root.entry_identity(&target)?;
-    if target_identity.is_some_and(|identity| !identity.is_file()) {
-        bail!(
-            "overwrite recovery target is not a regular file: {}",
-            target.display()
-        );
-    }
     let target_backup_exists = backups.iter().any(|(name, _)| name == &target_file_name);
-    if !backups.is_empty() && target_identity.is_none() && !target_backup_exists {
+    if !backups.is_empty() && root.entry_identity(&target)?.is_none() && !target_backup_exists {
         bail!(
             "overwrite recovery target and its backup are both missing: {}",
             target.display()
@@ -5611,36 +6046,29 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
     }
 
     let mut report = Vec::new();
-    for (name, backup_identity) in backups {
-        let backup = directory.join(&name);
-        let original = parent.join(&name);
-        let backup_entry = root.bind_entry(&backup, false)?;
-        match root.entry_identity(&original)? {
-            Some(original_identity) if original_identity.is_file() => {
-                root.remove_bound_file_if_identity(&backup_entry, backup_identity)
-                    .with_context(|| {
-                        format!(
-                            "failed to finalize recovered overwrite backup {}",
-                            backup.display()
-                        )
-                    })?;
-                report.push(format!(
-                    "Finalized committed overwrite file: {}",
-                    original.display()
-                ));
+    match manifest.phase {
+        OverwriteRecoveryPhase::Acquired => {
+            if !manifest.committed_files.is_empty() {
+                bail!("acquired overwrite manifest unexpectedly contains committed files");
             }
-            Some(_) => {
-                bail!(
-                    "overwrite recovery destination is occupied by a non-file: {}",
-                    original.display()
-                );
+            for (name, _) in &backups {
+                let original = parent.join(name);
+                if root.entry_identity(&original)?.is_some() {
+                    bail!(
+                        "uncommitted overwrite destination is occupied; retained backup for manual recovery: {}",
+                        original.display()
+                    );
+                }
             }
-            None => {
+            for (name, backup_identity) in &backups {
+                let backup = directory.join(name);
+                let original = parent.join(name);
+                let backup_entry = root.bind_entry(&backup, false)?;
                 let original_entry = root.bind_entry(&original, false)?;
                 root.rename_via_bound_parents_noreplace_if_identity(
                     &backup_entry,
                     &original_entry,
-                    backup_identity,
+                    *backup_identity,
                 )
                 .with_context(|| {
                     format!(
@@ -5654,6 +6082,41 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
                     original.display()
                 ));
             }
+        }
+        OverwriteRecoveryPhase::Committed => {
+            let committed = bind_recovery_committed_files(root, parent, &manifest)?;
+            validate_recovery_committed_files(root, parent, &committed)?;
+            for (name, _) in &backups {
+                let original = parent.join(name);
+                if let Some(current) = root.entry_identity(&original)? {
+                    let is_committed_object =
+                        committed.values().any(|file| file.identity() == current);
+                    if !is_committed_object {
+                        bail!(
+                            "uncommitted object occupies an overwrite removal path; retained backup: {}",
+                            original.display()
+                        );
+                    }
+                }
+            }
+            for (name, backup_identity) in &backups {
+                validate_recovery_committed_files(root, parent, &committed)?;
+                let backup = directory.join(name);
+                let original = parent.join(name);
+                let backup_entry = root.bind_entry(&backup, false)?;
+                root.remove_bound_file_if_identity(&backup_entry, *backup_identity)
+                    .with_context(|| {
+                        format!(
+                            "failed to finalize recovered overwrite backup {}",
+                            backup.display()
+                        )
+                    })?;
+                report.push(format!(
+                    "Finalized committed overwrite file: {}",
+                    original.display()
+                ));
+            }
+            validate_recovery_committed_files(root, parent, &committed)?;
         }
     }
 
@@ -5671,6 +6134,57 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
         directory.display()
     ));
     Ok(report)
+}
+
+fn bind_recovery_committed_files(
+    root: &RootedFs,
+    parent: &Path,
+    manifest: &OverwriteRecoveryManifest,
+) -> Result<BTreeMap<PathBuf, BoundFile>> {
+    let mut files = BTreeMap::new();
+    for record in &manifest.committed_files {
+        let file_name = PathBuf::from(single_recovery_file_name(&record.file_name)?);
+        let path = parent.join(&file_name);
+        let file = root
+            .open_bound_file(&path)?
+            .with_context(|| format!("committed overwrite file is missing: {}", path.display()))?;
+        let identity = file.identity();
+        if identity.device() != record.device || identity.inode() != record.inode {
+            bail!(
+                "committed overwrite file identity does not match its manifest: {}",
+                path.display()
+            );
+        }
+        if files.insert(file_name.clone(), file).is_some() {
+            bail!(
+                "committed overwrite manifest repeats file name {}",
+                file_name.display()
+            );
+        }
+    }
+    let target_file_name = PathBuf::from(single_recovery_file_name(&manifest.target_file_name)?);
+    if !files.contains_key(&target_file_name) {
+        bail!("committed overwrite manifest does not bind the target file");
+    }
+    Ok(files)
+}
+
+fn validate_recovery_committed_files(
+    root: &RootedFs,
+    parent: &Path,
+    files: &BTreeMap<PathBuf, BoundFile>,
+) -> Result<()> {
+    for (file_name, file) in files {
+        file.validate_identity()?;
+        let path = parent.join(file_name);
+        if root.entry_identity(&path)? != Some(file.identity()) {
+            bail!(
+                "committed overwrite path identity changed during recovery: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn single_recovery_file_name(path: &Path) -> Result<std::ffi::OsString> {
@@ -8905,9 +9419,30 @@ mod tests {
         let _ = fs::remove_dir_all(final_dir);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn startup_recovery_keeps_new_media_and_restores_a_missing_sidecar() {
-        let final_dir = temp_test_dir("overwrite-startup-complete");
+    fn startup_recovery_skips_an_unreadable_unrelated_directory() {
+        let final_dir = temp_test_dir("overwrite-startup-unreadable-child");
+        let unreadable = final_dir.join("unrelated");
+        fs::create_dir(&unreadable).expect("unrelated directory should create");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+            .expect("unrelated directory should become unreadable");
+
+        let recovery = recover_pending_overwrite_transactions(&final_dir);
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700))
+            .expect("unrelated directory permissions should restore");
+        let report = recovery.expect("an unrelated unreadable child must not block startup");
+
+        assert!(report.iter().any(|line| {
+            line.contains("Skipped unreadable directory during overwrite recovery scan")
+                && line.contains("unrelated")
+        }));
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn startup_recovery_retains_an_uncommitted_replacement_and_its_backups() {
+        let final_dir = temp_test_dir("overwrite-startup-uncommitted-replacement");
         let existing = final_dir.join("Episode.mkv");
         fs::write(&existing, "original-video").expect("existing file should write");
         write_bilibili_identity_nfo(&existing, "cid123");
@@ -8929,12 +9464,138 @@ mod tests {
         fs::write(&existing, "replacement-video").expect("replacement should write");
         drop(acquired);
 
-        recover_pending_overwrite_transactions(&final_dir)
-            .expect("partially committed overwrite should recover");
+        let report = recover_pending_overwrite_transactions(&final_dir)
+            .expect("uncommitted overwrite should be retained without blocking startup");
 
         assert_eq!(fs::read_to_string(&existing).unwrap(), "replacement-video");
-        assert!(existing.with_extension("nfo").is_file());
+        assert!(!existing.with_extension("nfo").exists());
+        let transactions = overwrite_backup_dirs(&final_dir);
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(
+            fs::read_to_string(transactions[0].join("Episode.mkv")).unwrap(),
+            "original-video"
+        );
+        assert!(transactions[0].join("Episode.nfo").is_file());
+        assert!(report.iter().any(|line| {
+            line.contains("Retained unresolved overwrite transaction")
+                && line.contains("uncommitted overwrite destination is occupied")
+        }));
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn startup_recovery_finalizes_a_committed_replacement_by_identity() {
+        let final_dir = temp_test_dir("overwrite-startup-committed");
+        let existing = final_dir.join("Episode.mkv");
+        fs::write(&existing, "original-video").expect("existing file should write");
+        write_bilibili_identity_nfo(&existing, "cid123");
+        let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        let root = RootedFs::new(&final_dir).expect("output root should open");
+        let duplicate =
+            bind_test_overwrite_confirmation(&root, VideoDuplicateAction::Overwrite, &duplicate)
+                .expect("overwrite confirmation should bind");
+        let acquired =
+            acquire_and_validate_overwrite_target(&root, &duplicate, StagedPrimaryMediaKind::Video)
+                .expect("overwrite target should be acquired");
+        let staged = final_dir
+            .join(VIDEO_STAGING_DIR_NAME)
+            .join("job-1")
+            .join("Episode.mkv");
+        fs::create_dir_all(staged.parent().unwrap()).expect("staging directory should create");
+        fs::write(&staged, "replacement-video").expect("replacement should stage");
+        let moved = move_step_with_bound_parents(
+            &root,
+            MoveStep {
+                source: staged,
+                destination: existing.clone(),
+            },
+        )
+        .expect("replacement should move into the acquired target");
+        let committed = persist_committed_overwrite_manifest(&acquired, &[moved])
+            .expect("committed replacement identity should persist");
+        drop(committed);
+        drop(acquired);
+
+        let report = recover_pending_overwrite_transactions(&final_dir)
+            .expect("committed overwrite should recover");
+
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "replacement-video");
+        assert!(!existing.with_extension("nfo").exists());
         assert!(overwrite_backup_dirs(&final_dir).is_empty());
+        assert!(
+            report
+                .iter()
+                .any(|line| line.contains("Finalized committed overwrite file"))
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn startup_recovery_preserves_backups_when_a_committed_path_is_replaced() {
+        let final_dir = temp_test_dir("overwrite-startup-committed-replaced");
+        let existing = final_dir.join("Episode.mkv");
+        fs::write(&existing, "original-video").expect("existing file should write");
+        let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        write_bilibili_identity_nfo(&existing, "cid123");
+        let root = RootedFs::new(&final_dir).expect("output root should open");
+        let duplicate =
+            bind_test_overwrite_confirmation(&root, VideoDuplicateAction::Overwrite, &duplicate)
+                .expect("overwrite confirmation should bind");
+        let acquired =
+            acquire_and_validate_overwrite_target(&root, &duplicate, StagedPrimaryMediaKind::Video)
+                .expect("overwrite target should be acquired");
+        let staged = final_dir
+            .join(VIDEO_STAGING_DIR_NAME)
+            .join("job-1")
+            .join("Episode.mkv");
+        fs::create_dir_all(staged.parent().unwrap()).expect("staging directory should create");
+        fs::write(&staged, "committed-video").expect("replacement should stage");
+        let moved = move_step_with_bound_parents(
+            &root,
+            MoveStep {
+                source: staged,
+                destination: existing.clone(),
+            },
+        )
+        .expect("replacement should move into the acquired target");
+        let committed = persist_committed_overwrite_manifest(&acquired, &[moved])
+            .expect("committed replacement identity should persist");
+        fs::remove_file(&existing).expect("committed path should unlink");
+        fs::write(&existing, "third-party-replacement").expect("third-party file should write");
+        drop(committed);
+        drop(acquired);
+
+        let report = recover_pending_overwrite_transactions(&final_dir)
+            .expect("identity mismatch should be reported without blocking startup");
+
+        assert_eq!(
+            fs::read_to_string(&existing).unwrap(),
+            "third-party-replacement"
+        );
+        let transactions = overwrite_backup_dirs(&final_dir);
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(
+            fs::read_to_string(transactions[0].join("Episode.mkv")).unwrap(),
+            "original-video"
+        );
+        assert!(report.iter().any(|line| {
+            line.contains("Retained unresolved overwrite transaction")
+                && line.contains("identity does not match its manifest")
+        }));
         let _ = fs::remove_dir_all(final_dir);
     }
 
@@ -9156,7 +9817,7 @@ mod tests {
         fs::write(&mux, "mux").expect("mux should write");
         fs::write(&danmaku, "danmaku").expect("danmaku should write");
         fs::write(&concat, "user-owned").expect("user concat file should write");
-        let report = parse_bilibili_download_report(
+        let mut report = parse_bilibili_download_report(
             r#"
             {"title":"Season","output_dir":".","entries":[{"index":1,"title":"Episode 1","directory":"Episode 1","files":[{"kind":"video","path":"Episode 1/video.m4s"},{"kind":"audio","path":"Episode 1/audio.m4s"},{"kind":"danmaku","path":"Episode 1/Episode 1.xml"}],"mux":{"output_path":"Episode 1/Episode 1.mkv"}}]}
             "#,
@@ -9164,6 +9825,8 @@ mod tests {
         .expect("download report JSON should parse");
 
         let rooted = RootedFs::new(&root).expect("output root should bind");
+        bind_existing_bilibili_mux_state(&rooted, &root, &mut report)
+            .expect("mux state should bind");
         cleanup_bilibili_mux_input_files(&rooted, &root, &report)
             .expect("raw inputs should clean up");
 
@@ -9191,14 +9854,17 @@ mod tests {
         fs::create_dir_all(&replacement).expect("replacement root should create");
         fs::write(original.join("video.m4s"), "original")
             .expect("original raw stream should write");
+        fs::write(original.join("Episode.mkv"), "mux").expect("mux output should write");
         fs::write(replacement.join("video.m4s"), "replacement")
             .expect("replacement raw stream should write");
         symlink(&original, &configured).expect("configured root symlink should create");
         let root = RootedFs::new(&configured).expect("configured root should bind");
-        let report = parse_bilibili_download_report(
+        let mut report = parse_bilibili_download_report(
             r#"{"title":"Episode","output_dir":".","entries":[{"index":1,"title":"Episode","directory":".","files":[{"kind":"video","path":"video.m4s"}],"mux":{"output_path":"Episode.mkv"}}]}"#,
         )
         .expect("download report should parse");
+        bind_existing_bilibili_mux_state(&root, &configured, &mut report)
+            .expect("mux state should bind");
 
         fs::remove_file(&configured).expect("configured symlink should remove");
         symlink(&replacement, &configured).expect("configured symlink should retarget");
@@ -9215,6 +9881,32 @@ mod tests {
             "original"
         );
         let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn bilibili_raw_cleanup_preserves_inputs_when_mux_output_is_replaced() {
+        let root = temp_test_dir("bilibili-cleanup-output-replaced");
+        let video = root.join("video.m4s");
+        let output = root.join("Episode.mkv");
+        fs::write(&video, "video").expect("raw video should write");
+        fs::write(&output, "mux").expect("mux output should write");
+        let mut report = parse_bilibili_download_report(
+            r#"{"title":"Episode","output_dir":".","entries":[{"index":1,"title":"Episode","directory":".","files":[{"kind":"video","path":"video.m4s"}],"mux":{"output_path":"Episode.mkv"}}]}"#,
+        )
+        .expect("download report should parse");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+        bind_existing_bilibili_mux_state(&rooted, &root, &mut report)
+            .expect("mux state should bind");
+
+        fs::remove_file(&output).expect("bound mux output should unlink");
+        fs::write(&output, "replacement").expect("replacement output should write");
+        let error = cleanup_bilibili_mux_input_files(&rooted, &root, &report)
+            .expect_err("replacement output must stop raw-input cleanup");
+
+        assert!(format!("{error:#}").contains("mux output identity changed"));
+        assert_eq!(fs::read_to_string(video).unwrap(), "video");
+        assert_eq!(fs::read_to_string(output).unwrap(), "replacement");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -10098,8 +10790,11 @@ mod tests {
 
     #[tokio::test]
     async fn reports_only_contended_video_output_lock_waits() {
+        let video_dir = temp_test_dir("video-output-lock-progress");
         let (tx, mut rx) = job_progress_channel();
-        let guard = video_output_lock("Bilibili download", Some(&tx)).await;
+        let guard = video_output_lock(&video_dir, "Bilibili download", Some(&tx))
+            .await
+            .expect("output lock should acquire");
         assert_no_progress(&rx);
         drop(guard);
 
@@ -10107,8 +10802,11 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .await;
+        let waiter_video_dir = video_dir.clone();
         let waiter = tokio::spawn(async move {
-            let _guard = video_output_lock("Bilibili download", Some(&tx)).await;
+            let _guard = video_output_lock(&waiter_video_dir, "Bilibili download", Some(&tx))
+                .await
+                .expect("waiting output lock should acquire");
         });
 
         assert_eq!(
@@ -10138,6 +10836,35 @@ mod tests {
             }
         );
         waiter.await.expect("waiter should finish");
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn video_output_file_lock_serializes_independent_open_handles() {
+        let video_dir = temp_test_dir("video-output-file-lock");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+        let first = video_output_lock_file(&root).expect("first lock handle should open");
+        let second = video_output_lock_file(&root).expect("second lock handle should open");
+
+        assert!(
+            first
+                .try_lock_exclusive()
+                .expect("first lock should acquire")
+        );
+        assert!(
+            !second
+                .try_lock_exclusive()
+                .expect("contended lock should report busy")
+        );
+        drop(first);
+        assert!(
+            second
+                .try_lock_exclusive()
+                .expect("second lock should acquire after release")
+        );
+
+        drop(second);
+        let _ = fs::remove_dir_all(video_dir);
     }
 
     #[cfg(unix)]

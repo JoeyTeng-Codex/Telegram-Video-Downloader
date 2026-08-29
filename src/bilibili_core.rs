@@ -53,23 +53,17 @@ impl CredentialRuntime {
     }
 
     pub fn logout(&self) -> Result<()> {
-        match self.selection.profile_name() {
-            Some(profile) => {
-                self.store
-                    .remove_profile(profile)
-                    .context("failed to clear BBDown credential profile")?;
-            }
-            None => {
+        self.store
+            .update_profiles(|profiles| {
                 let profile = self
-                    .store
-                    .load_profiles()
-                    .context("failed to load BBDown credential profiles")?
-                    .default_profile;
-                self.store
-                    .remove_profile(&profile)
-                    .context("failed to clear BBDown default credential profile")?;
-            }
-        }
+                    .selection
+                    .profile_name()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| profiles.default_profile.clone());
+                profiles.remove_profile(&profile)?;
+                Ok(())
+            })
+            .context("failed to clear BBDown credential profile")?;
         Ok(())
     }
 }
@@ -692,5 +686,49 @@ mod tests {
         let client_config = client_config(&config, Credentials::default()).unwrap();
 
         assert_eq!(client_config.user_agent, BILIBILI_BROWSER_USER_AGENT);
+    }
+
+    #[test]
+    fn default_logout_removes_the_profile_selected_inside_the_store_update() {
+        let directory = std::env::temp_dir().join(format!(
+            "telegram-video-downloader-logout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let credential_file = directory.join("credentials.json");
+        let store = CredentialStore::new(credential_file.clone());
+        let mut profiles = bbdown_core::CredentialProfiles::default();
+        profiles
+            .set_profile(
+                "first",
+                Credentials::default().with_cookie("SESSDATA=first"),
+            )
+            .unwrap();
+        profiles
+            .set_profile(
+                "current",
+                Credentials::default().with_cookie("SESSDATA=current"),
+            )
+            .unwrap();
+        profiles.set_default_profile("current").unwrap();
+        store.save_profiles(&profiles).unwrap();
+
+        let runtime = CredentialRuntime {
+            store: store.clone(),
+            selection: CredentialProfileSelection::Default,
+        };
+        runtime.logout().unwrap();
+
+        let loaded = store.load_profiles().unwrap();
+        assert!(loaded.profile("current").unwrap().is_empty());
+        assert_eq!(
+            loaded.profile("first").unwrap().cookie.as_deref(),
+            Some("SESSDATA=first")
+        );
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

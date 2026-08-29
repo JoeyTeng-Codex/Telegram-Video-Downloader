@@ -43,6 +43,7 @@ static BILIBILI_LOGIN_CANCEL_NOTIFY: OnceLock<Notify> = OnceLock::new();
 static BILIBILI_AUTH_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static BILIBILI_AUTH_REPLY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static BILIBILI_AUTH_GENERATION: AtomicU64 = AtomicU64::new(0);
+static BILIBILI_CREDENTIAL_REVISION: AtomicU64 = AtomicU64::new(0);
 static PENDING_DUPLICATE_JOBS: OnceLock<Mutex<HashMap<u64, PendingDuplicateJob>>> = OnceLock::new();
 static PENDING_BILIBILI_SELECTION_JOBS: OnceLock<Mutex<HashMap<u64, PendingBilibiliSelectionJob>>> =
     OnceLock::new();
@@ -769,9 +770,24 @@ async fn save_bbdown_login_credentials(
     auth_generation: u64,
     credentials: bbdown_core::Credentials,
 ) -> Result<CredentialSource> {
+    save_bbdown_login_credentials_with_sync(config, auth_generation, credentials, || {
+        sync_legacy_bbdown_auth_state_for_fresh_login(config)
+    })
+    .await
+}
+
+async fn save_bbdown_login_credentials_with_sync<F>(
+    config: &AppConfig,
+    auth_generation: u64,
+    credentials: bbdown_core::Credentials,
+    sync_legacy: F,
+) -> Result<CredentialSource>
+where
+    F: FnOnce() -> Result<()>,
+{
     let _state_guard = bbdown_auth_state_lock().lock().await;
     ensure_bbdown_login_active(auth_generation)?;
-    sync_legacy_bbdown_auth_state_for_fresh_login(config);
+    sync_legacy()?;
     ensure_bbdown_login_active(auth_generation)?;
     let summary = bilibili_core::credential_runtime(config)?.save_merged(credentials)?;
     ensure_bbdown_login_active(auth_generation)?;
@@ -783,20 +799,18 @@ async fn save_bbdown_login_credentials(
         );
     }
     ensure_bbdown_login_active(auth_generation)?;
+    BILIBILI_CREDENTIAL_REVISION.fetch_add(1, Ordering::SeqCst);
     Ok(summary)
 }
 
-fn sync_legacy_bbdown_auth_state_for_fresh_login(config: &AppConfig) {
-    if let Err(err) = bilibili_auth::sync_bbdown_rust_credentials_from_state(
+fn sync_legacy_bbdown_auth_state_for_fresh_login(config: &AppConfig) -> Result<()> {
+    bilibili_auth::sync_bbdown_rust_credentials_from_state(
         &config.bilibili.auth.state_path,
         &config.bilibili.auth.credential_file,
         config.bilibili.auth.credential_profile.as_deref(),
-    ) {
-        warn!(
-            error = %err,
-            "failed to migrate legacy BBDown auth state before saving fresh credentials"
-        );
-    }
+    )
+    .context("failed to migrate legacy BBDown auth state before saving fresh credentials")?;
+    Ok(())
 }
 
 async fn poll_bbdown_qr_login(
@@ -1117,10 +1131,11 @@ fn prune_expired_pending_bilibili_access_key_logins(
 }
 
 async fn run_bbdown_status(telegram: TelegramClient, config: Arc<AppConfig>, chat_id: i64) {
-    let (auth_generation, sync_result) = {
+    let (auth_generation, credential_revision, sync_result) = {
         let _state_guard = bbdown_auth_state_lock().lock().await;
         (
             BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst),
+            BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst),
             bilibili_auth::sync_bbdown_rust_credentials_from_state(
                 &config.bilibili.auth.state_path,
                 &config.bilibili.auth.credential_file,
@@ -1142,13 +1157,18 @@ async fn run_bbdown_status(telegram: TelegramClient, config: Arc<AppConfig>, cha
         ),
     };
     let _reply_guard = bbdown_auth_reply_lock().lock().await;
-    let message = current_bbdown_status_message(auth_generation, message);
+    let message = current_bbdown_status_message(auth_generation, credential_revision, message);
     send_or_log(&telegram, chat_id, message).await;
 }
 
-fn current_bbdown_status_message(auth_generation: u64, message: String) -> String {
+fn current_bbdown_status_message(
+    auth_generation: u64,
+    credential_revision: u64,
+    message: String,
+) -> String {
     if auth_generation.is_multiple_of(2)
         && BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst) == auth_generation
+        && BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst) == credential_revision
     {
         message
     } else {
@@ -1183,6 +1203,7 @@ async fn run_bbdown_logout(telegram: TelegramClient, config: Arc<AppConfig>, cha
         // Return to a stable even generation and invalidate status checks that started after
         // logout was requested but before the credential files were cleared.
         BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
+        BILIBILI_CREDENTIAL_REVISION.fetch_add(1, Ordering::SeqCst);
         (legacy_state, credential_state)
     };
     let message = match (legacy_state, credential_state) {
@@ -2514,6 +2535,41 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn fresh_login_preserves_legacy_state_when_migration_fails() {
+        let _guard = TEST_AUTH_GENERATION_LOCK.lock().await;
+        let root = temp_main_test_dir("fresh-login-migration-failure");
+        fs::create_dir_all(&root).expect("temp dir should create");
+        let mut config = AppConfig::for_test();
+        config.bilibili.auth.state_path = root.join("bilibili-auth.json");
+        config.bilibili.auth.credential_file = root.join("bbdown-credentials.json");
+        bilibili_auth::save_auth_state(
+            &config.bilibili.auth.state_path,
+            &bilibili_auth::AuthState {
+                cookie: "SESSDATA=legacy".to_string(),
+                mid: 1,
+                uname: "legacy".to_string(),
+                stored_at_unix: 1,
+            },
+        )
+        .expect("legacy state should save");
+        let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+
+        let error = save_bbdown_login_credentials_with_sync(
+            &config,
+            generation,
+            bbdown_core::Credentials::default().with_access_key("fresh-access-key"),
+            || Err(anyhow::anyhow!("synthetic migration failure")),
+        )
+        .await
+        .expect_err("failed migration must stop the fresh credential save");
+
+        assert!(error.to_string().contains("synthetic migration failure"));
+        assert!(config.bilibili.auth.state_path.is_file());
+        assert!(!config.bilibili.auth.credential_file.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn default_bot_commands_match_supported_commands() {
         let commands = default_bot_commands();
@@ -2859,13 +2915,15 @@ mod tests {
     async fn bbdown_status_discards_a_result_after_logout_generation_changes() {
         let _guard = TEST_AUTH_GENERATION_LOCK.lock().await;
         let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+        let revision = BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst);
         assert_eq!(
-            current_bbdown_status_message(generation, "Credential valid".to_string()),
+            current_bbdown_status_message(generation, revision, "Credential valid".to_string()),
             "Credential valid"
         );
 
         BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
-        let message = current_bbdown_status_message(generation, "Credential valid".to_string());
+        let message =
+            current_bbdown_status_message(generation, revision, "Credential valid".to_string());
         BILIBILI_AUTH_GENERATION.store(generation, Ordering::SeqCst);
 
         assert!(message.contains("state changed"));
@@ -2876,22 +2934,38 @@ mod tests {
     async fn bbdown_status_rejects_a_generation_captured_during_logout() {
         let _guard = TEST_AUTH_GENERATION_LOCK.lock().await;
         let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+        let revision = BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst);
         assert!(generation.is_multiple_of(2));
 
         BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
         let during_logout = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
         let in_progress =
-            current_bbdown_status_message(during_logout, "Credential valid".to_string());
+            current_bbdown_status_message(during_logout, revision, "Credential valid".to_string());
 
         BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
         let after_logout =
-            current_bbdown_status_message(during_logout, "Credential valid".to_string());
+            current_bbdown_status_message(during_logout, revision, "Credential valid".to_string());
         BILIBILI_AUTH_GENERATION.store(generation, Ordering::SeqCst);
 
         assert!(in_progress.contains("state changed"));
         assert!(after_logout.contains("state changed"));
         assert!(!in_progress.contains("Credential valid"));
         assert!(!after_logout.contains("Credential valid"));
+    }
+
+    #[tokio::test]
+    async fn bbdown_status_discards_a_result_after_successful_login() {
+        let _guard = TEST_AUTH_GENERATION_LOCK.lock().await;
+        let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+        let revision = BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst);
+
+        BILIBILI_CREDENTIAL_REVISION.fetch_add(1, Ordering::SeqCst);
+        let message =
+            current_bbdown_status_message(generation, revision, "Credential invalid".to_string());
+        BILIBILI_CREDENTIAL_REVISION.store(revision, Ordering::SeqCst);
+
+        assert!(message.contains("state changed"));
+        assert!(!message.contains("Credential invalid"));
     }
 
     #[tokio::test]
