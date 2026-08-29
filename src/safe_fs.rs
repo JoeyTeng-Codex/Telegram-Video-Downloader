@@ -1,4 +1,4 @@
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -74,6 +74,14 @@ impl RootedFs {
 
     pub(crate) fn root_path(&self) -> &Path {
         &self.canonical_root
+    }
+
+    pub(crate) fn logical_root_path(&self) -> &Path {
+        &self.logical_root
+    }
+
+    pub(crate) fn validate_configured_root(&self) -> Result<()> {
+        self.validate_root()
     }
 
     pub(crate) fn bind_entry(&self, path: &Path, create_parent: bool) -> Result<BoundEntry> {
@@ -155,6 +163,38 @@ impl RootedFs {
         expected: EntryIdentity,
     ) -> Result<()> {
         self.remove_bound_entry_if_identity(entry, expected, AtFlags::REMOVEDIR)
+    }
+
+    pub(crate) fn remove_bound_tree_if_identity(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+    ) -> Result<()> {
+        self.validate_bound_parent(&entry.parent)?;
+        let current = identity_at(entry.parent.fd.as_ref(), &entry.leaf)?
+            .ok_or_else(|| anyhow!("bound directory is missing: {}", entry.path.display()))?;
+        if current != expected || !current.is_dir() {
+            bail!("bound directory identity changed: {}", entry.path.display());
+        }
+
+        let directory = openat_directory(entry.parent.fd.as_ref(), &entry.leaf)
+            .with_context(|| format!("failed to open bound directory {}", entry.path.display()))?;
+        if identity_for_fd(&directory)? != expected {
+            bail!("bound directory identity changed: {}", entry.path.display());
+        }
+        remove_directory_contents(&directory, &entry.path)?;
+
+        let current = identity_at(entry.parent.fd.as_ref(), &entry.leaf)?
+            .ok_or_else(|| anyhow!("bound directory is missing: {}", entry.path.display()))?;
+        if current != expected {
+            bail!("bound directory identity changed: {}", entry.path.display());
+        }
+        rustix::fs::unlinkat(entry.parent.fd.as_ref(), &entry.leaf, AtFlags::REMOVEDIR)
+            .map_err(errno_to_io)
+            .with_context(|| {
+                format!("failed to remove bound directory {}", entry.path.display())
+            })?;
+        self.validate_bound_parent(&entry.parent)
     }
 
     pub(crate) fn entry_identity(&self, path: &Path) -> Result<Option<EntryIdentity>> {
@@ -527,6 +567,16 @@ fn openat_directory(parent: &OwnedFd, name: &OsStr) -> Result<OwnedFd, std::io::
     .map_err(errno_to_io)
 }
 
+fn openat_directory_cstr(parent: &OwnedFd, name: &CStr) -> Result<OwnedFd, std::io::Error> {
+    rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(errno_to_io)
+}
+
 fn identity_for_fd(fd: &OwnedFd) -> Result<EntryIdentity> {
     let stat = rustix::fs::fstat(fd)
         .map_err(errno_to_io)
@@ -540,6 +590,87 @@ fn identity_at(parent: &OwnedFd, name: &OsStr) -> Result<Option<EntryIdentity>> 
         Err(err) if err == rustix::io::Errno::NOENT => Ok(None),
         Err(err) => Err(errno_to_io(err)).context("failed to inspect output entry"),
     }
+}
+
+fn identity_at_cstr(parent: &OwnedFd, name: &CStr) -> Result<Option<EntryIdentity>> {
+    match rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => Ok(Some(identity_from_stat(&stat))),
+        Err(err) if err == rustix::io::Errno::NOENT => Ok(None),
+        Err(err) => Err(errno_to_io(err)).context("failed to inspect output entry"),
+    }
+}
+
+fn remove_directory_contents(directory: &OwnedFd, display_path: &Path) -> Result<()> {
+    let entries = rustix::fs::Dir::read_from(directory)
+        .map_err(errno_to_io)
+        .with_context(|| format!("failed to read bound directory {}", display_path.display()))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name().to_owned())
+                .map_err(errno_to_io)
+        })
+        .collect::<std::result::Result<Vec<CString>, std::io::Error>>()
+        .with_context(|| format!("failed to read bound directory {}", display_path.display()))?;
+
+    for name in entries {
+        if matches!(name.as_bytes(), b"." | b"..") {
+            continue;
+        }
+        let child_path = display_path.join(name.to_string_lossy().as_ref());
+        let expected = identity_at_cstr(directory, &name)?
+            .ok_or_else(|| anyhow!("bound cleanup entry is missing: {}", child_path.display()))?;
+        if expected.is_dir() {
+            let child = openat_directory_cstr(directory, &name).with_context(|| {
+                format!(
+                    "failed to open bound cleanup directory {}",
+                    child_path.display()
+                )
+            })?;
+            if identity_for_fd(&child)? != expected {
+                bail!(
+                    "bound cleanup entry identity changed: {}",
+                    child_path.display()
+                );
+            }
+            remove_directory_contents(&child, &child_path)?;
+            let current = identity_at_cstr(directory, &name)?.ok_or_else(|| {
+                anyhow!("bound cleanup entry is missing: {}", child_path.display())
+            })?;
+            if current != expected {
+                bail!(
+                    "bound cleanup entry identity changed: {}",
+                    child_path.display()
+                );
+            }
+            rustix::fs::unlinkat(directory, &name, AtFlags::REMOVEDIR)
+                .map_err(errno_to_io)
+                .with_context(|| {
+                    format!(
+                        "failed to remove bound cleanup directory {}",
+                        child_path.display()
+                    )
+                })?;
+        } else {
+            let current = identity_at_cstr(directory, &name)?.ok_or_else(|| {
+                anyhow!("bound cleanup entry is missing: {}", child_path.display())
+            })?;
+            if current != expected {
+                bail!(
+                    "bound cleanup entry identity changed: {}",
+                    child_path.display()
+                );
+            }
+            rustix::fs::unlinkat(directory, &name, AtFlags::empty())
+                .map_err(errno_to_io)
+                .with_context(|| {
+                    format!(
+                        "failed to remove bound cleanup entry {}",
+                        child_path.display()
+                    )
+                })?;
+        }
+    }
+    Ok(())
 }
 
 fn identity_from_stat(stat: &rustix::fs::Stat) -> EntryIdentity {
@@ -743,6 +874,55 @@ mod tests {
             b"replacement"
         );
         assert!(!replacement.join("target").exists());
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_tree_cleanup_uses_the_original_root_after_symlink_retargeting() {
+        use std::os::unix::fs::symlink;
+
+        let parent = temp_dir("bound-tree-root-symlink-retarget");
+        let original = parent.join("original");
+        let replacement = parent.join("replacement");
+        let configured = parent.join("configured");
+        let relative_tree = Path::new("staging/job-1");
+        fs::create_dir_all(original.join(relative_tree).join("nested"))
+            .expect("original staging tree should create");
+        fs::write(
+            original.join(relative_tree).join("nested/video"),
+            b"original",
+        )
+        .expect("original staged file should write");
+        fs::create_dir_all(replacement.join(relative_tree))
+            .expect("replacement staging tree should create");
+        fs::write(
+            replacement.join(relative_tree).join("sentinel"),
+            b"replacement",
+        )
+        .expect("replacement sentinel should write");
+        symlink(&original, &configured).expect("configured root symlink should create");
+        let rooted = RootedFs::new(&configured).expect("configured root should bind");
+        let logical_tree = configured.join(relative_tree);
+        let entry = rooted
+            .bind_entry(&logical_tree, false)
+            .expect("staging tree should bind");
+        let identity = rooted
+            .bound_entry_identity(&entry)
+            .expect("staging identity should read")
+            .expect("staging tree should exist");
+
+        fs::remove_file(&configured).expect("configured symlink should remove");
+        symlink(&replacement, &configured).expect("configured symlink should retarget");
+        rooted
+            .remove_bound_tree_if_identity(&entry, identity)
+            .expect("bound cleanup should remove only the original staging tree");
+
+        assert!(!original.join(relative_tree).exists());
+        assert_eq!(
+            fs::read(replacement.join(relative_tree).join("sentinel")).unwrap(),
+            b"replacement"
+        );
         let _ = fs::remove_dir_all(parent);
     }
 

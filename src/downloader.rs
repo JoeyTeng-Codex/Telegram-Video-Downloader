@@ -1672,9 +1672,12 @@ async fn run_staged_video_job(
     let _guard = video_output_lock("Staged video download", progress.as_ref()).await;
     let final_dir = config.downloads.video_dir.clone();
     let primary_media_kind = staged_primary_media_kind(config, job)?;
-    let staging_dir = create_video_staging_dir(&final_dir)?;
-    let _staging_cleanup = RemoveDirOnDrop::new(staging_dir.clone());
+    let root = RootedFs::new(&final_dir)?;
+    let staging = create_video_staging_dir(&root)?;
+    let staging_dir = staging.path().to_path_buf();
+    staging.validate_for_path_access()?;
     copy_bbdown_config_for_staging(&final_dir, &staging_dir)?;
+    staging.validate_for_path_access()?;
     send_progress(
         progress.as_ref(),
         format!("staging: downloading into {}", staging_dir.display()),
@@ -1722,10 +1725,16 @@ async fn run_staged_video_job(
         Err(err) => return Err(err),
     };
 
+    staging
+        .validate_for_path_access()
+        .context("output root or staging directory changed during download")?;
     let staged_files = collect_regular_files(&staging_dir)?
         .into_iter()
         .filter(|path| !is_staging_support_file(&staging_dir, path))
         .collect::<Vec<_>>();
+    staging
+        .validate_for_path_access()
+        .context("output root or staging directory changed while collecting download outputs")?;
     if staged_files.is_empty() {
         bail!(
             "staged video download finished but no output files were found in {}",
@@ -1758,7 +1767,8 @@ async fn run_staged_video_job(
     }
 
     let moved_files = if staged_media.is_empty() && artifact_only {
-        move_staged_artifact_files(
+        move_staged_artifact_files_with_root(
+            &root,
             &staging_dir,
             &final_dir,
             &staged_files,
@@ -1767,7 +1777,8 @@ async fn run_staged_video_job(
             primary_media_kind,
         )
     } else {
-        move_staged_video_files(
+        move_staged_video_files_with_root(
+            &root,
             &staging_dir,
             &final_dir,
             &staged_files,
@@ -3546,7 +3557,7 @@ fn index_video_identities(
 ) -> Result<()> {
     index_video_filename_identities(index, video);
 
-    for path in metadata_sidecar_paths(video) {
+    for path in existing_metadata_sidecar_paths(video)? {
         index_metadata_sidecar(index, video, &path, &path, read_policy)?;
     }
 
@@ -3609,12 +3620,16 @@ fn index_metadata_sidecar(
 }
 
 fn metadata_sidecars_match_identity(video: &Path, identity: &VideoIdentity) -> bool {
-    metadata_sidecar_paths(video).into_iter().any(|path| {
-        fs::read_to_string(&path)
-            .ok()
-            .and_then(|content| metadata_sidecar_identities(&path, &content).ok())
-            .is_some_and(|identities| identities.contains(identity))
-    })
+    existing_metadata_sidecar_paths(video)
+        .ok()
+        .into_iter()
+        .flatten()
+        .any(|path| {
+            fs::read_to_string(&path)
+                .ok()
+                .and_then(|content| metadata_sidecar_identities(&path, &content).ok())
+                .is_some_and(|identities| identities.contains(identity))
+        })
 }
 
 fn video_file_identity_ids(path: &Path) -> Vec<String> {
@@ -3786,11 +3801,48 @@ fn uniqueid_tag_type(tag: &str, quote: char) -> Option<&str> {
     Some(value)
 }
 
-fn metadata_sidecar_paths(video: &Path) -> Vec<PathBuf> {
+fn expected_metadata_sidecar_paths(video: &Path) -> Vec<PathBuf> {
     ["nfo", "info.json"]
         .into_iter()
         .map(|extension| video.with_extension(extension))
         .collect()
+}
+
+fn existing_metadata_sidecar_paths(video: &Path) -> Result<Vec<PathBuf>> {
+    let Some(parent) = video.parent() else {
+        return Ok(Vec::new());
+    };
+    let Some(stem) = video.file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(Vec::new());
+    };
+    let mut entries = Vec::new();
+    let mut primary_stems = BTreeSet::from([stem.to_string()]);
+    for entry in
+        fs::read_dir(parent).with_context(|| format!("failed to read {}", parent.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_file()
+            && (is_video_file(&path) || is_audio_file(&path))
+            && let Some(primary_stem) = path.file_stem().and_then(|stem| stem.to_str())
+        {
+            primary_stems.insert(primary_stem.to_string());
+        }
+        entries.push(path);
+    }
+
+    let prefix = format!("{stem}.");
+    Ok(entries
+        .into_iter()
+        .filter(|path| {
+            identity_metadata_kind(path).is_some()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+                && best_primary_stem_for_sidecar(path, &primary_stems).as_deref() == Some(stem)
+        })
+        .collect())
 }
 
 fn list_video_files(root: &Path) -> Result<BTreeSet<PathBuf>> {
@@ -3865,23 +3917,32 @@ fn is_primary_media_file(path: &Path, kind: StagedPrimaryMediaKind) -> bool {
         || (matches!(kind, StagedPrimaryMediaKind::VideoOrAudio) && is_audio_file(path))
 }
 
-fn create_video_staging_dir(final_dir: &Path) -> Result<PathBuf> {
-    let parent = final_dir.join(VIDEO_STAGING_DIR_NAME);
-    fs::create_dir_all(&parent)
-        .with_context(|| format!("failed to create staging directory {}", parent.display()))?;
+fn create_video_staging_dir(root: &RootedFs) -> Result<BoundStagingDir> {
+    let parent = root.logical_root_path().join(VIDEO_STAGING_DIR_NAME);
+    let _ = root.create_dir(&parent, 0o755)?;
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     for index in 0..1000 {
         let candidate = parent.join(format!("job-{}-{nanos}-{index}", std::process::id()));
-        match fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to create {}", candidate.display()));
+        match root.create_dir(&candidate, 0o700)? {
+            Some(identity) => {
+                let entry = root.bind_entry(&candidate, false)?;
+                if root.bound_entry_identity(&entry)? != Some(identity) {
+                    let _ = root.remove_bound_dir_if_identity(&entry, identity);
+                    bail!(
+                        "staging directory identity changed while binding: {}",
+                        candidate.display()
+                    );
+                }
+                return Ok(BoundStagingDir {
+                    root: root.clone(),
+                    entry,
+                    identity,
+                });
             }
+            None => continue,
         }
     }
     bail!(
@@ -4049,19 +4110,35 @@ impl AcquiredOverwrite {
 }
 
 #[derive(Debug)]
-struct RemoveDirOnDrop {
-    path: PathBuf,
+struct BoundStagingDir {
+    root: RootedFs,
+    entry: BoundEntry,
+    identity: EntryIdentity,
 }
 
-impl RemoveDirOnDrop {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
+impl BoundStagingDir {
+    fn path(&self) -> &Path {
+        self.entry.path()
+    }
+
+    fn validate_for_path_access(&self) -> Result<()> {
+        self.root.validate_configured_root()?;
+        require_bound_entry_identity(&self.root, &self.entry, self.identity, "staging directory")
     }
 }
 
-impl Drop for RemoveDirOnDrop {
+impl Drop for BoundStagingDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        if let Err(err) = self
+            .root
+            .remove_bound_tree_if_identity(&self.entry, self.identity)
+        {
+            info!(
+                path = %self.entry.path().display(),
+                error = %err,
+                "failed to clean bound staging directory"
+            );
+        }
     }
 }
 
@@ -4080,7 +4157,8 @@ fn acquire_and_validate_overwrite_target(
         .into_iter()
         .collect::<BTreeSet<_>>();
     artifacts.remove(&target);
-    artifacts.extend(metadata_sidecar_paths(&target));
+    artifacts.extend(existing_metadata_sidecar_paths(&target)?);
+    artifacts.extend(expected_metadata_sidecar_paths(&target));
     let backup_parent = target.parent().context("overwrite target has no parent")?;
     let (backup_dir, backup_dir_entry, backup_dir_identity) =
         create_overwrite_backup_dir(root, backup_parent)?;
@@ -4259,9 +4337,10 @@ fn validate_acquired_overwrite(
 
     let mut acquired_index = VideoIdentityIndex::default();
     index_video_filename_identities(&mut acquired_index, acquired.target());
-    let mut identity_metadata_paths = metadata_sidecar_paths(acquired.target())
+    let mut identity_metadata_paths = expected_metadata_sidecar_paths(acquired.target())
         .into_iter()
         .collect::<BTreeSet<_>>();
+    identity_metadata_paths.extend(existing_metadata_sidecar_paths(acquired.target())?);
     identity_metadata_paths.extend(
         acquired
             .backups
@@ -4344,6 +4423,7 @@ fn rollback_acquired_overwrite(error: anyhow::Error, acquired: AcquiredOverwrite
     }
 }
 
+#[cfg(test)]
 fn move_staged_video_files(
     staging_dir: &Path,
     final_dir: &Path,
@@ -4353,6 +4433,26 @@ fn move_staged_video_files(
     primary_media_kind: StagedPrimaryMediaKind,
 ) -> Result<Vec<PathBuf>> {
     let root = RootedFs::new(final_dir)?;
+    move_staged_video_files_with_root(
+        &root,
+        staging_dir,
+        final_dir,
+        staged_files,
+        action,
+        duplicate,
+        primary_media_kind,
+    )
+}
+
+fn move_staged_video_files_with_root(
+    root: &RootedFs,
+    staging_dir: &Path,
+    final_dir: &Path,
+    staged_files: &[PathBuf],
+    action: VideoDuplicateAction,
+    duplicate: &VideoDuplicate,
+    primary_media_kind: StagedPrimaryMediaKind,
+) -> Result<Vec<PathBuf>> {
     let staged_media_count = staged_files
         .iter()
         .filter(|path| is_primary_media_file(path, primary_media_kind))
@@ -4368,7 +4468,7 @@ fn move_staged_video_files(
         };
     let acquisition = if matches!(effective_action, VideoDuplicateAction::Overwrite) {
         Some(acquire_and_validate_overwrite_target(
-            &root,
+            root,
             duplicate,
             primary_media_kind,
         )?)
@@ -4378,7 +4478,7 @@ fn move_staged_video_files(
     let overwrite_target = acquisition.as_ref().map(AcquiredOverwrite::target);
 
     let move_result = move_staged_video_files_inner(
-        &root,
+        root,
         staging_dir,
         final_dir,
         staged_files,
@@ -4419,6 +4519,7 @@ fn move_staged_video_files_inner(
     execute_move_plan(root, plan, primary_media_kind)
 }
 
+#[cfg(test)]
 fn move_staged_artifact_files(
     staging_dir: &Path,
     final_dir: &Path,
@@ -4428,9 +4529,29 @@ fn move_staged_artifact_files(
     primary_media_kind: StagedPrimaryMediaKind,
 ) -> Result<Vec<PathBuf>> {
     let root = RootedFs::new(final_dir)?;
+    move_staged_artifact_files_with_root(
+        &root,
+        staging_dir,
+        final_dir,
+        staged_files,
+        action,
+        duplicate,
+        primary_media_kind,
+    )
+}
+
+fn move_staged_artifact_files_with_root(
+    root: &RootedFs,
+    staging_dir: &Path,
+    final_dir: &Path,
+    staged_files: &[PathBuf],
+    action: VideoDuplicateAction,
+    duplicate: &VideoDuplicate,
+    primary_media_kind: StagedPrimaryMediaKind,
+) -> Result<Vec<PathBuf>> {
     let mut acquisition = if matches!(action, VideoDuplicateAction::Overwrite) {
         Some(acquire_and_validate_overwrite_target(
-            &root,
+            root,
             duplicate,
             primary_media_kind,
         )?)
@@ -4453,12 +4574,12 @@ fn move_staged_artifact_files(
         .iter()
         .map(|step| step.destination.clone())
         .collect::<BTreeSet<_>>();
-    let move_result = execute_artifact_move_plan(&root, plan);
+    let move_result = execute_artifact_move_plan(root, plan);
     match move_result {
         Ok(moved) => {
             if let Some(mut acquired) = acquisition.take() {
                 if let Err(err) = acquired.restore_unreplaced(&replaced_destinations) {
-                    let err = with_move_rollback_error(&root, err, &moved);
+                    let err = with_move_rollback_error(root, err, &moved);
                     return Err(rollback_acquired_overwrite(err, acquired));
                 }
                 acquired
@@ -5905,7 +6026,7 @@ mod tests {
         fs::create_dir_all(&video_dir).expect("video dir should create");
         config.downloads.video_dir = video_dir.clone();
         let video = video_dir.join("Indexed.mp4");
-        let nfo = video.with_extension("nfo");
+        let nfo = video.with_extension("NFO");
         fs::write(&video, "video").expect("video should write");
         fs::write(
             &nfo,
@@ -5920,6 +6041,14 @@ mod tests {
             selection: None,
         };
         let index = build_video_identity_index(&config, &job).expect("index should build");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid456".to_string(),
+            },
+            existing_videos: vec![video.clone()],
+        };
+        assert!(duplicate.allows_overwrite_for(&job));
         fs::remove_file(nfo).expect("sidecar should be removable after indexing");
 
         for id in ["BV123", "cid456"] {
@@ -6018,7 +6147,7 @@ mod tests {
         let video_path = video_dir.join("Unrelated title.mkv");
         fs::write(&video_path, "video").expect("video file should write");
         fs::write(
-            video_path.with_extension("info.json"),
+            video_path.with_extension("INFO.JSON"),
             serde_json::json!({
                 "id": "PHH1wTDF-1M",
                 "extractor": "youtube",
@@ -6213,6 +6342,50 @@ mod tests {
 
         assert_eq!(duplicate, None);
         let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_staging_rejects_retargeted_root_and_cleans_only_the_original() {
+        use std::os::unix::fs::symlink;
+
+        let parent = temp_test_dir("bound-staging-root-retarget");
+        let original = parent.join("original");
+        let replacement = parent.join("replacement");
+        let configured = parent.join("configured");
+        fs::create_dir_all(&original).expect("original root should create");
+        fs::create_dir_all(&replacement).expect("replacement root should create");
+        symlink(&original, &configured).expect("configured root symlink should create");
+        let root = RootedFs::new(&configured).expect("configured root should bind");
+        let staging = create_video_staging_dir(&root).expect("staging directory should create");
+        let relative_staging = staging
+            .path()
+            .strip_prefix(&configured)
+            .expect("staging should be output-relative")
+            .to_path_buf();
+        fs::write(staging.path().join("download.mkv"), "original")
+            .expect("original staged file should write");
+
+        fs::remove_file(&configured).expect("configured symlink should remove");
+        symlink(&replacement, &configured).expect("configured symlink should retarget");
+        let replacement_staging = replacement.join(&relative_staging);
+        fs::create_dir_all(&replacement_staging)
+            .expect("replacement staging directory should create");
+        fs::write(replacement_staging.join("sentinel"), "replacement")
+            .expect("replacement sentinel should write");
+
+        let error = staging
+            .validate_for_path_access()
+            .expect_err("retargeted output root must fail before commit");
+        assert!(format!("{error:#}").contains("different directory"));
+        drop(staging);
+
+        assert!(!original.join(relative_staging).exists());
+        assert_eq!(
+            fs::read_to_string(replacement_staging.join("sentinel")).unwrap(),
+            "replacement"
+        );
+        let _ = fs::remove_dir_all(parent);
     }
 
     #[test]
