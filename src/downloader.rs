@@ -25,7 +25,7 @@ use crate::bilibili_auth;
 use crate::bilibili_core;
 use crate::config::AppConfig;
 use crate::router::{BilibiliSelection, JobRequest};
-use crate::safe_fs::{BoundEntry, EntryIdentity, RootedFs};
+use crate::safe_fs::{BoundEntry, EntryIdentity, RootedFs, identity_for_open_file};
 
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -84,6 +84,13 @@ pub enum VideoDuplicateAction {
 pub struct VideoDuplicate {
     pub identity: VideoIdentity,
     pub existing_videos: Vec<PathBuf>,
+    pub(crate) overwrite_confirmation: Option<VideoOverwriteConfirmation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VideoOverwriteConfirmation {
+    root_identity: EntryIdentity,
+    target_identity: EntryIdentity,
 }
 
 impl VideoDuplicate {
@@ -126,6 +133,11 @@ impl VideoDuplicate {
             && (self.identity.provider == VideoProvider::Youtube
                 || is_bilibili_entry_identity(&self.identity.id)))
         .then(|| &self.existing_videos[0])
+    }
+
+    fn with_overwrite_confirmation(mut self, confirmation: VideoOverwriteConfirmation) -> Self {
+        self.overwrite_confirmation = Some(confirmation);
+        self
     }
 }
 
@@ -367,6 +379,7 @@ pub async fn run_video_job_staged_keep_both(
         return run_job(config, job, progress).await;
     };
     let duplicate = VideoDuplicate {
+        overwrite_confirmation: None,
         identity,
         existing_videos: Vec::new(),
     };
@@ -457,6 +470,8 @@ fn find_video_duplicate_for_identities(
 struct VideoIdentityIndex {
     videos_by_identity: BTreeMap<VideoIdentity, Vec<PathBuf>>,
     overwrite_videos_by_identity: BTreeMap<VideoIdentity, Vec<PathBuf>>,
+    root_identity: Option<EntryIdentity>,
+    file_identities: BTreeMap<PathBuf, EntryIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -481,6 +496,13 @@ impl VideoIdentityIndex {
 
     fn overwrite_videos(&self, identity: &VideoIdentity) -> &[PathBuf] {
         identity_paths(&self.overwrite_videos_by_identity, identity)
+    }
+
+    fn overwrite_confirmation(&self, video: &Path) -> Option<VideoOverwriteConfirmation> {
+        Some(VideoOverwriteConfirmation {
+            root_identity: self.root_identity?,
+            target_identity: *self.file_identities.get(video)?,
+        })
     }
 }
 
@@ -516,9 +538,20 @@ fn build_video_identity_index_in_dir(
     primary_media_kind: StagedPrimaryMediaKind,
     read_policy: IdentityIndexReadPolicy,
 ) -> Result<VideoIdentityIndex> {
-    let media_files = list_primary_media_files(root, primary_media_kind)?;
-    let mut index = VideoIdentityIndex::default();
+    let root = RootedFs::new(root)?;
+    let media_files = list_primary_media_files(root.logical_root_path(), primary_media_kind)?;
+    let mut index = VideoIdentityIndex {
+        root_identity: Some(root.root_identity()),
+        ..VideoIdentityIndex::default()
+    };
     for video in media_files {
+        let Some(file_identity) = root.entry_identity(&video)? else {
+            continue;
+        };
+        if !file_identity.is_file() {
+            continue;
+        }
+        index.file_identities.insert(video.clone(), file_identity);
         index_video_identities(&mut index, &video, read_policy)?;
     }
     Ok(index)
@@ -543,9 +576,14 @@ fn find_video_duplicate_in_index(
     if exact_videos.len() == 1
         && let Some(identity) = exact_identity
     {
+        let existing_videos = exact_videos.into_iter().collect::<Vec<_>>();
+        let overwrite_confirmation = existing_videos
+            .first()
+            .and_then(|video| index.overwrite_confirmation(video));
         return Some(VideoDuplicate {
+            overwrite_confirmation,
             identity,
-            existing_videos: exact_videos.into_iter().collect(),
+            existing_videos,
         });
     }
 
@@ -564,9 +602,15 @@ fn find_video_duplicate_in_index(
         }
     }
 
-    matched_identity.map(|identity| VideoDuplicate {
-        identity,
-        existing_videos,
+    matched_identity.map(|identity| {
+        let overwrite_confirmation = (existing_videos.len() == 1)
+            .then(|| index.overwrite_confirmation(&existing_videos[0]))
+            .flatten();
+        VideoDuplicate {
+            overwrite_confirmation,
+            identity,
+            existing_videos,
+        }
     })
 }
 
@@ -609,11 +653,13 @@ async fn run_bilibili_job(
     progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
     let _guard = video_output_lock("Bilibili download", progress.as_ref()).await;
-    run_bilibili_job_locked(config, url, selection, None, progress).await
+    let root = RootedFs::new(&config.downloads.video_dir)?;
+    run_bilibili_job_locked(config, &root, url, selection, None, progress).await
 }
 
 async fn run_bilibili_job_locked(
     config: &AppConfig,
+    root: &RootedFs,
     url: &str,
     selection: Option<BilibiliSelection>,
     expected_overwrite_identity: Option<&VideoIdentity>,
@@ -649,6 +695,7 @@ async fn run_bilibili_job_locked(
     if mux_locally {
         mux_bilibili_report_media(
             config,
+            root,
             &output_dir,
             &mut report,
             command_started_at,
@@ -656,7 +703,7 @@ async fn run_bilibili_job_locked(
         )
         .await?;
     }
-    cleanup_bilibili_mux_input_files(&output_dir, &report)?;
+    cleanup_bilibili_mux_input_files(root, &output_dir, &report)?;
     let primary_videos = bilibili_report_primary_media(&output_dir, &report);
     let mut details = vec![format!(
         "BBDown-rust crate: {} entr{}",
@@ -795,23 +842,28 @@ struct BilibiliMediaInput {
 
 #[derive(Debug)]
 struct OwnedTemporaryFile {
-    path: PathBuf,
+    root: RootedFs,
+    entry: BoundEntry,
+    identity: EntryIdentity,
 }
 
 impl OwnedTemporaryFile {
     fn path(&self) -> &Path {
-        &self.path
+        self.entry.path()
     }
 }
 
 impl Drop for OwnedTemporaryFile {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = self
+            .root
+            .remove_bound_file_if_identity(&self.entry, self.identity);
     }
 }
 
 async fn mux_bilibili_report_media(
     config: &AppConfig,
+    root: &RootedFs,
     cwd: &Path,
     report: &mut BilibiliDownloadReport,
     since: SystemTime,
@@ -834,18 +886,18 @@ async fn mux_bilibili_report_media(
         };
         let output_path = unique_bilibili_mux_output_path(&entry_dir, title, "mp4", since);
         let (spec, concat_file) =
-            bilibili_local_mux_command_spec(config, &media_inputs, &entry_dir, &output_path)?;
+            bilibili_local_mux_command_spec(config, root, &media_inputs, &entry_dir, &output_path)?;
         let output_result = run_command(config, &spec, progress.clone()).await;
         drop(concat_file);
         let output_result = match output_result {
             Ok(output_result) => output_result,
             Err(err) => {
-                let _ = fs::remove_file(&output_path);
+                let _ = root.remove_file_if_exists(&output_path);
                 return Err(err);
             }
         };
         if !output_result.status.success() {
-            let _ = fs::remove_file(&output_path);
+            let _ = root.remove_file_if_exists(&output_path);
             bail!(
                 "{} exited with status {}\n{}",
                 spec.program.display(),
@@ -856,7 +908,10 @@ async fn mux_bilibili_report_media(
                 )
             );
         }
-        if !output_path.is_file() {
+        if !root
+            .entry_identity(&output_path)?
+            .is_some_and(EntryIdentity::is_file)
+        {
             bail!(
                 "Bilibili mux finished without creating {}",
                 output_path.display()
@@ -884,6 +939,7 @@ fn bilibili_entry_media_inputs(
 
 fn bilibili_local_mux_command_spec(
     config: &AppConfig,
+    root: &RootedFs,
     media_inputs: &[BilibiliMediaInput],
     entry_dir: &Path,
     output: &Path,
@@ -895,6 +951,7 @@ fn bilibili_local_mux_command_spec(
     ];
     let concat_file = if only_bilibili_flv_segments(media_inputs) {
         let concat_file = create_bilibili_concat_file(
+            root,
             entry_dir,
             ffmpeg_concat_file_list(media_inputs).as_bytes(),
         )?;
@@ -937,7 +994,11 @@ fn bilibili_local_mux_command_spec(
     ))
 }
 
-fn create_bilibili_concat_file(entry_dir: &Path, contents: &[u8]) -> Result<OwnedTemporaryFile> {
+fn create_bilibili_concat_file(
+    root: &RootedFs,
+    entry_dir: &Path,
+    contents: &[u8],
+) -> Result<OwnedTemporaryFile> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -948,6 +1009,7 @@ fn create_bilibili_concat_file(entry_dir: &Path, contents: &[u8]) -> Result<Owne
             "{BILIBILI_FFMPEG_CONCAT_FILE_PREFIX}-{}-{stamp:x}-{counter:x}.txt",
             std::process::id()
         ));
+        root.validate_configured_root()?;
         let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -960,17 +1022,32 @@ fn create_bilibili_concat_file(entry_dir: &Path, contents: &[u8]) -> Result<Owne
                 });
             }
         };
+        let identity = identity_for_open_file(&file)?;
+        let entry = root.bind_entry(&path, false)?;
+        if root.bound_entry_identity(&entry)? != Some(identity) {
+            bail!(
+                "Bilibili ffmpeg concat list identity changed while binding: {}",
+                path.display()
+            );
+        }
         if let Err(err) = file.write_all(contents) {
             drop(file);
-            let _ = fs::remove_file(&path);
-            return Err(err).with_context(|| {
-                format!(
-                    "failed to write Bilibili ffmpeg concat list {}",
-                    path.display()
-                )
-            });
+            let error = anyhow!(err).context(format!(
+                "failed to write Bilibili ffmpeg concat list {}",
+                path.display()
+            ));
+            return match root.remove_bound_file_if_identity(&entry, identity) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(anyhow!(
+                    "{error:#}; failed to clean Bilibili ffmpeg concat list: {cleanup:#}"
+                )),
+            };
         }
-        return Ok(OwnedTemporaryFile { path });
+        return Ok(OwnedTemporaryFile {
+            root: root.clone(),
+            entry,
+            identity,
+        });
     }
     bail!("failed to allocate a unique Bilibili ffmpeg concat list")
 }
@@ -991,7 +1068,11 @@ fn ffmpeg_concat_file_list(media_inputs: &[BilibiliMediaInput]) -> String {
         .collect()
 }
 
-fn cleanup_bilibili_mux_input_files(cwd: &Path, report: &BilibiliDownloadReport) -> Result<()> {
+fn cleanup_bilibili_mux_input_files(
+    root: &RootedFs,
+    cwd: &Path,
+    report: &BilibiliDownloadReport,
+) -> Result<()> {
     for entry in &report.entries {
         if entry.mux.is_none() {
             continue;
@@ -1002,15 +1083,9 @@ fn cleanup_bilibili_mux_input_files(cwd: &Path, report: &BilibiliDownloadReport)
             .filter(|file| matches!(file.kind.as_str(), "video" | "audio" | "flv_segment"))
         {
             let path = resolve_command_output_path(cwd, &file.path);
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(err).with_context(|| {
-                        format!("failed to remove raw Bilibili input {}", path.display())
-                    });
-                }
-            }
+            root.remove_file_if_exists(&path).with_context(|| {
+                format!("failed to remove raw Bilibili input {}", path.display())
+            })?;
         }
     }
     Ok(())
@@ -1692,6 +1767,7 @@ async fn run_staged_video_job(
                 matches!(action, VideoDuplicateAction::Overwrite).then_some(&duplicate.identity);
             run_bilibili_job_locked(
                 &staging_config,
+                &root,
                 url,
                 *selection,
                 expected_identity,
@@ -4007,6 +4083,8 @@ struct MoveStep {
 struct MovedFile {
     source: PathBuf,
     destination: PathBuf,
+    source_entry: BoundEntry,
+    destination_entry: BoundEntry,
     identity: EntryIdentity,
 }
 
@@ -4152,6 +4230,20 @@ fn acquire_and_validate_overwrite_target(
         .overwrite_target()
         .context("overwrite target is not an exact unique match")?
         .clone();
+    let confirmation = duplicate
+        .overwrite_confirmation
+        .context("overwrite target was not bound when replacement was confirmed")?;
+    if root.root_identity() != confirmation.root_identity {
+        bail!("output root changed after overwrite confirmation");
+    }
+    match root.entry_identity(&target)? {
+        Some(current) if current == confirmation.target_identity => {}
+        Some(_) => bail!(
+            "overwrite target changed after confirmation: {}",
+            target.display()
+        ),
+        None => bail!("overwrite target is missing: {}", target.display()),
+    }
 
     let mut artifacts = existing_video_artifacts(&target)?
         .into_iter()
@@ -4164,7 +4256,14 @@ fn acquire_and_validate_overwrite_target(
         create_overwrite_backup_dir(root, backup_parent)?;
     let mut backups = Vec::new();
 
-    if let Err(err) = acquire_overwrite_path(root, &target, true, &backup_dir, &mut backups) {
+    if let Err(err) = acquire_overwrite_path(
+        root,
+        &target,
+        true,
+        Some(confirmation.target_identity),
+        &backup_dir,
+        &mut backups,
+    ) {
         if backups.is_empty() {
             let _ = root.remove_bound_dir_if_identity(&backup_dir_entry, backup_dir_identity);
             return Err(err);
@@ -4183,7 +4282,8 @@ fn acquire_and_validate_overwrite_target(
         ));
     }
     for artifact in artifacts {
-        if let Err(err) = acquire_overwrite_path(root, &artifact, false, &backup_dir, &mut backups)
+        if let Err(err) =
+            acquire_overwrite_path(root, &artifact, false, None, &backup_dir, &mut backups)
         {
             return Err(rollback_acquired_overwrite(
                 err,
@@ -4251,6 +4351,7 @@ fn acquire_overwrite_path(
     root: &RootedFs,
     original: &Path,
     required: bool,
+    expected_identity: Option<EntryIdentity>,
     backup_dir: &Path,
     backups: &mut Vec<FileBackup>,
 ) -> Result<()> {
@@ -4270,6 +4371,12 @@ fn acquire_overwrite_path(
         }
         bail!(
             "overwrite path is no longer a regular file: {}",
+            original.display()
+        );
+    }
+    if expected_identity.is_some_and(|expected| expected != identity) {
+        bail!(
+            "overwrite target changed after confirmation: {}",
             original.display()
         );
     }
@@ -4424,6 +4531,31 @@ fn rollback_acquired_overwrite(error: anyhow::Error, acquired: AcquiredOverwrite
 }
 
 #[cfg(test)]
+fn bind_test_overwrite_confirmation(
+    root: &RootedFs,
+    action: VideoDuplicateAction,
+    duplicate: &VideoDuplicate,
+) -> Result<VideoDuplicate> {
+    let mut duplicate = duplicate.clone();
+    if !matches!(action, VideoDuplicateAction::Overwrite)
+        || duplicate.overwrite_confirmation.is_some()
+    {
+        return Ok(duplicate);
+    }
+    let Some(target) = duplicate.overwrite_target() else {
+        return Ok(duplicate);
+    };
+    let target_identity = root
+        .entry_identity(target)?
+        .with_context(|| format!("overwrite target is missing: {}", target.display()))?;
+    duplicate = duplicate.with_overwrite_confirmation(VideoOverwriteConfirmation {
+        root_identity: root.root_identity(),
+        target_identity,
+    });
+    Ok(duplicate)
+}
+
+#[cfg(test)]
 fn move_staged_video_files(
     staging_dir: &Path,
     final_dir: &Path,
@@ -4433,13 +4565,14 @@ fn move_staged_video_files(
     primary_media_kind: StagedPrimaryMediaKind,
 ) -> Result<Vec<PathBuf>> {
     let root = RootedFs::new(final_dir)?;
+    let duplicate = bind_test_overwrite_confirmation(&root, action, duplicate)?;
     move_staged_video_files_with_root(
         &root,
         staging_dir,
         final_dir,
         staged_files,
         action,
-        duplicate,
+        &duplicate,
         primary_media_kind,
     )
 }
@@ -4529,13 +4662,14 @@ fn move_staged_artifact_files(
     primary_media_kind: StagedPrimaryMediaKind,
 ) -> Result<Vec<PathBuf>> {
     let root = RootedFs::new(final_dir)?;
+    let duplicate = bind_test_overwrite_confirmation(&root, action, duplicate)?;
     move_staged_artifact_files_with_root(
         &root,
         staging_dir,
         final_dir,
         staged_files,
         action,
-        duplicate,
+        &duplicate,
         primary_media_kind,
     )
 }
@@ -4673,12 +4807,8 @@ fn artifact_sidecar_suffix(source: &Path) -> Option<String> {
 fn execute_artifact_move_plan(root: &RootedFs, plan: Vec<MoveStep>) -> Result<Vec<MovedFile>> {
     let mut moved = Vec::new();
     for step in plan {
-        match root.rename_noreplace(&step.source, &step.destination, true) {
-            Ok(identity) => moved.push(MovedFile {
-                source: step.source,
-                destination: step.destination,
-                identity,
-            }),
+        match move_step_with_bound_parents(root, step.clone()) {
+            Ok(moved_file) => moved.push(moved_file),
             Err(err) => {
                 let err = err.context(format!(
                     "failed to move {} to {}",
@@ -4941,16 +5071,12 @@ fn execute_move_plan(
     let mut moved = Vec::new();
     let mut moved_videos = Vec::new();
     for step in plan {
-        match root.rename_noreplace(&step.source, &step.destination, true) {
-            Ok(identity) => {
-                if is_primary_media_file(&step.destination, primary_media_kind) {
-                    moved_videos.push(step.destination.clone());
+        match move_step_with_bound_parents(root, step.clone()) {
+            Ok(moved_file) => {
+                if is_primary_media_file(&moved_file.destination, primary_media_kind) {
+                    moved_videos.push(moved_file.destination.clone());
                 }
-                moved.push(MovedFile {
-                    source: step.source,
-                    destination: step.destination,
-                    identity,
-                });
+                moved.push(moved_file);
             }
             Err(err) => {
                 let err = err.context(format!(
@@ -4963,6 +5089,43 @@ fn execute_move_plan(
         }
     }
     Ok(moved_videos)
+}
+
+fn move_step_with_bound_parents(root: &RootedFs, step: MoveStep) -> Result<MovedFile> {
+    let source_entry = root.bind_entry(&step.source, false)?;
+    let destination_entry = root.bind_entry(&step.destination, true)?;
+    let identity = root
+        .bound_entry_identity(&source_entry)?
+        .with_context(|| format!("move source is missing: {}", step.source.display()))?;
+    if !identity.is_file() {
+        bail!(
+            "move source is not a regular file: {}",
+            step.source.display()
+        );
+    }
+    root.validate_configured_root()?;
+    root.rename_via_bound_parents_noreplace_if_identity(
+        &source_entry,
+        &destination_entry,
+        identity,
+    )?;
+    let moved = MovedFile {
+        source: step.source,
+        destination: step.destination,
+        source_entry,
+        destination_entry,
+        identity,
+    };
+    if let Err(err) =
+        require_entry_identity(root, &moved.destination, identity, "moved destination")
+    {
+        return Err(with_move_rollback_error(
+            root,
+            err.context("failed to validate moved destination through the configured output root"),
+            std::slice::from_ref(&moved),
+        ));
+    }
+    Ok(moved)
 }
 
 fn existing_video_artifacts(video: &Path) -> Result<Vec<PathBuf>> {
@@ -5030,10 +5193,9 @@ fn is_known_video_sidecar(path: &Path) -> bool {
 fn rollback_moves(root: &RootedFs, moved: &[MovedFile]) -> Result<()> {
     let mut failures = Vec::new();
     for moved in moved.iter().rev() {
-        if let Err(err) = root.rename_noreplace_if_identity(
-            &moved.destination,
-            &moved.source,
-            false,
+        if let Err(err) = root.rename_via_bound_parents_noreplace_if_identity(
+            &moved.destination_entry,
+            &moved.source_entry,
             moved.identity,
         ) {
             failures.push(format!(
@@ -6042,6 +6204,7 @@ mod tests {
         };
         let index = build_video_identity_index(&config, &job).expect("index should build");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
                 id: "cid456".to_string(),
@@ -6389,6 +6552,77 @@ mod tests {
     }
 
     #[test]
+    fn staged_move_rollback_uses_captured_parent_directories() {
+        let root_dir = temp_test_dir("bound-staged-move-rollback");
+        let staging_dir = root_dir.join("staging");
+        let destination_dir = root_dir.join("library");
+        let renamed_destination_dir = root_dir.join("library-renamed");
+        fs::create_dir_all(&staging_dir).expect("staging directory should create");
+        fs::create_dir_all(&destination_dir).expect("destination directory should create");
+        let source = staging_dir.join("video.mkv");
+        let destination = destination_dir.join("video.mkv");
+        fs::write(&source, "video").expect("staged video should write");
+        let root = RootedFs::new(&root_dir).expect("output root should bind");
+        let moved = move_step_with_bound_parents(
+            &root,
+            MoveStep {
+                source: source.clone(),
+                destination: destination.clone(),
+            },
+        )
+        .expect("staged file should move");
+
+        fs::rename(&destination_dir, &renamed_destination_dir)
+            .expect("destination parent should rename");
+        rollback_moves(&root, &[moved])
+            .expect("rollback should use the captured destination parent");
+
+        assert_eq!(fs::read_to_string(&source).unwrap(), "video");
+        assert!(!renamed_destination_dir.join("video.mkv").exists());
+        let _ = fs::remove_dir_all(root_dir);
+    }
+
+    #[test]
+    fn overwrite_rejects_a_same_identity_replacement_after_confirmation() {
+        let mut config = test_config();
+        let final_dir = temp_test_dir("overwrite-confirmed-object-replaced");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging directory should create");
+        config.downloads.video_dir = final_dir.clone();
+        let existing = final_dir.join("Example [PHH1wTDF-1M].mkv");
+        fs::write(&existing, "confirmed-video").expect("confirmed video should write");
+        let job = JobRequest::Youtube {
+            url: "https://www.youtube.com/watch?v=PHH1wTDF-1M".to_string(),
+        };
+        let duplicate = find_video_duplicate_without_probe(&config, &job)
+            .expect("duplicate scan should succeed")
+            .expect("confirmed duplicate should exist");
+
+        fs::remove_file(&existing).expect("confirmed video should remove");
+        fs::write(&existing, "replacement-video").expect("replacement video should write");
+        let staged = staging_dir.join("Example [PHH1wTDF-1M].mkv");
+        fs::write(&staged, "new-video").expect("staged video should write");
+        let staged_files = collect_regular_files(&staging_dir).expect("staging should scan");
+        let root = RootedFs::new(&final_dir).expect("output root should bind");
+
+        let error = move_staged_video_files_with_root(
+            &root,
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::Overwrite,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect_err("replacement object must not inherit overwrite confirmation");
+
+        assert!(error.to_string().contains("changed after confirmation"));
+        assert_eq!(fs::read_to_string(existing).unwrap(), "replacement-video");
+        assert_eq!(fs::read_to_string(staged).unwrap(), "new-video");
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
     fn keep_both_moves_staged_video_to_unique_path() {
         let final_dir = temp_test_dir("keep-both-final");
         let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
@@ -6402,6 +6636,7 @@ mod tests {
         fs::write(staged.with_extension("nfo"), "new-nfo").expect("new nfo should write");
         fs::write(staged.with_extension("info.json"), "new-json").expect("new json should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
                 id: "PHH1wTDF-1M".to_string(),
@@ -6453,6 +6688,7 @@ mod tests {
         fs::write(&staged, "new-video").expect("staged video should write");
         fs::write(staged.with_extension("xml"), "new-xml").expect("staged xml should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
                 id: "BV123".to_string(),
@@ -6496,6 +6732,7 @@ mod tests {
         fs::write(staged.with_extension("info.json"), "new-json")
             .expect("staged info json should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
                 id: "PHH1wTDF-1M".to_string(),
@@ -6549,6 +6786,7 @@ mod tests {
         fs::write(staged_part2.with_extension("nfo"), "new-part2-nfo")
             .expect("part2 nfo should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
                 id: "BV123".to_string(),
@@ -6594,6 +6832,7 @@ mod tests {
         fs::write(staged_part2.with_extension("nfo"), "new-part2-nfo")
             .expect("part2 nfo should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
                 id: "PHH1wTDF-1M".to_string(),
@@ -6657,6 +6896,7 @@ mod tests {
         fs::write(&staged_b, "new-b").expect("movie b should write");
         fs::write(staged_b.with_extension("nfo"), "new-b-nfo").expect("movie b nfo should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
                 id: "PHH1wTDF-1M".to_string(),
@@ -6700,6 +6940,7 @@ mod tests {
         fs::write(&staged_audio, "new-audio").expect("audio should write");
         fs::write(staged_audio.with_extension("nfo"), "new-nfo").expect("nfo should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
                 id: "BV123".to_string(),
@@ -6742,6 +6983,7 @@ mod tests {
         fs::write(staging_dir.join("Episode.cover.jpg"), "cover").expect("cover should write");
         let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
                 id: "BV123".to_string(),
@@ -6798,6 +7040,7 @@ mod tests {
             .expect("cover should write");
         let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
                 id: "cid123".to_string(),
@@ -6869,6 +7112,7 @@ mod tests {
         fs::write(staging_dir.join("New.Title.xml"), "new-xml").expect("new xml should write");
         let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
                 id: "cid123".to_string(),
@@ -6906,6 +7150,7 @@ mod tests {
         fs::write(&staged_xml, "new-xml").expect("staged xml should write");
         let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
                 id: "cid123".to_string(),
@@ -6951,6 +7196,7 @@ mod tests {
         let staged_flv = staging_dir.join("Episode Part 2.flv");
         fs::write(&staged_flv, "new-flv").expect("flv segment should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
                 id: "BV123".to_string(),
@@ -7010,6 +7256,7 @@ mod tests {
         fs::write(staged.with_extension("nfo"), "new-nfo").expect("new nfo should write");
         fs::write(staged.with_extension("xml"), "new-xml").expect("new xml should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
                 id: "PHH1wTDF-1M".to_string(),
@@ -7073,6 +7320,7 @@ mod tests {
         fs::write(staging_dir.join("danmaku.xml"), "new-danmaku")
             .expect("new bare danmaku should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
                 id: "cid123".to_string(),
@@ -7128,6 +7376,7 @@ mod tests {
         fs::write(staging_dir.join("subtitle-zh-01-new.ass"), "new-subtitle")
             .expect("new unbound subtitle should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
                 id: "cid123".to_string(),
@@ -7179,6 +7428,7 @@ mod tests {
         fs::write(staging_dir.join("cover-image-new.jpg"), "new-cover")
             .expect("new unbound cover should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
                 id: "cid123".to_string(),
@@ -7829,6 +8079,7 @@ mod tests {
         let staged = staging_dir.join("New [PHH1wTDF-1M].mkv");
         fs::write(&staged, "new-video").expect("staged file should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
                 id: "PHH1wTDF-1M".to_string(),
@@ -7880,6 +8131,7 @@ mod tests {
         fs::write(&first_staged, "new-first").expect("first staged video should write");
         fs::write(&second_staged, "new-second").expect("second staged video should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
                 id: "cid123".to_string(),
@@ -7928,6 +8180,7 @@ mod tests {
         fs::write(&staged, "new-video").expect("staged video should write");
         fs::write(staged.with_extension("nfo"), "new-nfo").expect("staged NFO should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
                 id: "cid123".to_string(),
@@ -7971,6 +8224,7 @@ mod tests {
         fs::write(staged.with_extension("info.json"), r#"{"id":"cid123"}"#)
             .expect("staged info JSON should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
                 id: "cid123".to_string(),
@@ -8008,6 +8262,7 @@ mod tests {
         let staged = staging_dir.join("New [PHH1wTDF-1M].mkv");
         fs::write(&staged, "new-video").expect("staged file should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
                 id: "PHH1wTDF-1M".to_string(),
@@ -8046,6 +8301,7 @@ mod tests {
         let staged = staging_dir.join("New [PHH1wTDF-1M].mkv");
         fs::write(&staged, "new-video").expect("staged file should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
                 id: "PHH1wTDF-1M".to_string(),
@@ -8087,6 +8343,7 @@ mod tests {
         let staged = staging_dir.join("New [BV123].mkv");
         fs::write(&staged, "new-video").expect("staged file should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
                 id: "cid123".to_string(),
@@ -8132,6 +8389,7 @@ mod tests {
         let staged = staging_dir.join("New [BV123].mkv");
         fs::write(&staged, "new-video").expect("staged file should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
                 id: "cid123".to_string(),
@@ -8177,6 +8435,7 @@ mod tests {
         fs::write(&existing, "original-video").expect("existing file should write");
         write_bilibili_identity_nfo(&existing, "cid123");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
                 id: "cid123".to_string(),
@@ -8185,6 +8444,9 @@ mod tests {
         };
 
         let root = RootedFs::new(&final_dir).expect("output root should open");
+        let duplicate =
+            bind_test_overwrite_confirmation(&root, VideoDuplicateAction::Overwrite, &duplicate)
+                .expect("overwrite confirmation should bind");
         let acquired =
             acquire_and_validate_overwrite_target(&root, &duplicate, StagedPrimaryMediaKind::Video)
                 .expect("overwrite target should be acquired");
@@ -8225,6 +8487,7 @@ mod tests {
         fs::write(&existing, "original-video").expect("existing file should write");
         write_bilibili_identity_nfo(&existing, "cid123");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
                 id: "cid123".to_string(),
@@ -8232,6 +8495,9 @@ mod tests {
             existing_videos: vec![existing.clone()],
         };
         let root = RootedFs::new(&final_dir).expect("output root should open");
+        let duplicate =
+            bind_test_overwrite_confirmation(&root, VideoDuplicateAction::Overwrite, &duplicate)
+                .expect("overwrite confirmation should bind");
         let acquired =
             acquire_and_validate_overwrite_target(&root, &duplicate, StagedPrimaryMediaKind::Video)
                 .expect("overwrite target should be acquired");
@@ -8279,6 +8545,7 @@ mod tests {
         fs::write(staged_part2.with_extension("nfo"), "new-part2-nfo")
             .expect("staged part2 nfo should write");
         let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
                 id: "PHH1wTDF-1M".to_string(),
@@ -8483,7 +8750,9 @@ mod tests {
         )
         .expect("download report JSON should parse");
 
-        cleanup_bilibili_mux_input_files(&root, &report).expect("raw inputs should clean up");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+        cleanup_bilibili_mux_input_files(&rooted, &root, &report)
+            .expect("raw inputs should clean up");
 
         assert!(!video.exists());
         assert!(!audio.exists());
@@ -8494,6 +8763,45 @@ mod tests {
         assert!(mux.exists());
         assert!(danmaku.exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bilibili_raw_cleanup_rejects_a_retargeted_output_root() {
+        use std::os::unix::fs::symlink;
+
+        let parent = temp_test_dir("bilibili-cleanup-root-retarget");
+        let original = parent.join("original");
+        let replacement = parent.join("replacement");
+        let configured = parent.join("configured");
+        fs::create_dir_all(&original).expect("original root should create");
+        fs::create_dir_all(&replacement).expect("replacement root should create");
+        fs::write(original.join("video.m4s"), "original")
+            .expect("original raw stream should write");
+        fs::write(replacement.join("video.m4s"), "replacement")
+            .expect("replacement raw stream should write");
+        symlink(&original, &configured).expect("configured root symlink should create");
+        let root = RootedFs::new(&configured).expect("configured root should bind");
+        let report = parse_bilibili_download_report(
+            r#"{"title":"Episode","output_dir":".","entries":[{"index":1,"title":"Episode","directory":".","files":[{"kind":"video","path":"video.m4s"}],"mux":{"output_path":"Episode.mkv"}}]}"#,
+        )
+        .expect("download report should parse");
+
+        fs::remove_file(&configured).expect("configured symlink should remove");
+        symlink(&replacement, &configured).expect("configured symlink should retarget");
+        let error = cleanup_bilibili_mux_input_files(&root, &configured, &report)
+            .expect_err("retargeted root must reject raw-stream cleanup");
+
+        assert!(format!("{error:#}").contains("different directory"));
+        assert_eq!(
+            fs::read_to_string(replacement.join("video.m4s")).unwrap(),
+            "replacement"
+        );
+        assert_eq!(
+            fs::read_to_string(original.join("video.m4s")).unwrap(),
+            "original"
+        );
+        let _ = fs::remove_dir_all(parent);
     }
 
     #[test]
@@ -8628,9 +8936,10 @@ mod tests {
             },
         ];
         let output = entry_dir.join("Episode.mp4");
+        let root = RootedFs::new(&entry_dir).expect("entry root should bind");
 
         let (spec, concat_file) =
-            bilibili_local_mux_command_spec(&config, &inputs, &entry_dir, &output)
+            bilibili_local_mux_command_spec(&config, &root, &inputs, &entry_dir, &output)
                 .expect("dash mux spec should build");
 
         assert!(concat_file.is_none());
@@ -8664,9 +8973,10 @@ mod tests {
             },
         ];
         let output = entry_dir.join("Episode.mp4");
+        let root = RootedFs::new(&entry_dir).expect("entry root should bind");
 
         let (spec, concat_file) =
-            bilibili_local_mux_command_spec(&config, &inputs, &entry_dir, &output)
+            bilibili_local_mux_command_spec(&config, &root, &inputs, &entry_dir, &output)
                 .expect("flv mux spec should build");
 
         let concat_file = concat_file.expect("flv mux should create concat list");

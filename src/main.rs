@@ -557,6 +557,7 @@ async fn run_bbdown_qr_login(
     let interval = Duration::from_secs(config.bilibili.auth.poll_interval_seconds);
     let cancel = bbdown_login_cancel_notify().notified();
     tokio::pin!(cancel);
+    cancel.as_mut().enable();
     let mut last_waiting_state: Option<&'static str> = None;
 
     loop {
@@ -811,9 +812,23 @@ async fn await_bbdown_login_active<F, T>(auth_generation: u64, future: F) -> Res
 where
     F: std::future::Future<Output = T>,
 {
+    await_bbdown_login_active_with_hook(auth_generation, future, || {}).await
+}
+
+async fn await_bbdown_login_active_with_hook<F, T, H>(
+    auth_generation: u64,
+    future: F,
+    after_generation_check: H,
+) -> Result<T>
+where
+    F: std::future::Future<Output = T>,
+    H: FnOnce(),
+{
     let cancel = bbdown_login_cancel_notify().notified();
     tokio::pin!(cancel);
+    cancel.as_mut().enable();
     ensure_bbdown_login_active(auth_generation)?;
+    after_generation_check();
     let result = tokio::select! {
         result = future => result,
         () = &mut cancel => {
@@ -2647,6 +2662,7 @@ mod tests {
             vec!["dup:000000000000002a:keep", "dup:000000000000002a:cancel"]
         );
         let exact_duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: crate::downloader::VideoIdentity {
                 provider: crate::downloader::VideoProvider::Bilibili,
                 id: "cid456".to_string(),
@@ -2668,6 +2684,7 @@ mod tests {
             &exact_duplicate,
         ));
         let broad_duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
             identity: crate::downloader::VideoIdentity {
                 provider: crate::downloader::VideoProvider::Bilibili,
                 id: "BV123".to_string(),
@@ -2692,6 +2709,7 @@ mod tests {
                 url: format!("https://youtu.be/{job_id}"),
             },
             duplicate: VideoDuplicate {
+                overwrite_confirmation: None,
                 identity: crate::downloader::VideoIdentity {
                     provider: crate::downloader::VideoProvider::Youtube,
                     id: job_id.to_string(),
@@ -2782,6 +2800,25 @@ mod tests {
 
         let err = result.expect_err("stale generation should cancel immediately");
         assert!(err.to_string().contains("canceled"));
+    }
+
+    #[tokio::test]
+    async fn login_cancel_cannot_be_lost_after_generation_check() {
+        let _guard = TEST_AUTH_GENERATION_LOCK.lock().await;
+        let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+        let result = tokio_timeout(
+            Duration::from_secs(1),
+            await_bbdown_login_active_with_hook(generation, std::future::pending::<()>(), || {
+                BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
+                bbdown_login_cancel_notify().notify_waiters();
+            }),
+        )
+        .await
+        .expect("registered logout notification should wake the waiter");
+        BILIBILI_AUTH_GENERATION.store(generation, Ordering::SeqCst);
+
+        let error = result.expect_err("logout should cancel after the generation check");
+        assert!(error.to_string().contains("canceled"));
     }
 
     #[tokio::test]

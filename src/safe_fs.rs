@@ -3,7 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use rustix::fd::OwnedFd;
+use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +74,10 @@ impl RootedFs {
 
     pub(crate) fn root_path(&self) -> &Path {
         &self.canonical_root
+    }
+
+    pub(crate) fn root_identity(&self) -> EntryIdentity {
+        self.root_identity
     }
 
     pub(crate) fn logical_root_path(&self) -> &Path {
@@ -157,6 +161,21 @@ impl RootedFs {
         self.remove_bound_entry_if_identity(entry, expected, AtFlags::empty())
     }
 
+    pub(crate) fn remove_file_if_exists(&self, path: &Path) -> Result<bool> {
+        let entry = self.bind_entry(path, false)?;
+        let Some(identity) = self.bound_entry_identity(&entry)? else {
+            return Ok(false);
+        };
+        if !identity.is_file() {
+            bail!(
+                "bound cleanup path is not a regular file: {}",
+                path.display()
+            );
+        }
+        self.remove_bound_file_if_identity(&entry, identity)?;
+        Ok(true)
+    }
+
     pub(crate) fn remove_bound_dir_if_identity(
         &self,
         entry: &BoundEntry,
@@ -238,37 +257,22 @@ impl RootedFs {
         Ok(Some(identity))
     }
 
+    #[cfg(test)]
     pub(crate) fn rename_noreplace(
         &self,
         source: &Path,
         destination: &Path,
         create_destination_parents: bool,
     ) -> Result<EntryIdentity> {
-        self.rename_noreplace_inner(source, destination, create_destination_parents, None)
+        self.rename_noreplace_inner(source, destination, create_destination_parents)
     }
 
-    pub(crate) fn rename_noreplace_if_identity(
-        &self,
-        source: &Path,
-        destination: &Path,
-        create_destination_parents: bool,
-        expected: EntryIdentity,
-    ) -> Result<()> {
-        self.rename_noreplace_inner(
-            source,
-            destination,
-            create_destination_parents,
-            Some(expected),
-        )?;
-        Ok(())
-    }
-
+    #[cfg(test)]
     fn rename_noreplace_inner(
         &self,
         source: &Path,
         destination: &Path,
         create_destination_parents: bool,
-        expected: Option<EntryIdentity>,
     ) -> Result<EntryIdentity> {
         let (source_parent_path, source_leaf) = self.split_parent(source)?;
         let (destination_parent_path, destination_leaf) = self.split_parent(destination)?;
@@ -282,9 +286,6 @@ impl RootedFs {
             .ok_or_else(|| anyhow!("move source is missing: {}", source.display()))?;
         if !source_identity.is_file() {
             bail!("move source is not a regular file: {}", source.display());
-        }
-        if expected.is_some_and(|expected| expected != source_identity) {
-            bail!("move source identity changed: {}", source.display());
         }
         if identity_at(destination_parent.fd.as_ref(), &destination_leaf)?.is_some() {
             bail!("move destination already exists: {}", destination.display());
@@ -322,6 +323,7 @@ impl RootedFs {
         Ok(source_identity)
     }
 
+    #[cfg(test)]
     fn validate_renamed_destination(
         &self,
         destination: &Path,
@@ -577,11 +579,15 @@ fn openat_directory_cstr(parent: &OwnedFd, name: &CStr) -> Result<OwnedFd, std::
     .map_err(errno_to_io)
 }
 
-fn identity_for_fd(fd: &OwnedFd) -> Result<EntryIdentity> {
+fn identity_for_fd<Fd: AsFd>(fd: Fd) -> Result<EntryIdentity> {
     let stat = rustix::fs::fstat(fd)
         .map_err(errno_to_io)
         .context("failed to inspect bound filesystem object")?;
     Ok(identity_from_stat(&stat))
+}
+
+pub(crate) fn identity_for_open_file(file: &std::fs::File) -> Result<EntryIdentity> {
+    identity_for_fd(file)
 }
 
 fn identity_at(parent: &OwnedFd, name: &OsStr) -> Result<Option<EntryIdentity>> {
