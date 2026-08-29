@@ -804,7 +804,10 @@ where
     ensure_bbdown_login_active(auth_generation)?;
     let summary = bilibili_core::credential_runtime(config)?.save_merged(credentials)?;
     ensure_bbdown_login_active(auth_generation)?;
-    if let Err(err) = bilibili_auth::delete_auth_state(&config.bilibili.auth.state_path) {
+    if let Err(err) = bilibili_auth::delete_auth_state(
+        &config.bilibili.auth.state_path,
+        &config.bilibili.auth.credential_file,
+    ) {
         warn!(
             error = %err,
             path = %config.bilibili.auth.state_path.display(),
@@ -1245,25 +1248,31 @@ async fn run_bbdown_logout(telegram: TelegramClient, config: Arc<AppConfig>, cha
     BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
     bbdown_login_cancel_notify().notify_waiters();
     pending_bilibili_access_key_logins().lock().await.clear();
-    let (legacy_state, credential_state) = {
+    let cleanup = {
         let _state_guard = bbdown_auth_state_lock().lock().await;
-        let legacy_state = bilibili_auth::delete_auth_state(&config.bilibili.auth.state_path);
-        let credential_state =
-            bilibili_core::credential_runtime(&config).and_then(|runtime| runtime.logout());
+        let cleanup = bilibili_auth::clear_auth_state_and_credentials(
+            &config.bilibili.auth.state_path,
+            &config.bilibili.auth.credential_file,
+            || bilibili_core::credential_runtime(&config).and_then(|runtime| runtime.logout()),
+        );
         // Return to a stable even generation and invalidate status checks that started after
         // logout was requested but before the credential files were cleared.
         BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
         BILIBILI_CREDENTIAL_REVISION.fetch_add(1, Ordering::SeqCst);
-        (legacy_state, credential_state)
+        cleanup
     };
-    let message = match (legacy_state, credential_state) {
-        (Ok(_), Ok(())) => "BBDown credential state cleared.".to_string(),
-        (Ok(_), Err(err)) => format!(
+    let message = match cleanup {
+        Ok((Ok(_), Ok(()))) => "BBDown credential state cleared.".to_string(),
+        Ok((Ok(_), Err(err))) => format!(
             "Failed to clear BBDown credential state:\n{}",
             summarize_bbdown_auth_error(&err)
         ),
-        (Err(err), _) => format!(
+        Ok((Err(err), _)) => format!(
             "Failed to clear legacy BBDown login state:\n{}",
+            truncate(&err.to_string())
+        ),
+        Err(err) => format!(
+            "Failed to lock BBDown credential state for logout:\n{}",
             truncate(&err.to_string())
         ),
     };

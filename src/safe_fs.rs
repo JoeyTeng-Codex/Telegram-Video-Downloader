@@ -274,44 +274,127 @@ impl RootedFs {
         Ok((entry, identity))
     }
 
-    pub(crate) fn rewrite_bound_file_if_identity(
+    pub(crate) fn replace_bound_file_atomically_if_identity(
         &self,
         entry: &BoundEntry,
         expected: EntryIdentity,
+        temp_path: &Path,
         contents: &[u8],
-    ) -> Result<()> {
+        mode: u16,
+    ) -> Result<(BoundEntry, EntryIdentity)> {
         self.validate_bound_parent(&entry.parent)?;
-        let fd = rustix::fs::openat(
+        if identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected) {
+            bail!(
+                "bound file identity changed before atomic replacement: {}",
+                entry.path.display()
+            );
+        }
+
+        let (temp_entry, temp_identity) = self.create_new_bound_file(temp_path, contents, mode)?;
+        if entry.parent.identity != temp_entry.parent.identity {
+            let cleanup = self.remove_bound_file_if_identity(&temp_entry, temp_identity);
+            return Err(with_cleanup_error(
+                anyhow!(
+                    "atomic replacement requires a temporary file in the destination directory: {}",
+                    temp_path.display()
+                ),
+                cleanup,
+                "atomic replacement temp cleanup",
+            ));
+        }
+        if let Err(err) = renameat_exchange(
             entry.parent.fd.as_ref(),
             &entry.leaf,
-            OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .map_err(errno_to_io)
-        .with_context(|| format!("failed to open bound file {}", entry.path.display()))?;
-        if identity_for_fd(&fd)? != expected
-            || identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected)
-        {
-            bail!(
-                "bound file identity changed before rewrite: {}",
-                entry.path.display()
-            );
+            temp_entry.parent.fd.as_ref(),
+            &temp_entry.leaf,
+        ) {
+            let cleanup = self.remove_bound_file_if_identity(&temp_entry, temp_identity);
+            return Err(with_cleanup_error(
+                err.context(format!(
+                    "failed to atomically replace bound file {}",
+                    entry.path.display()
+                )),
+                cleanup,
+                "atomic replacement temp cleanup",
+            ));
         }
-        let mut file = File::from(fd);
-        file.set_len(0)
-            .and_then(|()| file.write_all(contents))
-            .and_then(|()| file.sync_all())
-            .with_context(|| format!("failed to persist bound file {}", entry.path.display()))?;
-        if identity_for_fd(&file)? != expected
-            || identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected)
-        {
+
+        let destination_identity = identity_at(entry.parent.fd.as_ref(), &entry.leaf)?;
+        let displaced_identity = identity_at(temp_entry.parent.fd.as_ref(), &temp_entry.leaf)?;
+        if destination_identity != Some(temp_identity) || displaced_identity != Some(expected) {
             bail!(
-                "bound file identity changed after rewrite: {}",
+                "bound file identities changed during atomic replacement: {}",
                 entry.path.display()
             );
         }
         self.validate_bound_parent(&entry.parent)?;
-        sync_directory(entry.parent.fd.as_ref())
+        sync_directory(entry.parent.fd.as_ref())?;
+        self.remove_bound_file_if_identity(&temp_entry, expected)?;
+        Ok((entry.clone(), temp_identity))
+    }
+
+    pub(crate) fn hard_link_via_bound_parents_noreplace_if_identity(
+        &self,
+        source: &BoundEntry,
+        destination: &BoundEntry,
+        expected: EntryIdentity,
+    ) -> Result<()> {
+        self.validate_bound_parent(&source.parent)?;
+        self.validate_bound_parent(&destination.parent)?;
+        if identity_at(source.parent.fd.as_ref(), &source.leaf)? != Some(expected) {
+            bail!(
+                "bound hard-link source identity changed: {}",
+                source.path.display()
+            );
+        }
+        if !expected.is_file() {
+            bail!(
+                "bound hard-link source is not a regular file: {}",
+                source.path.display()
+            );
+        }
+        if identity_at(destination.parent.fd.as_ref(), &destination.leaf)?.is_some() {
+            bail!(
+                "bound hard-link destination already exists: {}",
+                destination.path.display()
+            );
+        }
+        rustix::fs::linkat(
+            source.parent.fd.as_ref(),
+            &source.leaf,
+            destination.parent.fd.as_ref(),
+            &destination.leaf,
+            AtFlags::empty(),
+        )
+        .map_err(errno_to_io)
+        .with_context(|| {
+            format!(
+                "failed to hard-link {} to {} through bound parents",
+                source.path.display(),
+                destination.path.display()
+            )
+        })?;
+
+        let source_current = identity_at(source.parent.fd.as_ref(), &source.leaf)?;
+        let destination_current = identity_at(destination.parent.fd.as_ref(), &destination.leaf)?;
+        if source_current != Some(expected) || destination_current != Some(expected) {
+            let cleanup = if destination_current == Some(expected) {
+                self.remove_bound_file_if_identity(destination, expected)
+            } else {
+                Ok(())
+            };
+            return Err(with_cleanup_error(
+                anyhow!(
+                    "bound hard-link identities changed while linking {}",
+                    destination.path.display()
+                ),
+                cleanup,
+                "bound hard-link cleanup",
+            ));
+        }
+        self.validate_bound_parent(&source.parent)?;
+        self.validate_bound_parent(&destination.parent)?;
+        sync_directory(destination.parent.fd.as_ref())
     }
 
     pub(crate) fn list_bound_directory(
@@ -1023,6 +1106,34 @@ fn renameat_noreplace(
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "linux"))]
+fn renameat_exchange(
+    first_parent: &OwnedFd,
+    first: &OsStr,
+    second_parent: &OwnedFd,
+    second: &OsStr,
+) -> Result<()> {
+    rustix::fs::renameat_with(
+        first_parent,
+        first,
+        second_parent,
+        second,
+        RenameFlags::EXCHANGE,
+    )
+    .map_err(errno_to_io)
+    .context("atomic exchange rename failed")
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+fn renameat_exchange(
+    _first_parent: &OwnedFd,
+    _first: &OsStr,
+    _second_parent: &OwnedFd,
+    _second: &OsStr,
+) -> Result<()> {
+    bail!("atomic exchange rename is unavailable on this platform")
+}
+
 fn errno_to_io(error: rustix::io::Errno) -> std::io::Error {
     std::io::Error::from_raw_os_error(error.raw_os_error())
 }
@@ -1074,6 +1185,83 @@ mod tests {
         assert!(error.to_string().contains("destination already exists"));
         assert_eq!(fs::read(root.join("staging/source")).unwrap(), b"new");
         assert_eq!(fs::read(root.join("target")).unwrap(), b"old");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn atomic_bound_file_replacement_never_exposes_partial_contents() {
+        let root = temp_dir("atomic-bound-replacement");
+        fs::create_dir_all(&root).expect("root should create");
+        let manifest = root.join("manifest.json");
+        let temp = root.join("manifest.next.json");
+        fs::write(&manifest, b"old-complete-manifest").expect("manifest should write");
+        let rooted = RootedFs::new(&root).expect("root should open");
+        let entry = rooted
+            .bind_entry(&manifest, false)
+            .expect("manifest should bind");
+        let old_identity = rooted
+            .bound_entry_identity(&entry)
+            .expect("manifest identity should read")
+            .expect("manifest should exist");
+
+        let (_, new_identity) = rooted
+            .replace_bound_file_atomically_if_identity(
+                &entry,
+                old_identity,
+                &temp,
+                b"new-complete-manifest",
+                0o600,
+            )
+            .expect("manifest replacement should succeed");
+
+        assert_eq!(fs::read(&manifest).unwrap(), b"new-complete-manifest");
+        assert!(!temp.exists());
+        assert_ne!(old_identity, new_identity);
+        assert_eq!(
+            rooted.entry_identity(&manifest).unwrap(),
+            Some(new_identity)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hard_link_anchor_prevents_committed_inode_reuse() {
+        let root = temp_dir("hard-link-anchor");
+        fs::create_dir_all(root.join("transaction")).expect("transaction should create");
+        let output = root.join("video.mkv");
+        let anchor = root.join("transaction/anchor");
+        fs::write(&output, b"committed-video").expect("output should write");
+        let rooted = RootedFs::new(&root).expect("root should open");
+        let output_entry = rooted
+            .bind_entry(&output, false)
+            .expect("output should bind");
+        let anchor_entry = rooted
+            .bind_entry(&anchor, false)
+            .expect("anchor should bind");
+        let committed_identity = rooted
+            .bound_entry_identity(&output_entry)
+            .expect("output identity should read")
+            .expect("output should exist");
+        rooted
+            .hard_link_via_bound_parents_noreplace_if_identity(
+                &output_entry,
+                &anchor_entry,
+                committed_identity,
+            )
+            .expect("anchor should link");
+
+        fs::remove_file(&output).expect("output should unlink");
+        fs::write(&output, b"unrelated-replacement").expect("replacement should write");
+
+        assert_eq!(fs::read(&anchor).unwrap(), b"committed-video");
+        assert_eq!(
+            rooted.entry_identity(&anchor).unwrap(),
+            Some(committed_identity)
+        );
+        assert_ne!(
+            rooted.entry_identity(&output).unwrap(),
+            Some(committed_identity)
+        );
         let _ = fs::remove_dir_all(root);
     }
 

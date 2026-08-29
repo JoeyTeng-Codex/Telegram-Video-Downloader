@@ -35,7 +35,10 @@ const VIDEO_OUTPUT_LOCK_FILE_NAME: &str = ".telegram-video-downloader.lock";
 const BILIBILI_FFMPEG_CONCAT_FILE_PREFIX: &str = ".telegram-video-downloader-ffmpeg-concat";
 const OVERWRITE_BACKUP_DIR_PREFIX: &str = ".telegram-video-downloader-overwrite";
 const OVERWRITE_RECOVERY_MANIFEST_NAME: &str = ".transaction.json";
-const OVERWRITE_RECOVERY_MANIFEST_VERSION: u32 = 2;
+const OVERWRITE_RECOVERY_MANIFEST_TEMP_NAME: &str = ".transaction.next.json";
+const OVERWRITE_COMMITTED_ANCHOR_PREFIX: &str = ".committed-output-";
+const OVERWRITE_RECOVERY_MANIFEST_VERSION: u32 = 3;
+const OVERWRITE_RECOVERY_LEGACY_MANIFEST_VERSION: u32 = 2;
 const OVERWRITE_RECOVERY_MANIFEST_LIMIT: usize = 16 * 1024;
 const VIDEO_SIDECAR_EXTENSIONS: &[&str] = &[
     "nfo",
@@ -4394,6 +4397,8 @@ struct OverwriteCommittedFile {
     file_name: PathBuf,
     device: u64,
     inode: u64,
+    #[serde(default)]
+    anchor_name: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -4410,6 +4415,7 @@ struct OverwriteRecoveryFiles {
 struct CommittedOverwriteState {
     manifest: OverwriteRecoveryManifest,
     files: BTreeMap<PathBuf, BoundFile>,
+    anchors: BTreeMap<PathBuf, BoundFile>,
 }
 
 #[derive(Debug)]
@@ -4483,8 +4489,8 @@ impl AcquiredOverwrite {
         }
     }
 
-    fn commit(self, moved: &[MovedFile], committed_target: &Path) -> Result<()> {
-        let committed = persist_committed_overwrite_manifest(&self, moved, committed_target)?;
+    fn commit(mut self, moved: &[MovedFile], committed_target: &Path) -> Result<()> {
+        let committed = persist_committed_overwrite_manifest(&mut self, moved, committed_target)?;
         remove_backups(&self.root, &self.backups, &self.recovery, &committed)
     }
 }
@@ -4680,7 +4686,7 @@ fn create_overwrite_recovery_manifest(
 }
 
 fn persist_committed_overwrite_manifest(
-    acquired: &AcquiredOverwrite,
+    acquired: &mut AcquiredOverwrite,
     moved: &[MovedFile],
     committed_target: &Path,
 ) -> Result<CommittedOverwriteState> {
@@ -4729,27 +4735,28 @@ fn persist_committed_overwrite_manifest(
             committed_target.display()
         );
     }
+    let (committed_files, anchors) =
+        create_committed_output_anchors(acquired, transaction_parent, &identities)?;
     let manifest = OverwriteRecoveryManifest {
         version: OVERWRITE_RECOVERY_MANIFEST_VERSION,
         target_file_name,
         phase: OverwriteRecoveryPhase::Committed,
-        committed_files: identities
-            .iter()
-            .map(|(file_name, identity)| OverwriteCommittedFile {
-                file_name: file_name.clone(),
-                device: identity.device(),
-                inode: identity.inode(),
-            })
-            .collect(),
+        committed_files,
     };
     let contents = serde_json::to_vec_pretty(&manifest)
         .context("failed to encode committed overwrite recovery manifest")?;
-    acquired
+    let temp_path = acquired
+        .recovery
+        .backup_dir
+        .join(OVERWRITE_RECOVERY_MANIFEST_TEMP_NAME);
+    let (manifest_entry, manifest_identity) = acquired
         .root
-        .rewrite_bound_file_if_identity(
+        .replace_bound_file_atomically_if_identity(
             &acquired.recovery.manifest_entry,
             acquired.recovery.manifest_identity,
+            &temp_path,
             &contents,
+            0o600,
         )
         .with_context(|| {
             format!(
@@ -4757,6 +4764,8 @@ fn persist_committed_overwrite_manifest(
                 acquired.recovery.manifest_path.display()
             )
         })?;
+    acquired.recovery.manifest_entry = manifest_entry;
+    acquired.recovery.manifest_identity = manifest_identity;
 
     let mut files = BTreeMap::new();
     for (file_name, identity) in identities {
@@ -4773,7 +4782,11 @@ fn persist_committed_overwrite_manifest(
         }
         files.insert(file_name, file);
     }
-    let committed = CommittedOverwriteState { manifest, files };
+    let committed = CommittedOverwriteState {
+        manifest,
+        files,
+        anchors,
+    };
     validate_committed_overwrite_state(
         &acquired.root,
         &acquired.backups,
@@ -4781,6 +4794,58 @@ fn persist_committed_overwrite_manifest(
         &committed,
     )?;
     Ok(committed)
+}
+
+fn create_committed_output_anchors(
+    acquired: &AcquiredOverwrite,
+    transaction_parent: &Path,
+    identities: &BTreeMap<PathBuf, EntryIdentity>,
+) -> Result<(Vec<OverwriteCommittedFile>, BTreeMap<PathBuf, BoundFile>)> {
+    let mut records = Vec::with_capacity(identities.len());
+    let mut anchors = BTreeMap::new();
+    for (index, (file_name, identity)) in identities.iter().enumerate() {
+        let anchor_name = PathBuf::from(format!("{OVERWRITE_COMMITTED_ANCHOR_PREFIX}{index:04x}"));
+        let source_path = transaction_parent.join(file_name);
+        let anchor_path = acquired.recovery.backup_dir.join(&anchor_name);
+        let source_entry = acquired.root.bind_entry(&source_path, false)?;
+        let anchor_entry = acquired.root.bind_entry(&anchor_path, false)?;
+        acquired
+            .root
+            .hard_link_via_bound_parents_noreplace_if_identity(
+                &source_entry,
+                &anchor_entry,
+                *identity,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to anchor committed overwrite output {}",
+                    source_path.display()
+                )
+            })?;
+        let anchor_file = acquired
+            .root
+            .open_bound_file(&anchor_path)?
+            .with_context(|| {
+                format!(
+                    "committed output anchor is missing: {}",
+                    anchor_path.display()
+                )
+            })?;
+        if anchor_file.identity() != *identity {
+            bail!(
+                "committed output anchor identity changed: {}",
+                anchor_path.display()
+            );
+        }
+        records.push(OverwriteCommittedFile {
+            file_name: file_name.clone(),
+            device: identity.device(),
+            inode: identity.inode(),
+            anchor_name: Some(anchor_name.clone()),
+        });
+        anchors.insert(anchor_name, anchor_file);
+    }
+    Ok((records, anchors))
 }
 
 fn insert_committed_file_identity(
@@ -4845,9 +4910,9 @@ fn acquire_overwrite_path(
     let file_name = original
         .file_name()
         .context("overwrite path has no file name")?;
-    if file_name == std::ffi::OsStr::new(OVERWRITE_RECOVERY_MANIFEST_NAME) {
+    if is_overwrite_recovery_control_name(file_name) {
         bail!(
-            "overwrite path conflicts with the recovery manifest name: {}",
+            "overwrite path conflicts with a reserved recovery name: {}",
             original.display()
         );
     }
@@ -5843,6 +5908,9 @@ fn validate_committed_overwrite_state(
     if committed.manifest.phase != OverwriteRecoveryPhase::Committed {
         bail!("overwrite cleanup requires a committed recovery manifest");
     }
+    if committed.manifest.version != OVERWRITE_RECOVERY_MANIFEST_VERSION {
+        bail!("overwrite cleanup requires the current recovery manifest version");
+    }
     let parent = recovery
         .backup_dir
         .parent()
@@ -5854,20 +5922,37 @@ fn validate_committed_overwrite_state(
     if committed.files.len() != committed.manifest.committed_files.len() {
         bail!("committed overwrite manifest contains duplicate file identities");
     }
+    if committed.anchors.len() != committed.manifest.committed_files.len() {
+        bail!("committed overwrite manifest contains duplicate output anchors");
+    }
 
     for record in &committed.manifest.committed_files {
         let file_name = PathBuf::from(single_recovery_file_name(&record.file_name)?);
+        let anchor_name = PathBuf::from(committed_recovery_anchor_name(record)?);
         let file = committed.files.get(&file_name).with_context(|| {
             format!(
                 "committed overwrite descriptor is missing for {}",
                 file_name.display()
             )
         })?;
+        let anchor = committed.anchors.get(&anchor_name).with_context(|| {
+            format!(
+                "committed overwrite anchor descriptor is missing for {}",
+                anchor_name.display()
+            )
+        })?;
         file.validate_identity()?;
+        anchor.validate_identity()?;
         let identity = file.identity();
         if identity.device() != record.device || identity.inode() != record.inode {
             bail!(
                 "committed overwrite descriptor identity changed for {}",
+                file_name.display()
+            );
+        }
+        if anchor.identity() != identity {
+            bail!(
+                "committed overwrite anchor no longer binds {}",
                 file_name.display()
             );
         }
@@ -5876,6 +5961,13 @@ fn validate_committed_overwrite_state(
             bail!(
                 "committed overwrite path identity changed: {}",
                 path.display()
+            );
+        }
+        let anchor_path = recovery.backup_dir.join(&anchor_name);
+        if root.entry_identity(&anchor_path)? != Some(identity) {
+            bail!(
+                "committed overwrite anchor path changed: {}",
+                anchor_path.display()
             );
         }
     }
@@ -5936,6 +6028,11 @@ fn remove_backups(
         ));
     }
     if failures.is_empty()
+        && let Err(err) = remove_committed_output_anchors(root, recovery, committed)
+    {
+        failures.push(format!("{err:#}"));
+    }
+    if failures.is_empty()
         && let Err(err) = remove_overwrite_transaction_dir(root, recovery)
     {
         failures.push(format!("{err:#}"));
@@ -5945,6 +6042,73 @@ fn remove_backups(
     } else {
         bail!("{}", failures.join("; "))
     }
+}
+
+fn remove_committed_output_anchors(
+    root: &RootedFs,
+    recovery: &OverwriteRecoveryFiles,
+    committed: &CommittedOverwriteState,
+) -> Result<()> {
+    for record in &committed.manifest.committed_files {
+        let file_name = PathBuf::from(single_recovery_file_name(&record.file_name)?);
+        let anchor_name = PathBuf::from(committed_recovery_anchor_name(record)?);
+        let output = committed.files.get(&file_name).with_context(|| {
+            format!(
+                "committed overwrite descriptor is missing for {}",
+                file_name.display()
+            )
+        })?;
+        let anchor = committed.anchors.get(&anchor_name).with_context(|| {
+            format!(
+                "committed overwrite anchor descriptor is missing for {}",
+                anchor_name.display()
+            )
+        })?;
+        output.validate_identity()?;
+        anchor.validate_identity()?;
+        if output.identity() != anchor.identity() {
+            bail!(
+                "committed overwrite anchor no longer binds {}",
+                file_name.display()
+            );
+        }
+        let output_path = recovery
+            .backup_dir
+            .parent()
+            .context("overwrite recovery directory has no parent")?
+            .join(&file_name);
+        if root.entry_identity(&output_path)? != Some(output.identity()) {
+            bail!(
+                "committed overwrite path changed before anchor cleanup: {}",
+                output_path.display()
+            );
+        }
+        let anchor_path = recovery.backup_dir.join(&anchor_name);
+        let anchor_entry = root.bind_entry(&anchor_path, false)?;
+        root.remove_bound_file_if_identity(&anchor_entry, anchor.identity())
+            .with_context(|| {
+                format!(
+                    "failed to remove committed output anchor {}",
+                    anchor_path.display()
+                )
+            })?;
+    }
+
+    for (file_name, output) in &committed.files {
+        output.validate_identity()?;
+        let output_path = recovery
+            .backup_dir
+            .parent()
+            .context("overwrite recovery directory has no parent")?
+            .join(file_name);
+        if root.entry_identity(&output_path)? != Some(output.identity()) {
+            bail!(
+                "committed overwrite path changed after anchor cleanup: {}",
+                output_path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn remove_overwrite_transaction_dir(
@@ -6139,7 +6303,10 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
                     manifest_path.display()
                 )
             })?;
-    if manifest.version != OVERWRITE_RECOVERY_MANIFEST_VERSION {
+    if !matches!(
+        manifest.version,
+        OVERWRITE_RECOVERY_LEGACY_MANIFEST_VERSION | OVERWRITE_RECOVERY_MANIFEST_VERSION
+    ) {
         bail!(
             "unsupported overwrite recovery manifest version {} in {}",
             manifest.version,
@@ -6152,12 +6319,23 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
         .context("overwrite recovery directory has no parent")?;
     let target = parent.join(&target_file_name);
 
-    let mut backups = root
+    if manifest.version == OVERWRITE_RECOVERY_MANIFEST_VERSION {
+        remove_recovery_transition_temp(root, directory)?;
+    }
+    let entries = root
         .list_bound_directory(&directory_entry, directory_identity)?
         .into_iter()
         .filter(|(name, _)| name != std::ffi::OsStr::new(OVERWRITE_RECOVERY_MANIFEST_NAME))
         .collect::<Vec<_>>();
-    for (name, identity) in &backups {
+    let (mut anchors, mut backups) = if manifest.version == OVERWRITE_RECOVERY_MANIFEST_VERSION {
+        entries.into_iter().partition::<Vec<_>, _>(|(name, _)| {
+            name.to_string_lossy()
+                .starts_with(OVERWRITE_COMMITTED_ANCHOR_PREFIX)
+        })
+    } else {
+        (Vec::new(), entries)
+    };
+    for (name, identity) in anchors.iter().chain(&backups) {
         if !identity.is_file() {
             bail!(
                 "overwrite recovery directory contains a non-file entry: {}",
@@ -6165,6 +6343,7 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
             );
         }
     }
+    anchors.sort_by(|left, right| left.0.cmp(&right.0));
     backups.sort_by_key(|(name, _)| name == &target_file_name);
 
     let target_backup_exists = backups.iter().any(|(name, _)| name == &target_file_name);
@@ -6175,12 +6354,21 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
         );
     }
 
+    let recovery = OverwriteRecoveryFiles {
+        backup_dir: directory.to_path_buf(),
+        backup_dir_entry: directory_entry,
+        backup_dir_identity: directory_identity,
+        manifest_path,
+        manifest_entry,
+        manifest_identity,
+    };
     let mut report = Vec::new();
     match manifest.phase {
         OverwriteRecoveryPhase::Acquired => {
             if !manifest.committed_files.is_empty() {
                 bail!("acquired overwrite manifest unexpectedly contains committed files");
             }
+            remove_uncommitted_recovery_anchors(root, &recovery, &anchors)?;
             for (name, _) in &backups {
                 let original = parent.join(name);
                 if root.entry_identity(&original)?.is_some() {
@@ -6214,13 +6402,19 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
             }
         }
         OverwriteRecoveryPhase::Committed => {
-            let committed = bind_recovery_committed_files(root, parent, &manifest)?;
-            validate_recovery_committed_files(root, parent, &committed)?;
+            if manifest.version != OVERWRITE_RECOVERY_MANIFEST_VERSION {
+                bail!("legacy committed overwrite transaction has no durable output anchors");
+            }
+            validate_recovery_anchor_set(&manifest, &anchors)?;
+            let committed = bind_recovery_committed_files(root, parent, &recovery, manifest)?;
+            validate_recovery_committed_files(root, parent, &recovery, &committed)?;
             for (name, _) in &backups {
                 let original = parent.join(name);
                 if let Some(current) = root.entry_identity(&original)? {
-                    let is_committed_object =
-                        committed.values().any(|file| file.identity() == current);
+                    let is_committed_object = committed
+                        .files
+                        .values()
+                        .any(|file| file.identity() == current);
                     if !is_committed_object {
                         bail!(
                             "uncommitted object occupies an overwrite removal path; retained backup: {}",
@@ -6230,7 +6424,7 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
                 }
             }
             for (name, backup_identity) in &backups {
-                validate_recovery_committed_files(root, parent, &committed)?;
+                validate_recovery_committed_files(root, parent, &recovery, &committed)?;
                 let backup = directory.join(name);
                 let original = parent.join(name);
                 let backup_entry = root.bind_entry(&backup, false)?;
@@ -6246,18 +6440,11 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
                     original.display()
                 ));
             }
-            validate_recovery_committed_files(root, parent, &committed)?;
+            validate_recovery_committed_files(root, parent, &recovery, &committed)?;
+            remove_committed_output_anchors(root, &recovery, &committed)?;
         }
     }
 
-    let recovery = OverwriteRecoveryFiles {
-        backup_dir: directory.to_path_buf(),
-        backup_dir_entry: directory_entry,
-        backup_dir_identity: directory_identity,
-        manifest_path,
-        manifest_entry,
-        manifest_identity,
-    };
     remove_overwrite_transaction_dir(root, &recovery)?;
     report.push(format!(
         "Recovered overwrite transaction: {}",
@@ -6269,19 +6456,35 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
 fn bind_recovery_committed_files(
     root: &RootedFs,
     parent: &Path,
-    manifest: &OverwriteRecoveryManifest,
-) -> Result<BTreeMap<PathBuf, BoundFile>> {
+    recovery: &OverwriteRecoveryFiles,
+    manifest: OverwriteRecoveryManifest,
+) -> Result<CommittedOverwriteState> {
     let mut files = BTreeMap::new();
+    let mut anchors = BTreeMap::new();
     for record in &manifest.committed_files {
         let file_name = PathBuf::from(single_recovery_file_name(&record.file_name)?);
+        let anchor_name = PathBuf::from(committed_recovery_anchor_name(record)?);
+        let anchor_path = recovery.backup_dir.join(&anchor_name);
+        let anchor = root.open_bound_file(&anchor_path)?.with_context(|| {
+            format!(
+                "committed overwrite output anchor is missing: {}",
+                anchor_path.display()
+            )
+        })?;
+        let identity = anchor.identity();
+        if identity.device() != record.device || identity.inode() != record.inode {
+            bail!(
+                "committed overwrite anchor identity does not match its manifest: {}",
+                anchor_path.display()
+            );
+        }
         let path = parent.join(&file_name);
         let file = root
             .open_bound_file(&path)?
             .with_context(|| format!("committed overwrite file is missing: {}", path.display()))?;
-        let identity = file.identity();
-        if identity.device() != record.device || identity.inode() != record.inode {
+        if file.identity() != identity {
             bail!(
-                "committed overwrite file identity does not match its manifest: {}",
+                "committed overwrite output does not match its durable anchor: {}",
                 path.display()
             );
         }
@@ -6291,45 +6494,129 @@ fn bind_recovery_committed_files(
                 file_name.display()
             );
         }
+        if anchors.insert(anchor_name.clone(), anchor).is_some() {
+            bail!(
+                "committed overwrite manifest repeats anchor name {}",
+                anchor_name.display()
+            );
+        }
     }
     let target_file_name = PathBuf::from(single_recovery_file_name(&manifest.target_file_name)?);
     if !files.contains_key(&target_file_name) {
         bail!("committed overwrite manifest does not bind the target file");
     }
-    Ok(files)
+    Ok(CommittedOverwriteState {
+        manifest,
+        files,
+        anchors,
+    })
 }
 
 fn validate_recovery_committed_files(
     root: &RootedFs,
-    parent: &Path,
-    files: &BTreeMap<PathBuf, BoundFile>,
+    _parent: &Path,
+    recovery: &OverwriteRecoveryFiles,
+    committed: &CommittedOverwriteState,
 ) -> Result<()> {
-    for (file_name, file) in files {
-        file.validate_identity()?;
-        let path = parent.join(file_name);
-        if root.entry_identity(&path)? != Some(file.identity()) {
-            bail!(
-                "committed overwrite path identity changed during recovery: {}",
-                path.display()
-            );
-        }
+    validate_committed_overwrite_state(root, &[], recovery, committed)
+}
+
+fn validate_recovery_anchor_set(
+    manifest: &OverwriteRecoveryManifest,
+    anchors: &[(std::ffi::OsString, EntryIdentity)],
+) -> Result<()> {
+    let expected = manifest
+        .committed_files
+        .iter()
+        .map(committed_recovery_anchor_name)
+        .collect::<Result<BTreeSet<_>>>()?;
+    let actual = anchors
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<BTreeSet<_>>();
+    if expected != actual || expected.len() != anchors.len() {
+        bail!("committed overwrite recovery anchor set does not match its manifest");
     }
     Ok(())
 }
 
-fn single_recovery_file_name(path: &Path) -> Result<std::ffi::OsString> {
-    let mut components = path.components();
-    let name = match (components.next(), components.next()) {
-        (Some(std::path::Component::Normal(name)), None) => name.to_os_string(),
-        _ => bail!(
-            "overwrite recovery manifest contains an invalid target file name: {}",
-            path.display()
-        ),
+fn remove_uncommitted_recovery_anchors(
+    root: &RootedFs,
+    recovery: &OverwriteRecoveryFiles,
+    anchors: &[(std::ffi::OsString, EntryIdentity)],
+) -> Result<()> {
+    for (name, identity) in anchors {
+        let path = recovery.backup_dir.join(name);
+        let entry = root.bind_entry(&path, false)?;
+        root.remove_bound_file_if_identity(&entry, *identity)
+            .with_context(|| {
+                format!(
+                    "failed to remove uncommitted output anchor {}",
+                    path.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn remove_recovery_transition_temp(root: &RootedFs, directory: &Path) -> Result<()> {
+    let path = directory.join(OVERWRITE_RECOVERY_MANIFEST_TEMP_NAME);
+    let Some(file) = root.open_bound_file(&path)? else {
+        return Ok(());
     };
-    if name == std::ffi::OsStr::new(OVERWRITE_RECOVERY_MANIFEST_NAME) {
-        bail!("overwrite recovery target conflicts with the manifest name");
+    let entry = root.bind_entry(&path, false)?;
+    root.remove_bound_file_if_identity(&entry, file.identity())
+        .with_context(|| {
+            format!(
+                "failed to remove interrupted manifest transition {}",
+                path.display()
+            )
+        })
+}
+
+fn committed_recovery_anchor_name(record: &OverwriteCommittedFile) -> Result<std::ffi::OsString> {
+    let anchor = record
+        .anchor_name
+        .as_deref()
+        .context("committed overwrite manifest does not contain a durable output anchor")?;
+    let name = single_recovery_control_file_name(anchor)?;
+    if !name
+        .to_string_lossy()
+        .starts_with(OVERWRITE_COMMITTED_ANCHOR_PREFIX)
+    {
+        bail!(
+            "committed overwrite manifest contains an invalid anchor name: {}",
+            anchor.display()
+        );
     }
     Ok(name)
+}
+
+fn single_recovery_file_name(path: &Path) -> Result<std::ffi::OsString> {
+    let name = single_recovery_control_file_name(path)?;
+    if is_overwrite_recovery_control_name(&name) {
+        bail!("overwrite recovery target conflicts with a reserved recovery name");
+    }
+    Ok(name)
+}
+
+fn single_recovery_control_file_name(path: &Path) -> Result<std::ffi::OsString> {
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(name)), None) => Ok(name.to_os_string()),
+        _ => bail!(
+            "overwrite recovery manifest contains an invalid file name: {}",
+            path.display()
+        ),
+    }
+}
+
+fn is_overwrite_recovery_control_name(name: &std::ffi::OsStr) -> bool {
+    name == std::ffi::OsStr::new(OVERWRITE_RECOVERY_MANIFEST_NAME)
+        || name == std::ffi::OsStr::new(OVERWRITE_RECOVERY_MANIFEST_TEMP_NAME)
+        || name
+            .to_string_lossy()
+            .starts_with(OVERWRITE_COMMITTED_ANCHOR_PREFIX)
 }
 
 fn unique_bilibili_mux_output_path(
@@ -9571,6 +9858,49 @@ mod tests {
     }
 
     #[test]
+    fn startup_recovery_ignores_an_incomplete_atomic_manifest_temp() {
+        let final_dir = temp_test_dir("overwrite-startup-manifest-temp");
+        let existing = final_dir.join("Episode.mkv");
+        fs::write(&existing, "original-video").expect("existing file should write");
+        write_bilibili_identity_nfo(&existing, "cid123");
+        let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        let root = RootedFs::new(&final_dir).expect("output root should open");
+        let duplicate =
+            bind_test_overwrite_confirmation(&root, VideoDuplicateAction::Overwrite, &duplicate)
+                .expect("overwrite confirmation should bind");
+        let acquired =
+            acquire_and_validate_overwrite_target(&root, &duplicate, StagedPrimaryMediaKind::Video)
+                .expect("overwrite target should be acquired");
+        let transition_temp = acquired
+            .recovery
+            .backup_dir
+            .join(OVERWRITE_RECOVERY_MANIFEST_TEMP_NAME);
+        fs::write(&transition_temp, b"{partial-committed-manifest")
+            .expect("interrupted transition temp should write");
+        drop(acquired);
+
+        let report = recover_pending_overwrite_transactions(&final_dir)
+            .expect("intact acquired manifest should remain recoverable");
+
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "original-video");
+        assert!(existing.with_extension("nfo").is_file());
+        assert!(overwrite_backup_dirs(&final_dir).is_empty());
+        assert!(
+            report
+                .iter()
+                .any(|line| line.contains("Restored interrupted"))
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
     fn overwrite_move_plan_commits_primary_media_before_sidecars() {
         let final_dir = temp_test_dir("overwrite-primary-first");
         let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
@@ -9607,6 +9937,51 @@ mod tests {
         assert!(report.iter().any(|line| {
             line.contains("Retained unresolved overwrite transaction")
                 && line.contains("failed to parse overwrite recovery manifest")
+        }));
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn startup_recovery_retains_legacy_committed_transactions_without_anchors() {
+        let final_dir = temp_test_dir("overwrite-startup-legacy-committed");
+        let output = final_dir.join("Episode.mkv");
+        fs::write(&output, "new-video").expect("committed output should write");
+        let root = RootedFs::new(&final_dir).expect("output root should open");
+        let identity = root
+            .entry_identity(&output)
+            .expect("output identity should read")
+            .expect("output should exist");
+        let transaction = final_dir.join(format!("{OVERWRITE_BACKUP_DIR_PREFIX}-legacy-committed"));
+        fs::create_dir(&transaction).expect("transaction directory should create");
+        fs::write(transaction.join("Episode.mkv"), "old-video")
+            .expect("legacy backup should write");
+        let manifest = serde_json::json!({
+            "version": OVERWRITE_RECOVERY_LEGACY_MANIFEST_VERSION,
+            "target_file_name": "Episode.mkv",
+            "phase": "committed",
+            "committed_files": [{
+                "file_name": "Episode.mkv",
+                "device": identity.device(),
+                "inode": identity.inode()
+            }]
+        });
+        fs::write(
+            transaction.join(OVERWRITE_RECOVERY_MANIFEST_NAME),
+            serde_json::to_vec_pretty(&manifest).expect("legacy manifest should encode"),
+        )
+        .expect("legacy manifest should write");
+
+        let report = recover_pending_overwrite_transactions(&final_dir)
+            .expect("legacy committed transaction should be retained without blocking startup");
+
+        assert_eq!(fs::read_to_string(&output).unwrap(), "new-video");
+        assert_eq!(
+            fs::read_to_string(transaction.join("Episode.mkv")).unwrap(),
+            "old-video"
+        );
+        assert!(report.iter().any(|line| {
+            line.contains("Retained unresolved overwrite transaction")
+                && line.contains("no durable output anchors")
         }));
         let _ = fs::remove_dir_all(final_dir);
     }
@@ -9693,7 +10068,7 @@ mod tests {
         let duplicate =
             bind_test_overwrite_confirmation(&root, VideoDuplicateAction::Overwrite, &duplicate)
                 .expect("overwrite confirmation should bind");
-        let acquired =
+        let mut acquired =
             acquire_and_validate_overwrite_target(&root, &duplicate, StagedPrimaryMediaKind::Video)
                 .expect("overwrite target should be acquired");
         let staged = final_dir
@@ -9710,8 +10085,15 @@ mod tests {
             },
         )
         .expect("replacement should move into the acquired target");
-        let committed = persist_committed_overwrite_manifest(&acquired, &[moved], &existing)
+        let transaction = acquired.recovery.backup_dir.clone();
+        let committed = persist_committed_overwrite_manifest(&mut acquired, &[moved], &existing)
             .expect("committed replacement identity should persist");
+        assert_eq!(committed.anchors.len(), committed.files.len());
+        fs::write(
+            transaction.join(OVERWRITE_RECOVERY_MANIFEST_TEMP_NAME),
+            b"old-complete-acquired-manifest",
+        )
+        .expect("displaced manifest temp should write");
         drop(committed);
         drop(acquired);
 
@@ -9747,7 +10129,7 @@ mod tests {
         let duplicate =
             bind_test_overwrite_confirmation(&root, VideoDuplicateAction::Overwrite, &duplicate)
                 .expect("overwrite confirmation should bind");
-        let acquired =
+        let mut acquired =
             acquire_and_validate_overwrite_target(&root, &duplicate, StagedPrimaryMediaKind::Video)
                 .expect("overwrite target should be acquired");
         let staged = final_dir
@@ -9764,10 +10146,23 @@ mod tests {
             },
         )
         .expect("replacement should move into the acquired target");
-        let committed = persist_committed_overwrite_manifest(&acquired, &[moved], &existing)
+        let committed = persist_committed_overwrite_manifest(&mut acquired, &[moved], &existing)
             .expect("committed replacement identity should persist");
+        let anchor_name = committed.manifest.committed_files[0]
+            .anchor_name
+            .as_ref()
+            .expect("committed file should have an anchor");
+        let anchor_path = acquired.recovery.backup_dir.join(anchor_name);
         fs::remove_file(&existing).expect("committed path should unlink");
         fs::write(&existing, "third-party-replacement").expect("third-party file should write");
+        assert_eq!(
+            fs::read_to_string(&anchor_path).expect("anchor should retain committed output"),
+            "committed-video"
+        );
+        assert_ne!(
+            root.entry_identity(&existing).unwrap(),
+            root.entry_identity(&anchor_path).unwrap()
+        );
         drop(committed);
         drop(acquired);
 
@@ -9786,7 +10181,7 @@ mod tests {
         );
         assert!(report.iter().any(|line| {
             line.contains("Retained unresolved overwrite transaction")
-                && line.contains("identity does not match its manifest")
+                && line.contains("does not match its durable anchor")
         }));
         let _ = fs::remove_dir_all(final_dir);
     }

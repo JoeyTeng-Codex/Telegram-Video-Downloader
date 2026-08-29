@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -17,6 +17,7 @@ use image::{DynamicImage, ImageFormat, Luma};
 use qrcode::QrCode;
 use reqwest::Client;
 use reqwest::header::{COOKIE, HeaderMap, SET_COOKIE, USER_AGENT};
+use rustix::fs::FlockOperation;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -28,6 +29,7 @@ const NAV_URL: &str = "https://api.bilibili.com/x/web-interface/nav";
 static AUTH_FILE_LOCK: Mutex<()> = Mutex::new(());
 static ACTIVE_BBDOWN_CONFIG_FILES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const AUTH_MUTATION_LOCK_SUFFIX: &str = ".telegram-video-downloader.auth.lock";
 const LOGIN_URL_COOKIE_NAMES: &[&str] = &[
     "SESSDATA",
     "bili_jct",
@@ -116,6 +118,11 @@ pub enum LoginPoll {
     Scanned,
     Expired,
     Success { cookie: String },
+}
+
+#[derive(Debug)]
+struct AuthMutationFileLock {
+    _file: File,
 }
 
 impl fmt::Debug for LoginPoll {
@@ -500,6 +507,177 @@ fn encode_cookie_value_for_bbdown(value: &str) -> String {
     value.replace(',', "%2C")
 }
 
+fn with_auth_mutation_lock<T>(
+    credential_file: &Path,
+    protected_paths: &[&Path],
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _guard = AUTH_FILE_LOCK
+        .lock()
+        .expect("auth file lock should not poison");
+    let _file_lock = acquire_auth_mutation_file_lock(credential_file, protected_paths)?;
+    operation()
+}
+
+fn acquire_auth_mutation_file_lock(
+    credential_file: &Path,
+    protected_paths: &[&Path],
+) -> Result<AuthMutationFileLock> {
+    let lock_path = auth_mutation_lock_path(credential_file);
+    if protected_paths.iter().any(|path| **path == lock_path) {
+        bail!(
+            "BBDown auth lock path conflicts with an auth data file: {}",
+            lock_path.display()
+        );
+    }
+    if let Some(parent) = lock_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        create_private_dir_if_missing(parent).with_context(|| {
+            format!(
+                "failed to create BBDown auth lock directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(&lock_path)
+        .with_context(|| format!("failed to open BBDown auth lock {}", lock_path.display()))?;
+    rustix::fs::flock(&file, FlockOperation::LockExclusive)
+        .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
+        .with_context(|| format!("failed to lock BBDown auth state {}", lock_path.display()))?;
+    validate_auth_mutation_lock_identity(&file, &lock_path)?;
+    validate_auth_mutation_lock_is_distinct(&file, protected_paths, &lock_path)?;
+    set_auth_mutation_lock_private(&file, &lock_path)?;
+    validate_auth_mutation_lock_identity(&file, &lock_path)?;
+    Ok(AuthMutationFileLock { _file: file })
+}
+
+#[cfg(unix)]
+fn validate_auth_mutation_lock_is_distinct(
+    file: &File,
+    protected_paths: &[&Path],
+    lock_path: &Path,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let lock = file
+        .metadata()
+        .with_context(|| format!("failed to inspect BBDown auth lock {}", lock_path.display()))?;
+    for path in protected_paths {
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to inspect auth data file {}", path.display())
+                });
+            }
+        };
+        if lock.dev() == metadata.dev() && lock.ino() == metadata.ino() {
+            bail!(
+                "BBDown auth lock aliases an auth data file: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_auth_mutation_lock_is_distinct(
+    _file: &File,
+    _protected_paths: &[&Path],
+    _lock_path: &Path,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_auth_mutation_lock_identity(file: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let opened = file
+        .metadata()
+        .with_context(|| format!("failed to inspect BBDown auth lock {}", path.display()))?;
+    let linked = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to revalidate BBDown auth lock {}", path.display()))?;
+    if !opened.is_file()
+        || !linked.file_type().is_file()
+        || opened.dev() != linked.dev()
+        || opened.ino() != linked.ino()
+    {
+        bail!(
+            "BBDown auth lock path changed while locking: {}",
+            path.display()
+        );
+    }
+    if opened.nlink() != 1 || linked.nlink() != 1 {
+        bail!("BBDown auth lock has hard-link aliases: {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_auth_mutation_lock_identity(file: &File, path: &Path) -> Result<()> {
+    if !file
+        .metadata()
+        .with_context(|| format!("failed to inspect BBDown auth lock {}", path.display()))?
+        .is_file()
+    {
+        bail!("BBDown auth lock is not a regular file: {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_auth_mutation_lock_private(file: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect BBDown auth lock {}", path.display()))?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o600);
+    file.set_permissions(permissions)
+        .with_context(|| format!("failed to protect BBDown auth lock {}", path.display()))?;
+    let mode = file
+        .metadata()
+        .with_context(|| format!("failed to recheck BBDown auth lock {}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode != 0o600 {
+        bail!(
+            "BBDown auth lock permissions are not private: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_auth_mutation_lock_private(_file: &File, _path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn auth_mutation_lock_path(credential_file: &Path) -> PathBuf {
+    let mut value = credential_file.as_os_str().to_os_string();
+    value.push(AUTH_MUTATION_LOCK_SUFFIX);
+    PathBuf::from(value)
+}
+
 pub fn load_auth_state(path: &Path) -> Result<Option<AuthState>> {
     let _guard = AUTH_FILE_LOCK
         .lock()
@@ -562,10 +740,13 @@ fn save_auth_state_unlocked(path: &Path, state: &AuthState) -> Result<()> {
     Ok(())
 }
 
-pub fn delete_auth_state(path: &Path) -> Result<bool> {
-    let _guard = AUTH_FILE_LOCK
-        .lock()
-        .expect("auth file lock should not poison");
+pub fn delete_auth_state(path: &Path, credential_file: &Path) -> Result<bool> {
+    with_auth_mutation_lock(credential_file, &[path, credential_file], || {
+        delete_auth_state_unlocked(path)
+    })
+}
+
+fn delete_auth_state_unlocked(path: &Path) -> Result<bool> {
     let config_path = bbdown_config_path(path);
     let legacy_config_path = legacy_bbdown_config_path(path);
     let mut removed = false;
@@ -602,30 +783,55 @@ pub fn sync_bbdown_rust_credentials_from_state(
     credential_file: &Path,
     credential_profile: Option<&str>,
 ) -> Result<bool> {
-    let _guard = AUTH_FILE_LOCK
-        .lock()
-        .expect("auth file lock should not poison");
-    let Some(state) = load_auth_state_unlocked(state_path)? else {
-        return Ok(false);
-    };
-    let cookie = state.cookie.trim();
-    if cookie.is_empty() {
-        return Ok(false);
-    }
-    update_bbdown_rust_cookie_unlocked(credential_file, credential_profile, Some(cookie), false)
+    sync_bbdown_rust_credentials_from_state_with_hook(
+        state_path,
+        credential_file,
+        credential_profile,
+        || {},
+    )
+}
+
+fn sync_bbdown_rust_credentials_from_state_with_hook(
+    state_path: &Path,
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+    after_legacy_read: impl FnOnce(),
+) -> Result<bool> {
+    with_auth_mutation_lock(credential_file, &[state_path, credential_file], || {
+        let Some(state) = load_auth_state_unlocked(state_path)? else {
+            return Ok(false);
+        };
+        let cookie = state.cookie.trim();
+        if cookie.is_empty() {
+            return Ok(false);
+        }
+        after_legacy_read();
+        update_bbdown_rust_cookie_unlocked(credential_file, credential_profile, Some(cookie), false)
+    })
 }
 
 pub fn clear_bbdown_rust_cookie(
     credential_file: &Path,
     credential_profile: Option<&str>,
 ) -> Result<bool> {
-    let _guard = AUTH_FILE_LOCK
-        .lock()
-        .expect("auth file lock should not poison");
-    if !credential_file.exists() {
-        return Ok(false);
-    }
-    update_bbdown_rust_cookie_unlocked(credential_file, credential_profile, None, true)
+    with_auth_mutation_lock(credential_file, &[credential_file], || {
+        if !credential_file.exists() {
+            return Ok(false);
+        }
+        update_bbdown_rust_cookie_unlocked(credential_file, credential_profile, None, true)
+    })
+}
+
+pub fn clear_auth_state_and_credentials(
+    state_path: &Path,
+    credential_file: &Path,
+    clear_credentials: impl FnOnce() -> Result<()>,
+) -> Result<(Result<bool>, Result<()>)> {
+    with_auth_mutation_lock(credential_file, &[state_path, credential_file], || {
+        let legacy_state = delete_auth_state_unlocked(state_path);
+        let credential_state = clear_credentials();
+        Ok((legacy_state, credential_state))
+    })
 }
 
 fn update_bbdown_rust_cookie_unlocked(
@@ -1151,12 +1357,13 @@ mod tests {
             load_auth_state(&path).expect("state should load"),
             Some(state)
         );
-        assert!(delete_auth_state(&path).expect("state should delete"));
+        let credential_file = path.with_file_name("credentials.json");
+        assert!(delete_auth_state(&path, &credential_file).expect("state should delete"));
         assert_eq!(
             load_auth_state(&path).expect("state should be missing"),
             None
         );
-        assert!(!delete_auth_state(&path).expect("missing delete should be ok"));
+        assert!(!delete_auth_state(&path, &credential_file).expect("missing delete should be ok"));
 
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
@@ -1384,6 +1591,118 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cross_process_logout_cannot_be_undone_by_legacy_cookie_migration() {
+        use std::process::Command;
+        use std::sync::mpsc::sync_channel;
+        use std::thread;
+        use std::time::Duration;
+
+        let state_path = temp_state_file("bbdown-rust-cross-process-logout");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        let child_started = root.join("logout-child-started");
+        save_auth_state(&state_path, &test_state()).expect("state should save");
+        let (read_tx, read_rx) = sync_channel(0);
+        let (release_tx, release_rx) = sync_channel(0);
+        let migration_state = state_path.clone();
+        let migration_credentials = credential_file.clone();
+        let migration = thread::spawn(move || {
+            sync_bbdown_rust_credentials_from_state_with_hook(
+                &migration_state,
+                &migration_credentials,
+                None,
+                || {
+                    read_tx.send(()).expect("legacy read signal should send");
+                    release_rx
+                        .recv()
+                        .expect("migration release signal should arrive");
+                },
+            )
+        });
+        read_rx
+            .recv()
+            .expect("migration should read legacy state while holding the shared lock");
+
+        let mut child = Command::new(std::env::current_exe().expect("test binary should resolve"))
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("bilibili_auth::tests::cross_process_logout_child")
+            .arg("--nocapture")
+            .env("TVD_AUTH_RACE_CHILD_ROOT", &root)
+            .spawn()
+            .expect("logout child should start");
+        for _ in 0..100 {
+            if child_started.is_file() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            child_started.is_file(),
+            "logout child did not reach the lock"
+        );
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            child
+                .try_wait()
+                .expect("child status should read")
+                .is_none(),
+            "logout must wait while migration owns the cross-process lock"
+        );
+
+        release_tx
+            .send(())
+            .expect("migration should be released before logout");
+        assert!(
+            migration
+                .join()
+                .expect("migration thread should finish")
+                .expect("migration should succeed")
+        );
+        let output = child
+            .wait_with_output()
+            .expect("logout child output should collect");
+        assert!(
+            output.status.success(),
+            "logout child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!state_path.exists());
+        assert!(!credential_file.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "spawned by cross_process_logout_cannot_be_undone_by_legacy_cookie_migration"]
+    fn cross_process_logout_child() {
+        let root = PathBuf::from(
+            std::env::var_os("TVD_AUTH_RACE_CHILD_ROOT")
+                .expect("child root must be provided by the parent test"),
+        );
+        let state_path = root.join("state.json");
+        let credential_file = root.join("credentials.json");
+        fs::write(root.join("logout-child-started"), b"started")
+            .expect("child start marker should write");
+
+        let (legacy, credentials) = clear_auth_state_and_credentials(
+            &state_path,
+            &credential_file,
+            || match fs::remove_file(&credential_file) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(err).context("failed to clear child credentials"),
+            },
+        )
+        .expect("child should acquire the shared auth lock");
+        legacy.expect("child should clear legacy state");
+        credentials.expect("child should clear credentials");
+    }
+
     fn test_poll(code: i64, cookie: Option<String>) -> LoginPoll {
         login_poll_from_response(test_poll_response(code), cookie).expect("poll should parse")
     }
@@ -1430,14 +1749,15 @@ mod tests {
         fs::write(&legacy_config_path, "--cookie legacy\n").expect("legacy config should write");
         let content = fs::read_to_string(&config_path).expect("BBDown config should be readable");
         assert_eq!(content, "--cookie\nSESSDATA=secret; bili_jct=csrf\n");
-        assert!(delete_auth_state(&path).expect("auth delete should succeed"));
+        let credential_file = path.with_file_name("credentials.json");
+        assert!(delete_auth_state(&path, &credential_file).expect("auth delete should succeed"));
         assert!(!path.exists());
         assert!(config_path.exists());
         release_bbdown_config_file(&config_path);
         assert!(!config_path.exists());
         let stale_config_path = bbdown_config_dir(&path).join("stale.config.tmp");
         fs::write(&stale_config_path, "--cookie\nstale\n").expect("stale config should write");
-        assert!(delete_auth_state(&path).expect("stale config should delete"));
+        assert!(delete_auth_state(&path, &credential_file).expect("stale config should delete"));
         assert!(!stale_config_path.exists());
         assert!(!legacy_config_path.exists());
 
@@ -1502,6 +1822,64 @@ mod tests {
         assert_eq!(mode, 0o600);
 
         if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_mutation_lock_never_follows_a_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let state_path = temp_state_file("auth-lock-symlink");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let victim = state_path.with_file_name("victim.txt");
+        save_auth_state(&state_path, &test_state()).expect("state should save");
+        fs::write(&victim, b"victim").expect("victim should write");
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644))
+            .expect("victim permissions should set");
+        symlink(&victim, auth_mutation_lock_path(&credential_file))
+            .expect("lock symlink should create");
+
+        let error = sync_bbdown_rust_credentials_from_state(&state_path, &credential_file, None)
+            .expect_err("symlinked auth lock must be rejected");
+
+        assert!(format!("{error:#}").contains("failed to open BBDown auth lock"));
+        assert_eq!(fs::read(&victim).unwrap(), b"victim");
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_mutation_lock_rejects_hard_link_aliases() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_path = temp_state_file("auth-lock-hard-link");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let victim = state_path.with_file_name("victim.txt");
+        save_auth_state(&state_path, &test_state()).expect("state should save");
+        fs::write(&victim, b"victim").expect("victim should write");
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644))
+            .expect("victim permissions should set");
+        fs::hard_link(&victim, auth_mutation_lock_path(&credential_file))
+            .expect("lock hard link should create");
+
+        let error = sync_bbdown_rust_credentials_from_state(&state_path, &credential_file, None)
+            .expect_err("aliased auth lock must be rejected");
+
+        assert!(format!("{error:#}").contains("hard-link aliases"));
+        assert_eq!(fs::read(&victim).unwrap(), b"victim");
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        if let Some(parent) = state_path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
     }
