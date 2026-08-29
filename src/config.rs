@@ -357,7 +357,6 @@ fn normalize_path_for_comparison(path: &Path) -> Result<PathBuf> {
             .context("failed to resolve the current directory for auth path validation")?
             .join(path)
     };
-    let absolute = lexical_normalize(&absolute);
     let mut ancestor = absolute.clone();
     let mut missing = Vec::new();
     loop {
@@ -970,6 +969,29 @@ mod tests {
         .expect_err("symlinked parent aliases should fail validation");
 
         assert!(error.to_string().contains("must refer to distinct files"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_missing_auth_alias_after_symlink_and_parent_components() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_test_dir("auth-symlink-parent-components");
+        let safe = root.join("safe");
+        let alias = root.join("alias");
+        fs::create_dir_all(safe.join("child")).expect("symlink target should create");
+        fs::create_dir_all(&alias).expect("alias directory should create");
+        symlink(safe.join("child"), alias.join("jump")).expect("path alias should create");
+        let state = safe.join("auth.json");
+        let credential = alias.join("jump/../auth.json");
+
+        let error = ensure_distinct_auth_paths(&state, &credential)
+            .expect_err("filesystem-resolved parent components should expose the alias");
+
+        assert!(error.to_string().contains("must refer to distinct files"));
+        assert!(!state.exists());
+        assert!(!credential.exists());
         let _ = fs::remove_dir_all(root);
     }
 

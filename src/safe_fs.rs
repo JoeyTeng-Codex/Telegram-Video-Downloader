@@ -389,7 +389,9 @@ impl RootedFs {
     }
 
     fn validate_bound_parent(&self, parent: &BoundParent) -> Result<()> {
-        self.validate_root()?;
+        // Bound recovery protects the captured directory object, not its current reachability
+        // through the configured root path. Revalidating that path here would strand backups
+        // after the root or an ancestor is renamed or retargeted.
         if identity_for_fd(parent.fd.as_ref())? != parent.identity {
             bail!("bound output parent directory identity changed");
         }
@@ -741,6 +743,48 @@ mod tests {
             b"replacement"
         );
         assert!(!replacement.join("target").exists());
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_recovery_survives_configured_root_symlink_retargeting() {
+        use std::os::unix::fs::symlink;
+
+        let parent = temp_dir("bound-root-symlink-retarget");
+        let original = parent.join("original");
+        let replacement = parent.join("replacement");
+        let configured = parent.join("configured");
+        fs::create_dir_all(original.join("backup")).expect("backup directory should create");
+        fs::create_dir_all(original.join("library")).expect("library directory should create");
+        fs::create_dir_all(replacement.join("library")).expect("replacement library should create");
+        fs::write(original.join("backup/video.mkv"), b"original").expect("backup should write");
+        symlink(&original, &configured).expect("configured root symlink should create");
+        let rooted = RootedFs::new(&configured).expect("configured root should bind");
+        let source = rooted
+            .bind_entry(&configured.join("backup/video.mkv"), false)
+            .expect("backup should bind");
+        let destination = rooted
+            .bind_entry(&configured.join("library/video.mkv"), false)
+            .expect("restore destination should bind");
+        let identity = rooted
+            .bound_entry_identity(&source)
+            .expect("backup identity should read")
+            .expect("backup should exist");
+
+        fs::remove_file(&configured).expect("configured symlink should remove");
+        symlink(&replacement, &configured).expect("configured symlink should retarget");
+
+        rooted
+            .rename_via_bound_parents_noreplace_if_identity(&source, &destination, identity)
+            .expect("bound recovery should use the captured directory objects");
+
+        assert_eq!(
+            fs::read(original.join("library/video.mkv")).unwrap(),
+            b"original"
+        );
+        assert!(!original.join("backup/video.mkv").exists());
+        assert!(!replacement.join("library/video.mkv").exists());
         let _ = fs::remove_dir_all(parent);
     }
 }
