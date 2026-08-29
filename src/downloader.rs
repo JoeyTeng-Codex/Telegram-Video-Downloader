@@ -35,11 +35,22 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static OVERWRITE_BACKUP_COUNTER: AtomicU64 = AtomicU64::new(1);
 const VIDEO_STAGING_DIR_NAME: &str = ".telegram-video-downloader-staging";
 const VIDEO_OUTPUT_LOCK_FILE_NAME: &str = ".telegram-video-downloader.lock";
-const VIDEO_RECOVERY_STATE_FILE_NAME: &str = ".telegram-video-downloader.recovery";
+const VIDEO_CONTROL_DIR_NAME: &str = ".telegram-video-downloader-control";
+const VIDEO_CONTROL_OWNER_FILE_NAME: &str = "owner.json";
+const VIDEO_CONTROL_OWNER_VERSION: u32 = 1;
+const VIDEO_CONTROL_OWNER_LIMIT: usize = 1024;
+const LEGACY_VIDEO_RECOVERY_STATE_FILE_NAME: &str = ".telegram-video-downloader.recovery";
+const VIDEO_RECOVERY_STATE_FILE_NAME: &str = "recovery-state";
+const VIDEO_RECOVERY_STATE_TEMP_FILE_NAME: &str = "recovery-state.next";
 const VIDEO_RECOVERY_STATE_CLEAN: u8 = b'C';
 const VIDEO_RECOVERY_STATE_DIRTY: u8 = b'D';
 const BILIBILI_FFMPEG_CONCAT_FILE_PREFIX: &str = ".telegram-video-downloader-ffmpeg-concat";
 const BILIBILI_MUX_STAGING_DIR_PREFIX: &str = ".telegram-video-downloader-mux";
+const BILIBILI_MUX_RECOVERY_MANIFEST_NAME: &str = "manifest.json";
+const BILIBILI_MUX_RECOVERY_MANIFEST_TEMP_NAME: &str = "manifest.next.json";
+const BILIBILI_MUX_RECOVERY_ANCHOR_NAME: &str = "output.anchor";
+const BILIBILI_MUX_RECOVERY_MANIFEST_VERSION: u32 = 1;
+const BILIBILI_MUX_RECOVERY_MANIFEST_LIMIT: usize = 16 * 1024;
 #[cfg(unix)]
 const BILIBILI_MUX_FD_BASE: i32 = 64;
 const OVERWRITE_BACKUP_DIR_PREFIX: &str = ".telegram-video-downloader-overwrite";
@@ -306,6 +317,8 @@ struct BilibiliMuxReport {
     bound_output: Option<BoundFile>,
     #[serde(skip)]
     bound_inputs: Vec<BoundBilibiliMuxInput>,
+    #[serde(skip)]
+    recovery: Option<BilibiliMuxRecovery>,
 }
 
 #[derive(Debug, Clone)]
@@ -313,6 +326,49 @@ struct BoundBilibiliMuxInput {
     path: PathBuf,
     entry: BoundEntry,
     file: BoundFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BilibiliMuxRecoveryManifest {
+    version: u32,
+    phase: BilibiliMuxRecoveryPhase,
+    parent_device: u64,
+    parent_inode: u64,
+    transaction_device: u64,
+    transaction_inode: u64,
+    staged_file_name: PathBuf,
+    output_file_name: PathBuf,
+    output_device: u64,
+    output_inode: u64,
+    inputs: Vec<BilibiliMuxRecoveryInput>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BilibiliMuxRecoveryPhase {
+    Muxing,
+    CleaningInputs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BilibiliMuxRecoveryInput {
+    file_name: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug, Clone)]
+struct BilibiliMuxRecovery {
+    directory: PathBuf,
+    directory_entry: BoundEntry,
+    directory_identity: EntryIdentity,
+    manifest_path: PathBuf,
+    manifest_entry: BoundEntry,
+    manifest_identity: EntryIdentity,
+    manifest: BilibiliMuxRecoveryManifest,
+    anchor: BoundFile,
 }
 
 impl From<&bbdown_core::DownloadPlan> for BilibiliDownloadPlan {
@@ -358,6 +414,7 @@ impl From<&DownloadReport> for BilibiliDownloadReport {
                         output_path: mux.output_path.clone(),
                         bound_output: None,
                         bound_inputs: Vec::new(),
+                        recovery: None,
                     }),
                 })
                 .collect(),
@@ -936,11 +993,20 @@ struct ReservedMuxOutput {
     staging_dir_identity: EntryIdentity,
     staged_entry: BoundEntry,
     file: BoundFile,
+    manifest_path: PathBuf,
+    manifest_entry: BoundEntry,
+    manifest_identity: EntryIdentity,
+    manifest: BilibiliMuxRecoveryManifest,
     active: bool,
+    published: bool,
 }
 
 impl ReservedMuxOutput {
-    fn create(root: &RootedFs, final_path: &Path) -> Result<Self> {
+    fn create(
+        root: &RootedFs,
+        final_path: &Path,
+        inputs: &[BoundBilibiliMuxInput],
+    ) -> Result<Self> {
         let entry_dir = final_path
             .parent()
             .context("Bilibili mux output has no parent")?;
@@ -1018,6 +1084,27 @@ impl ReservedMuxOutput {
                 ));
             }
         };
+        let (manifest_path, manifest_entry, manifest_identity, manifest) =
+            match create_bilibili_mux_recovery_manifest(
+                root,
+                entry_dir,
+                &staging_dir,
+                staging_dir_identity,
+                &staged_path,
+                identity,
+                final_path,
+                inputs,
+            ) {
+                Ok(manifest) => manifest,
+                Err(err) => {
+                    return Err(with_reserved_mux_tree_cleanup_error(
+                        root,
+                        &staging_dir_entry,
+                        staging_dir_identity,
+                        err,
+                    ));
+                }
+            };
         Ok(Self {
             root: root.clone(),
             final_entry,
@@ -1025,7 +1112,12 @@ impl ReservedMuxOutput {
             staging_dir_identity,
             staged_entry,
             file,
+            manifest_path,
+            manifest_entry,
+            manifest_identity,
+            manifest,
             active: true,
+            published: false,
         })
     }
 
@@ -1033,7 +1125,7 @@ impl ReservedMuxOutput {
         self.staged_entry.path()
     }
 
-    fn commit(mut self) -> Result<BoundFile> {
+    fn commit(mut self) -> Result<(BoundFile, BilibiliMuxRecovery)> {
         self.file
             .sync_all()
             .context("failed to persist private Bilibili mux output")?;
@@ -1061,32 +1153,78 @@ impl ReservedMuxOutput {
                     self.final_entry.path().display()
                 )
             })?;
-        self.active = false;
-        if let Err(err) = self
+        self.published = true;
+        let anchor_path = self
+            .staging_dir_entry
+            .path()
+            .join(BILIBILI_MUX_RECOVERY_ANCHOR_NAME);
+        let anchor_entry = self.root.bind_entry(&anchor_path, false)?;
+        self.root
+            .hard_link_via_bound_parents_noreplace_if_identity(
+                &self.final_entry,
+                &anchor_entry,
+                self.file.identity(),
+            )
+            .with_context(|| {
+                format!(
+                    "failed to anchor published Bilibili mux output {}",
+                    self.final_entry.path().display()
+                )
+            })?;
+        let anchor = self
             .root
-            .remove_bound_dir_if_identity(&self.staging_dir_entry, self.staging_dir_identity)
-        {
-            info!(
-                path = %self.staging_dir_entry.path().display(),
-                error = %err,
-                "failed to clean empty Bilibili mux staging directory"
-            );
+            .open_bound_file(&anchor_path)?
+            .context("published Bilibili mux output anchor is missing")?;
+        if anchor.identity() != self.file.identity() {
+            bail!("published Bilibili mux output anchor identity changed");
         }
-        Ok(self.file.clone())
+        self.manifest.phase = BilibiliMuxRecoveryPhase::CleaningInputs;
+        let (manifest_entry, manifest_identity) = replace_bilibili_mux_recovery_manifest(
+            &self.root,
+            &self.staging_dir_entry,
+            self.staging_dir_identity,
+            &self.manifest_path,
+            &self.manifest_entry,
+            self.manifest_identity,
+            &self.manifest,
+        )?;
+        self.manifest_entry = manifest_entry;
+        self.manifest_identity = manifest_identity;
+        self.active = false;
+        Ok((
+            self.file.clone(),
+            BilibiliMuxRecovery {
+                directory: self.staging_dir_entry.path().to_path_buf(),
+                directory_entry: self.staging_dir_entry.clone(),
+                directory_identity: self.staging_dir_identity,
+                manifest_path: self.manifest_path.clone(),
+                manifest_entry: self.manifest_entry.clone(),
+                manifest_identity: self.manifest_identity,
+                manifest: self.manifest.clone(),
+                anchor,
+            },
+        ))
     }
 }
 
 impl Drop for ReservedMuxOutput {
     fn drop(&mut self) {
         if self.active
-            && let Err(err) = self
-                .root
-                .remove_bound_tree_if_identity(&self.staging_dir_entry, self.staging_dir_identity)
+            && !self.published
+            && let Err(err) = self.root.remove_bound_tree_durably_if_identity(
+                &self.staging_dir_entry,
+                self.staging_dir_identity,
+            )
         {
             info!(
                 path = %self.staging_dir_entry.path().display(),
                 error = %err,
                 "failed to clean private Bilibili mux staging directory"
+            );
+        } else if self.active && self.published {
+            info!(
+                path = %self.staging_dir_entry.path().display(),
+                "retained published Bilibili mux transaction for startup recovery"
             );
         }
     }
@@ -1117,6 +1255,202 @@ fn with_reserved_mux_cleanup_error(
             staging_dir_entry.path().display()
         ),
     }
+}
+
+fn with_reserved_mux_tree_cleanup_error(
+    root: &RootedFs,
+    staging_dir_entry: &BoundEntry,
+    staging_dir_identity: EntryIdentity,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match root.remove_bound_tree_durably_if_identity(staging_dir_entry, staging_dir_identity) {
+        Ok(()) => error,
+        Err(cleanup) => anyhow!(
+            "{error:#}; failed to durably clean Bilibili mux transaction {}: {cleanup:#}",
+            staging_dir_entry.path().display()
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_bilibili_mux_recovery_manifest(
+    root: &RootedFs,
+    parent: &Path,
+    transaction: &Path,
+    transaction_identity: EntryIdentity,
+    staged_path: &Path,
+    output_identity: EntryIdentity,
+    output_path: &Path,
+    inputs: &[BoundBilibiliMuxInput],
+) -> Result<(
+    PathBuf,
+    BoundEntry,
+    EntryIdentity,
+    BilibiliMuxRecoveryManifest,
+)> {
+    let parent_identity = rooted_directory_identity(root, parent)?;
+    if !parent_identity.is_dir() || transaction.parent() != Some(parent) {
+        bail!("Bilibili mux transaction is outside its bound parent");
+    }
+    let staged_file_name = single_bilibili_mux_control_name(staged_path, transaction)?;
+    let output_file_name = single_bilibili_mux_parent_name(output_path, parent)?;
+    let mut recovery_inputs = Vec::with_capacity(inputs.len());
+    let mut seen = BTreeSet::new();
+    for input in inputs {
+        input.file.validate_identity()?;
+        if root.bound_entry_identity(&input.entry)? != Some(input.file.identity()) {
+            bail!(
+                "Bilibili mux input identity changed: {}",
+                input.path.display()
+            );
+        }
+        let file_name = single_bilibili_mux_parent_name(&input.path, parent)?;
+        if !seen.insert(file_name.clone()) {
+            bail!(
+                "Bilibili mux recovery manifest repeats input {}",
+                file_name.display()
+            );
+        }
+        recovery_inputs.push(BilibiliMuxRecoveryInput {
+            file_name,
+            device: input.file.identity().device(),
+            inode: input.file.identity().inode(),
+        });
+    }
+    let manifest = BilibiliMuxRecoveryManifest {
+        version: BILIBILI_MUX_RECOVERY_MANIFEST_VERSION,
+        phase: BilibiliMuxRecoveryPhase::Muxing,
+        parent_device: parent_identity.device(),
+        parent_inode: parent_identity.inode(),
+        transaction_device: transaction_identity.device(),
+        transaction_inode: transaction_identity.inode(),
+        staged_file_name,
+        output_file_name,
+        output_device: output_identity.device(),
+        output_inode: output_identity.inode(),
+        inputs: recovery_inputs,
+    };
+    let contents = serde_json::to_vec_pretty(&manifest)
+        .context("failed to encode Bilibili mux recovery manifest")?;
+    if contents.len() > BILIBILI_MUX_RECOVERY_MANIFEST_LIMIT {
+        bail!("Bilibili mux recovery manifest exceeds its size limit");
+    }
+    let manifest_path = transaction.join(BILIBILI_MUX_RECOVERY_MANIFEST_NAME);
+    let (manifest_entry, manifest_identity) = root
+        .create_new_bound_file(&manifest_path, &contents, 0o600)
+        .context("failed to create Bilibili mux recovery manifest")?;
+    let manifest_file = root
+        .open_bound_file(&manifest_path)?
+        .context("Bilibili mux recovery manifest disappeared after creation")?;
+    if manifest_file.identity() != manifest_identity {
+        bail!("Bilibili mux recovery manifest identity changed after creation");
+    }
+    manifest_file.validate_private_single_link(0o600)?;
+    Ok((manifest_path, manifest_entry, manifest_identity, manifest))
+}
+
+fn replace_bilibili_mux_recovery_manifest(
+    root: &RootedFs,
+    transaction_entry: &BoundEntry,
+    transaction_identity: EntryIdentity,
+    manifest_path: &Path,
+    manifest_entry: &BoundEntry,
+    manifest_identity: EntryIdentity,
+    manifest: &BilibiliMuxRecoveryManifest,
+) -> Result<(BoundEntry, EntryIdentity)> {
+    root.validate_private_bound_directory(transaction_entry, transaction_identity, 0o700)?;
+    let transaction = transaction_entry.path();
+    if manifest_path.parent() != Some(transaction) {
+        bail!("Bilibili mux manifest is outside its transaction directory");
+    }
+    remove_valid_bilibili_mux_manifest_temp(root, transaction, transaction_identity)?;
+    let contents = serde_json::to_vec_pretty(manifest)
+        .context("failed to encode Bilibili mux recovery manifest")?;
+    if contents.len() > BILIBILI_MUX_RECOVERY_MANIFEST_LIMIT {
+        bail!("Bilibili mux recovery manifest exceeds its size limit");
+    }
+    let temp_path = transaction.join(BILIBILI_MUX_RECOVERY_MANIFEST_TEMP_NAME);
+    let (entry, identity) = root.replace_bound_file_atomically_if_identity(
+        manifest_entry,
+        manifest_identity,
+        &temp_path,
+        &contents,
+        0o600,
+    )?;
+    let file = root
+        .open_bound_file(manifest_path)?
+        .context("Bilibili mux recovery manifest disappeared after replacement")?;
+    if file.identity() != identity {
+        bail!("Bilibili mux recovery manifest identity changed after replacement");
+    }
+    file.validate_private_single_link(0o600)?;
+    root.validate_private_bound_directory(transaction_entry, transaction_identity, 0o700)?;
+    Ok((entry, identity))
+}
+
+fn remove_valid_bilibili_mux_manifest_temp(
+    root: &RootedFs,
+    transaction: &Path,
+    transaction_identity: EntryIdentity,
+) -> Result<()> {
+    let path = transaction.join(BILIBILI_MUX_RECOVERY_MANIFEST_TEMP_NAME);
+    let Some(file) = root.open_bound_file(&path)? else {
+        return Ok(());
+    };
+    file.validate_private_single_link(0o600)?;
+    let manifest: BilibiliMuxRecoveryManifest =
+        serde_json::from_slice(&file.read_limited(BILIBILI_MUX_RECOVERY_MANIFEST_LIMIT)?)
+            .context("failed to parse interrupted Bilibili mux manifest transition")?;
+    if manifest.version != BILIBILI_MUX_RECOVERY_MANIFEST_VERSION
+        || manifest.transaction_device != transaction_identity.device()
+        || manifest.transaction_inode != transaction_identity.inode()
+    {
+        bail!(
+            "refused to remove unrecognized Bilibili mux manifest transition {}",
+            path.display()
+        );
+    }
+    let entry = root.bind_entry(&path, false)?;
+    root.remove_bound_file_if_identity(&entry, file.identity())
+        .with_context(|| {
+            format!(
+                "failed to remove interrupted Bilibili mux manifest transition {}",
+                path.display()
+            )
+        })
+}
+
+fn single_bilibili_mux_control_name(path: &Path, parent: &Path) -> Result<PathBuf> {
+    if path.parent() != Some(parent) {
+        bail!("Bilibili mux control path is outside its transaction directory");
+    }
+    let name = path
+        .file_name()
+        .context("Bilibili mux control path has no file name")?;
+    Ok(PathBuf::from(name))
+}
+
+fn single_bilibili_mux_parent_name(path: &Path, parent: &Path) -> Result<PathBuf> {
+    if path.parent() != Some(parent) {
+        bail!(
+            "Bilibili mux path is outside its transaction parent: {}",
+            path.display()
+        );
+    }
+    let name = PathBuf::from(
+        path.file_name()
+            .context("Bilibili mux path has no file name")?,
+    );
+    if is_bilibili_mux_control_name(&name) {
+        bail!("Bilibili mux path conflicts with a recovery control name");
+    }
+    Ok(name)
+}
+
+fn is_bilibili_mux_control_name(name: &Path) -> bool {
+    name == Path::new(BILIBILI_MUX_RECOVERY_MANIFEST_NAME)
+        || name == Path::new(BILIBILI_MUX_RECOVERY_MANIFEST_TEMP_NAME)
+        || name == Path::new(BILIBILI_MUX_RECOVERY_ANCHOR_NAME)
 }
 
 fn create_bilibili_mux_staging_dir(
@@ -1173,7 +1507,7 @@ async fn mux_bilibili_report_media(
         };
         let output_path = unique_bilibili_mux_output_path(&entry_dir, title, "mp4", since);
         let bound_inputs = bind_bilibili_mux_inputs(root, &media_inputs)?;
-        let output_reservation = ReservedMuxOutput::create(root, &output_path)?;
+        let output_reservation = ReservedMuxOutput::create(root, &output_path, &bound_inputs)?;
         let BilibiliMuxCommand {
             spec,
             concat_file,
@@ -1205,11 +1539,12 @@ async fn mux_bilibili_report_media(
                 )
             );
         }
-        let bound_output = output_reservation.commit()?;
+        let (bound_output, recovery) = output_reservation.commit()?;
         entry.mux = Some(BilibiliMuxReport {
             output_path,
             bound_output: Some(bound_output),
             bound_inputs,
+            recovery: Some(recovery),
         });
     }
     Ok(())
@@ -1463,10 +1798,10 @@ fn cleanup_bilibili_mux_input_files(
         .entries
         .iter()
         .filter_map(|entry| entry.mux.as_ref())
-        .filter(|mux| mux.bound_output.is_some())
+        .filter(|mux| mux.bound_output.is_some() && mux.recovery.is_some())
         .collect::<Vec<_>>();
     for mux in &muxes {
-        validate_bilibili_mux_output(root, mux)?;
+        validate_bilibili_mux_recovery(root, mux)?;
         for input in &mux.bound_inputs {
             input.file.validate_identity()?;
             if root.bound_entry_identity(&input.entry)? != Some(input.file.identity()) {
@@ -1481,7 +1816,7 @@ fn cleanup_bilibili_mux_input_files(
     for mux in &muxes {
         for input in &mux.bound_inputs {
             for current in &muxes {
-                validate_bilibili_mux_output(root, current)?;
+                validate_bilibili_mux_recovery(root, current)?;
             }
             input.file.validate_identity()?;
             root.remove_bound_file_if_identity(&input.entry, input.file.identity())
@@ -1494,7 +1829,10 @@ fn cleanup_bilibili_mux_input_files(
         }
     }
     for mux in &muxes {
-        validate_bilibili_mux_output(root, mux)?;
+        validate_bilibili_mux_recovery(root, mux)?;
+    }
+    for mux in &muxes {
+        finalize_bilibili_mux_recovery(root, mux)?;
     }
     Ok(())
 }
@@ -1514,6 +1852,503 @@ fn validate_bilibili_mux_output(root: &RootedFs, mux: &BilibiliMuxReport) -> Res
     Ok(())
 }
 
+fn validate_bilibili_mux_recovery(root: &RootedFs, mux: &BilibiliMuxReport) -> Result<()> {
+    validate_bilibili_mux_output(root, mux)?;
+    let output = mux
+        .bound_output
+        .as_ref()
+        .context("Bilibili mux output is missing during recovery validation")?;
+    let recovery = mux
+        .recovery
+        .as_ref()
+        .context("Bilibili mux recovery transaction is missing")?;
+    root.validate_private_bound_directory(
+        &recovery.directory_entry,
+        recovery.directory_identity,
+        0o700,
+    )?;
+    if recovery.directory != *recovery.directory_entry.path()
+        || recovery.manifest_path.parent() != Some(recovery.directory.as_path())
+        || root.bound_entry_identity(&recovery.manifest_entry)? != Some(recovery.manifest_identity)
+    {
+        bail!("Bilibili mux recovery paths or identities changed");
+    }
+    let manifest_file = root
+        .open_bound_file(&recovery.manifest_path)?
+        .context("Bilibili mux recovery manifest is missing")?;
+    if manifest_file.identity() != recovery.manifest_identity {
+        bail!("Bilibili mux recovery manifest identity changed");
+    }
+    manifest_file.validate_private_single_link(0o600)?;
+    let persisted: BilibiliMuxRecoveryManifest =
+        serde_json::from_slice(&manifest_file.read_limited(BILIBILI_MUX_RECOVERY_MANIFEST_LIMIT)?)
+            .context("failed to parse Bilibili mux recovery manifest")?;
+    if persisted != recovery.manifest
+        || persisted.version != BILIBILI_MUX_RECOVERY_MANIFEST_VERSION
+        || persisted.phase != BilibiliMuxRecoveryPhase::CleaningInputs
+        || persisted.transaction_device != recovery.directory_identity.device()
+        || persisted.transaction_inode != recovery.directory_identity.inode()
+    {
+        bail!("Bilibili mux recovery manifest changed");
+    }
+    let parent = recovery
+        .directory
+        .parent()
+        .context("Bilibili mux recovery directory has no parent")?;
+    let parent_identity = rooted_directory_identity(root, parent)?;
+    if persisted.parent_device != parent_identity.device()
+        || persisted.parent_inode != parent_identity.inode()
+        || parent.join(&persisted.output_file_name) != mux.output_path
+        || persisted.output_device != output.identity().device()
+        || persisted.output_inode != output.identity().inode()
+    {
+        bail!("Bilibili mux recovery manifest does not bind the published output");
+    }
+    recovery.anchor.validate_identity()?;
+    if recovery.anchor.identity() != output.identity()
+        || root.entry_identity(&recovery.directory.join(BILIBILI_MUX_RECOVERY_ANCHOR_NAME))?
+            != Some(output.identity())
+    {
+        bail!("Bilibili mux output anchor changed");
+    }
+    let actual_inputs = mux
+        .bound_inputs
+        .iter()
+        .map(|input| {
+            Ok((
+                single_bilibili_mux_parent_name(&input.path, parent)?,
+                input.file.identity(),
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    if actual_inputs.len() != persisted.inputs.len()
+        || persisted.inputs.iter().any(|input| {
+            actual_inputs.get(&input.file_name).is_none_or(|identity| {
+                identity.device() != input.device || identity.inode() != input.inode
+            })
+        })
+    {
+        bail!("Bilibili mux recovery input set changed");
+    }
+    Ok(())
+}
+
+fn finalize_bilibili_mux_recovery(root: &RootedFs, mux: &BilibiliMuxReport) -> Result<()> {
+    validate_bilibili_mux_recovery(root, mux)?;
+    let recovery = mux
+        .recovery
+        .as_ref()
+        .context("Bilibili mux recovery transaction is missing")?;
+    let expected = BTreeSet::from([
+        std::ffi::OsString::from(BILIBILI_MUX_RECOVERY_MANIFEST_NAME),
+        std::ffi::OsString::from(BILIBILI_MUX_RECOVERY_ANCHOR_NAME),
+    ]);
+    let actual = root
+        .list_bound_directory(&recovery.directory_entry, recovery.directory_identity)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<BTreeSet<_>>();
+    if actual != expected {
+        bail!(
+            "refused to finalize Bilibili mux transaction with unexpected entries in {}",
+            recovery.directory.display()
+        );
+    }
+    root.remove_bound_tree_durably_if_identity(
+        &recovery.directory_entry,
+        recovery.directory_identity,
+    )
+    .with_context(|| {
+        format!(
+            "failed to durably finalize Bilibili mux transaction {}",
+            recovery.directory.display()
+        )
+    })
+}
+
+#[derive(Debug, Default)]
+struct BilibiliMuxRecoveryReport {
+    messages: Vec<String>,
+    unresolved: bool,
+}
+
+#[derive(Debug)]
+struct PendingBilibiliMuxRecovery {
+    directory: PathBuf,
+    directory_entry: BoundEntry,
+    directory_identity: EntryIdentity,
+    manifest_path: PathBuf,
+    manifest_entry: BoundEntry,
+    manifest_identity: EntryIdentity,
+    manifest: BilibiliMuxRecoveryManifest,
+}
+
+fn recover_pending_bilibili_mux_transactions_locked(
+    root: &RootedFs,
+    video_dir: &Path,
+) -> Result<BilibiliMuxRecoveryReport> {
+    let mut directories = Vec::new();
+    let mut report = BilibiliMuxRecoveryReport::default();
+    collect_bilibili_mux_recovery_directories(
+        root,
+        video_dir,
+        video_dir,
+        &mut directories,
+        &mut report.messages,
+    )?;
+    report.unresolved = !report.messages.is_empty();
+    directories.sort();
+    for directory in directories {
+        match recover_bilibili_mux_transaction(root, &directory) {
+            Ok(message) => report.messages.push(message),
+            Err(err) => {
+                report.unresolved = true;
+                report.messages.push(format!(
+                    "Retained unresolved Bilibili mux transaction {}: {err:#}",
+                    directory.display()
+                ));
+            }
+        }
+    }
+    Ok(report)
+}
+
+fn collect_bilibili_mux_recovery_directories(
+    root: &RootedFs,
+    scan_root: &Path,
+    directory: &Path,
+    recovered: &mut Vec<PathBuf>,
+    issues: &mut Vec<String>,
+) -> Result<()> {
+    root.validate_configured_root()?;
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(err) if directory != scan_root => {
+            issues.push(format!(
+                "Skipped unreadable directory during Bilibili mux recovery scan {}: {err}",
+                directory.display()
+            ));
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to scan Bilibili mux recovery root {}",
+                    directory.display()
+                )
+            });
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                issues.push(format!(
+                    "Skipped unreadable entry during Bilibili mux recovery scan {}: {err}",
+                    directory.display()
+                ));
+                continue;
+            }
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                issues.push(format!(
+                    "Skipped uninspectable entry during Bilibili mux recovery scan {}: {err}",
+                    entry.path().display()
+                ));
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(BILIBILI_MUX_STAGING_DIR_PREFIX) {
+            recovered.push(path);
+            continue;
+        }
+        if name == VIDEO_STAGING_DIR_NAME
+            || name == VIDEO_CONTROL_DIR_NAME
+            || name.starts_with(OVERWRITE_BACKUP_DIR_PREFIX)
+        {
+            continue;
+        }
+        collect_bilibili_mux_recovery_directories(root, scan_root, &path, recovered, issues)?;
+    }
+    root.validate_configured_root()
+}
+
+fn recover_bilibili_mux_transaction(root: &RootedFs, directory: &Path) -> Result<String> {
+    let mut pending = load_bilibili_mux_recovery(root, directory)?;
+    remove_valid_bilibili_mux_manifest_temp(root, directory, pending.directory_identity)?;
+    let parent = directory
+        .parent()
+        .context("Bilibili mux recovery directory has no parent")?;
+    let staged_name =
+        bilibili_mux_manifest_name(&pending.manifest.staged_file_name, "staged output")?;
+    let staged_path = directory.join(&staged_name);
+    let staged_identity = root.entry_identity(&staged_path)?;
+    let staged_matches = staged_identity.is_some_and(|identity| {
+        identity.is_file()
+            && identity.device() == pending.manifest.output_device
+            && identity.inode() == pending.manifest.output_inode
+    });
+
+    if pending.manifest.phase == BilibiliMuxRecoveryPhase::Muxing && staged_matches {
+        let output_name =
+            bilibili_mux_manifest_name(&pending.manifest.output_file_name, "published output")?;
+        if root.entry_identity(&parent.join(output_name))?.is_some() {
+            bail!("both staged and published Bilibili mux outputs exist");
+        }
+        let expected = BTreeSet::from([
+            std::ffi::OsString::from(BILIBILI_MUX_RECOVERY_MANIFEST_NAME),
+            staged_name,
+        ]);
+        require_bilibili_mux_transaction_entries(root, &pending, &expected)?;
+        root.remove_bound_tree_durably_if_identity(
+            &pending.directory_entry,
+            pending.directory_identity,
+        )?;
+        return Ok(format!(
+            "Discarded interrupted Bilibili mux staging: {}",
+            directory.display()
+        ));
+    }
+    if staged_identity.is_some() {
+        bail!("Bilibili mux staged output identity changed");
+    }
+
+    let (output_path, output, anchor) = ensure_bilibili_mux_output_anchor(root, &pending)?;
+    if pending.manifest.phase == BilibiliMuxRecoveryPhase::Muxing {
+        pending.manifest.phase = BilibiliMuxRecoveryPhase::CleaningInputs;
+        let (entry, identity) = replace_bilibili_mux_recovery_manifest(
+            root,
+            &pending.directory_entry,
+            pending.directory_identity,
+            &pending.manifest_path,
+            &pending.manifest_entry,
+            pending.manifest_identity,
+            &pending.manifest,
+        )?;
+        pending.manifest_entry = entry;
+        pending.manifest_identity = identity;
+    }
+
+    for input in &pending.manifest.inputs {
+        validate_recovered_bilibili_mux_output(root, &output_path, &output, &pending, &anchor)?;
+        let input_name = bilibili_mux_manifest_name(&input.file_name, "raw input")?;
+        if input_name == pending.manifest.output_file_name {
+            bail!("Bilibili mux recovery input conflicts with its output");
+        }
+        let input_path = parent.join(input_name);
+        let Some(current) = root.entry_identity(&input_path)? else {
+            continue;
+        };
+        if !current.is_file() || current.device() != input.device || current.inode() != input.inode
+        {
+            bail!(
+                "Bilibili mux raw input identity changed: {}",
+                input_path.display()
+            );
+        }
+        let input_entry = root.bind_entry(&input_path, false)?;
+        root.remove_bound_file_if_identity(&input_entry, current)
+            .with_context(|| {
+                format!(
+                    "failed to finalize recovered Bilibili mux input {}",
+                    input_path.display()
+                )
+            })?;
+    }
+    validate_recovered_bilibili_mux_output(root, &output_path, &output, &pending, &anchor)?;
+    let expected = BTreeSet::from([
+        std::ffi::OsString::from(BILIBILI_MUX_RECOVERY_MANIFEST_NAME),
+        std::ffi::OsString::from(BILIBILI_MUX_RECOVERY_ANCHOR_NAME),
+    ]);
+    require_bilibili_mux_transaction_entries(root, &pending, &expected)?;
+    root.remove_bound_tree_durably_if_identity(
+        &pending.directory_entry,
+        pending.directory_identity,
+    )?;
+    Ok(format!(
+        "Recovered Bilibili mux transaction: {}",
+        output_path.display()
+    ))
+}
+
+fn load_bilibili_mux_recovery(
+    root: &RootedFs,
+    directory: &Path,
+) -> Result<PendingBilibiliMuxRecovery> {
+    let directory_entry = root.bind_entry(directory, false)?;
+    let directory_identity = root
+        .bound_entry_identity(&directory_entry)?
+        .context("Bilibili mux recovery directory is missing")?;
+    root.validate_private_bound_directory(&directory_entry, directory_identity, 0o700)?;
+    let manifest_path = directory.join(BILIBILI_MUX_RECOVERY_MANIFEST_NAME);
+    let manifest_file = root
+        .open_bound_file(&manifest_path)?
+        .context("Bilibili mux recovery manifest is missing")?;
+    manifest_file.validate_private_single_link(0o600)?;
+    let manifest_identity = manifest_file.identity();
+    let manifest_entry = root.bind_entry(&manifest_path, false)?;
+    if root.bound_entry_identity(&manifest_entry)? != Some(manifest_identity) {
+        bail!("Bilibili mux recovery manifest identity changed");
+    }
+    let manifest: BilibiliMuxRecoveryManifest =
+        serde_json::from_slice(&manifest_file.read_limited(BILIBILI_MUX_RECOVERY_MANIFEST_LIMIT)?)
+            .context("failed to parse Bilibili mux recovery manifest")?;
+    let parent = directory
+        .parent()
+        .context("Bilibili mux recovery directory has no parent")?;
+    let parent_identity = rooted_directory_identity(root, parent)?;
+    if manifest.version != BILIBILI_MUX_RECOVERY_MANIFEST_VERSION
+        || manifest.transaction_device != directory_identity.device()
+        || manifest.transaction_inode != directory_identity.inode()
+        || manifest.parent_device != parent_identity.device()
+        || manifest.parent_inode != parent_identity.inode()
+    {
+        bail!("Bilibili mux recovery manifest does not describe this transaction");
+    }
+    let output_name = bilibili_mux_manifest_name(&manifest.output_file_name, "published output")?;
+    let staged_name = bilibili_mux_manifest_name(&manifest.staged_file_name, "staged output")?;
+    if is_bilibili_mux_control_name(Path::new(&output_name))
+        || is_bilibili_mux_control_name(Path::new(&staged_name))
+    {
+        bail!("Bilibili mux recovery manifest conflicts with a control name");
+    }
+    let mut inputs = BTreeSet::new();
+    for input in &manifest.inputs {
+        let name = bilibili_mux_manifest_name(&input.file_name, "raw input")?;
+        if is_bilibili_mux_control_name(Path::new(&name)) || !inputs.insert(name) {
+            bail!("Bilibili mux recovery manifest has an invalid input set");
+        }
+    }
+    Ok(PendingBilibiliMuxRecovery {
+        directory: directory.to_path_buf(),
+        directory_entry,
+        directory_identity,
+        manifest_path,
+        manifest_entry,
+        manifest_identity,
+        manifest,
+    })
+}
+
+fn ensure_bilibili_mux_output_anchor(
+    root: &RootedFs,
+    pending: &PendingBilibiliMuxRecovery,
+) -> Result<(PathBuf, BoundFile, BoundFile)> {
+    let parent = pending
+        .directory
+        .parent()
+        .context("Bilibili mux recovery directory has no parent")?;
+    let output_name =
+        bilibili_mux_manifest_name(&pending.manifest.output_file_name, "published output")?;
+    let output_path = parent.join(output_name);
+    let anchor_path = pending.directory.join(BILIBILI_MUX_RECOVERY_ANCHOR_NAME);
+    let output_entry = root.bind_entry(&output_path, false)?;
+    let anchor_entry = root.bind_entry(&anchor_path, false)?;
+    let output_identity = root.bound_entry_identity(&output_entry)?;
+    let anchor_identity = root.bound_entry_identity(&anchor_entry)?;
+    for (label, identity) in [("output", output_identity), ("anchor", anchor_identity)] {
+        if let Some(identity) = identity
+            && (!identity.is_file()
+                || identity.device() != pending.manifest.output_device
+                || identity.inode() != pending.manifest.output_inode)
+        {
+            bail!("Bilibili mux recovered {label} identity changed");
+        }
+    }
+    match (output_identity, anchor_identity) {
+        (Some(_), None) => root.hard_link_via_bound_parents_noreplace_if_identity(
+            &output_entry,
+            &anchor_entry,
+            output_identity.expect("output identity is present"),
+        )?,
+        (None, Some(_)) => root.hard_link_via_bound_parents_noreplace_if_identity(
+            &anchor_entry,
+            &output_entry,
+            anchor_identity.expect("anchor identity is present"),
+        )?,
+        (Some(_), Some(_)) => {}
+        (None, None) => bail!("Bilibili mux output and durable anchor are both missing"),
+    }
+    let output = root
+        .open_bound_file(&output_path)?
+        .context("recovered Bilibili mux output is missing")?;
+    let anchor = root
+        .open_bound_file(&anchor_path)?
+        .context("recovered Bilibili mux anchor is missing")?;
+    validate_recovered_bilibili_mux_output(root, &output_path, &output, pending, &anchor)?;
+    Ok((output_path, output, anchor))
+}
+
+fn validate_recovered_bilibili_mux_output(
+    root: &RootedFs,
+    output_path: &Path,
+    output: &BoundFile,
+    pending: &PendingBilibiliMuxRecovery,
+    anchor: &BoundFile,
+) -> Result<()> {
+    output.validate_identity()?;
+    anchor.validate_identity()?;
+    if output.identity() != anchor.identity()
+        || output.identity().device() != pending.manifest.output_device
+        || output.identity().inode() != pending.manifest.output_inode
+        || root.entry_identity(output_path)? != Some(output.identity())
+        || root.entry_identity(&pending.directory.join(BILIBILI_MUX_RECOVERY_ANCHOR_NAME))?
+            != Some(anchor.identity())
+    {
+        bail!("recovered Bilibili mux output or durable anchor changed");
+    }
+    Ok(())
+}
+
+fn require_bilibili_mux_transaction_entries(
+    root: &RootedFs,
+    pending: &PendingBilibiliMuxRecovery,
+    expected: &BTreeSet<std::ffi::OsString>,
+) -> Result<()> {
+    let actual = root
+        .list_bound_directory(&pending.directory_entry, pending.directory_identity)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<BTreeSet<_>>();
+    if &actual != expected {
+        bail!(
+            "Bilibili mux recovery directory contains unexpected entries: {}",
+            pending.directory.display()
+        );
+    }
+    Ok(())
+}
+
+fn bilibili_mux_manifest_name(path: &Path, label: &str) -> Result<std::ffi::OsString> {
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(name)), None) => Ok(name.to_os_string()),
+        _ => bail!("Bilibili mux recovery manifest has an invalid {label} name"),
+    }
+}
+
+fn rooted_directory_identity(root: &RootedFs, path: &Path) -> Result<EntryIdentity> {
+    root.validate_configured_root()?;
+    if path == root.logical_root_path() || path == root.root_path() {
+        return Ok(root.root_identity());
+    }
+    let identity = root
+        .entry_identity(path)?
+        .with_context(|| format!("bound directory is missing: {}", path.display()))?;
+    if !identity.is_dir() {
+        bail!("bound path is not a directory: {}", path.display());
+    }
+    Ok(identity)
+}
+
 #[cfg(test)]
 fn bind_existing_bilibili_mux_state(
     root: &RootedFs,
@@ -1529,7 +2364,58 @@ fn bind_existing_bilibili_mux_state(
         mux.bound_inputs = bind_bilibili_mux_inputs(root, &media_inputs)?;
         let output_path = resolve_command_output_path(cwd, &mux.output_path);
         mux.output_path = output_path.clone();
-        mux.bound_output = root.open_bound_file(&output_path)?;
+        let output = root
+            .open_bound_file(&output_path)?
+            .with_context(|| format!("test mux output is missing: {}", output_path.display()))?;
+        let parent = output_path
+            .parent()
+            .context("test mux output has no parent")?;
+        let (directory, directory_entry, directory_identity) =
+            create_bilibili_mux_staging_dir(root, parent)?;
+        let staged_path = directory.join("output.test");
+        let (manifest_path, manifest_entry, manifest_identity, mut manifest) =
+            create_bilibili_mux_recovery_manifest(
+                root,
+                parent,
+                &directory,
+                directory_identity,
+                &staged_path,
+                output.identity(),
+                &output_path,
+                &mux.bound_inputs,
+            )?;
+        let output_entry = root.bind_entry(&output_path, false)?;
+        let anchor_path = directory.join(BILIBILI_MUX_RECOVERY_ANCHOR_NAME);
+        let anchor_entry = root.bind_entry(&anchor_path, false)?;
+        root.hard_link_via_bound_parents_noreplace_if_identity(
+            &output_entry,
+            &anchor_entry,
+            output.identity(),
+        )?;
+        let anchor = root
+            .open_bound_file(&anchor_path)?
+            .context("test mux output anchor is missing")?;
+        manifest.phase = BilibiliMuxRecoveryPhase::CleaningInputs;
+        let (manifest_entry, manifest_identity) = replace_bilibili_mux_recovery_manifest(
+            root,
+            &directory_entry,
+            directory_identity,
+            &manifest_path,
+            &manifest_entry,
+            manifest_identity,
+            &manifest,
+        )?;
+        mux.bound_output = Some(output);
+        mux.recovery = Some(BilibiliMuxRecovery {
+            directory,
+            directory_entry,
+            directory_identity,
+            manifest_path,
+            manifest_entry,
+            manifest_identity,
+            manifest,
+            anchor,
+        });
     }
     Ok(())
 }
@@ -2965,6 +3851,75 @@ struct VideoOutputGuard {
     _file_guard: BoundFile,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VideoControlOwner {
+    version: u32,
+    root_device: u64,
+    root_inode: u64,
+    control_device: u64,
+    control_inode: u64,
+}
+
+#[derive(Debug)]
+struct VideoControlDirectory {
+    path: PathBuf,
+    entry: BoundEntry,
+    identity: EntryIdentity,
+}
+
+#[derive(Debug)]
+struct VideoRecoveryMarker {
+    root: RootedFs,
+    path: PathBuf,
+    temp_path: PathBuf,
+    entry: BoundEntry,
+    file: BoundFile,
+}
+
+impl VideoRecoveryMarker {
+    fn write_state(&mut self, state: u8) -> Result<()> {
+        if !matches!(
+            state,
+            VIDEO_RECOVERY_STATE_CLEAN | VIDEO_RECOVERY_STATE_DIRTY
+        ) {
+            bail!("invalid video recovery state");
+        }
+        self.file.validate_private_single_link(0o600)?;
+        if self.root.bound_entry_identity(&self.entry)? != Some(self.file.identity()) {
+            bail!(
+                "video recovery state identity changed before replacement: {}",
+                self.path.display()
+            );
+        }
+        remove_valid_recovery_state_temp(&self.root, &self.temp_path)?;
+        let (entry, identity) = self
+            .root
+            .replace_bound_file_atomically_if_identity(
+                &self.entry,
+                self.file.identity(),
+                &self.temp_path,
+                &[state],
+                0o600,
+            )
+            .context("failed to atomically persist video recovery state")?;
+        let file = self
+            .root
+            .open_bound_file(&self.path)?
+            .context("video recovery state disappeared after replacement")?;
+        if file.identity() != identity {
+            bail!("video recovery state identity changed after replacement");
+        }
+        file.validate_private_single_link(0o600)?;
+        if file.read_limited(1)? != [state] {
+            bail!("video recovery state replacement has invalid contents");
+        }
+        self.entry = entry;
+        self.file = file;
+        Ok(())
+    }
+}
+
 impl VideoOutputGuard {
     fn root(&self) -> &RootedFs {
         &self.root
@@ -2980,7 +3935,7 @@ impl VideoOutputGuard {
 }
 
 struct VideoRecoveryState {
-    file: BoundFile,
+    marker: VideoRecoveryMarker,
     operation_clean: Cell<bool>,
     unresolved_before_operation: bool,
 }
@@ -2992,7 +3947,7 @@ impl Drop for VideoRecoveryState {
         } else {
             VIDEO_RECOVERY_STATE_DIRTY
         };
-        let _ = self.file.write_prefix_and_sync(&[state]);
+        let _ = self.marker.write_state(state);
     }
 }
 
@@ -3004,10 +3959,68 @@ fn video_output_lock_file(root: &RootedFs) -> Result<BoundFile> {
     .context("failed to open the cross-process video output lock")
 }
 
-fn video_recovery_state_file(root: &RootedFs) -> Result<(BoundFile, bool)> {
-    let path = root
-        .logical_root_path()
-        .join(VIDEO_RECOVERY_STATE_FILE_NAME);
+fn video_control_directory(root: &RootedFs) -> Result<VideoControlDirectory> {
+    let path = root.logical_root_path().join(VIDEO_CONTROL_DIR_NAME);
+    let created = root.create_dir(&path, 0o700)?;
+    let entry = root.bind_entry(&path, false)?;
+    let identity = match (created, root.bound_entry_identity(&entry)?) {
+        (Some(created), Some(current)) if created == current => current,
+        (Some(_), _) => bail!("video control directory identity changed while creating it"),
+        (None, Some(current)) if current.is_dir() => current,
+        (None, Some(_)) => bail!("video control path is not a directory: {}", path.display()),
+        (None, None) => bail!("video control directory disappeared: {}", path.display()),
+    };
+    root.validate_private_bound_directory(&entry, identity, 0o700)?;
+
+    let owner_path = path.join(VIDEO_CONTROL_OWNER_FILE_NAME);
+    let expected = VideoControlOwner {
+        version: VIDEO_CONTROL_OWNER_VERSION,
+        root_device: root.root_identity().device(),
+        root_inode: root.root_identity().inode(),
+        control_device: identity.device(),
+        control_inode: identity.inode(),
+    };
+    if created.is_some() {
+        let contents = serde_json::to_vec(&expected)
+            .context("failed to encode video control ownership record")?;
+        root.create_new_bound_file(&owner_path, &contents, 0o600)
+            .context("failed to create video control ownership record")?;
+    }
+    let owner = root.open_bound_file(&owner_path)?.with_context(|| {
+        format!(
+            "video control directory is not app-owned; missing {}",
+            owner_path.display()
+        )
+    })?;
+    owner.validate_private_single_link(0o600)?;
+    let actual: VideoControlOwner =
+        serde_json::from_slice(&owner.read_limited(VIDEO_CONTROL_OWNER_LIMIT)?)
+            .context("failed to parse video control ownership record")?;
+    if actual.version != expected.version
+        || actual.root_device != expected.root_device
+        || actual.root_inode != expected.root_inode
+        || actual.control_device != expected.control_device
+        || actual.control_inode != expected.control_inode
+    {
+        bail!("video control ownership record does not match the bound output root");
+    }
+    if root.entry_identity(&owner_path)? != Some(owner.identity()) {
+        bail!("video control ownership record identity changed after validation");
+    }
+    root.validate_private_bound_directory(&entry, identity, 0o700)?;
+    Ok(VideoControlDirectory {
+        path,
+        entry,
+        identity,
+    })
+}
+
+fn video_recovery_state_file(root: &RootedFs) -> Result<(VideoRecoveryMarker, bool)> {
+    let control = video_control_directory(root)?;
+    root.validate_private_bound_directory(&control.entry, control.identity, 0o700)?;
+    let path = control.path.join(VIDEO_RECOVERY_STATE_FILE_NAME);
+    let temp_path = control.path.join(VIDEO_RECOVERY_STATE_TEMP_FILE_NAME);
+    remove_valid_recovery_state_temp(root, &temp_path)?;
     let entry = root.bind_entry(&path, false)?;
     let previous = root.bound_entry_identity(&entry)?;
     if previous.is_some_and(|identity| !identity.is_file()) {
@@ -3016,20 +4029,82 @@ fn video_recovery_state_file(root: &RootedFs) -> Result<(BoundFile, bool)> {
             path.display()
         );
     }
+    let legacy_requires_scan = previous.is_none()
+        && root
+            .entry_identity(
+                &root
+                    .logical_root_path()
+                    .join(LEGACY_VIDEO_RECOVERY_STATE_FILE_NAME),
+            )?
+            .is_some();
+    if previous.is_none() {
+        root.create_new_bound_file(
+            &path,
+            &[if legacy_requires_scan {
+                VIDEO_RECOVERY_STATE_DIRTY
+            } else {
+                VIDEO_RECOVERY_STATE_CLEAN
+            }],
+            0o600,
+        )
+        .context("failed to create the video recovery state marker")?;
+    }
     let file = root
-        .open_or_create_bound_file(&path, 0o600)
-        .context("failed to open the video recovery state marker")?;
+        .open_bound_file(&path)?
+        .context("video recovery state marker is missing")?;
     if previous.is_some_and(|identity| identity != file.identity()) {
         bail!(
             "video recovery state identity changed while opening: {}",
             path.display()
         );
     }
-    Ok((file, previous.is_some()))
+    file.validate_private_single_link(0o600)?;
+    let contents = file.read_limited(1)?;
+    if !matches!(
+        contents.as_slice(),
+        [VIDEO_RECOVERY_STATE_CLEAN | VIDEO_RECOVERY_STATE_DIRTY]
+    ) {
+        bail!("video recovery state marker has invalid contents");
+    }
+    Ok((
+        VideoRecoveryMarker {
+            root: root.clone(),
+            path,
+            temp_path,
+            entry,
+            file,
+        },
+        previous.is_some() || legacy_requires_scan,
+    ))
 }
 
-fn video_recovery_state_is_clean(file: &BoundFile) -> Result<bool> {
-    Ok(file.read_limited(1)?.first().copied() == Some(VIDEO_RECOVERY_STATE_CLEAN))
+fn remove_valid_recovery_state_temp(root: &RootedFs, path: &Path) -> Result<()> {
+    let Some(file) = root.open_bound_file(path)? else {
+        return Ok(());
+    };
+    file.validate_private_single_link(0o600)?;
+    if !matches!(
+        file.read_limited(1)?.as_slice(),
+        [VIDEO_RECOVERY_STATE_CLEAN | VIDEO_RECOVERY_STATE_DIRTY]
+    ) {
+        bail!(
+            "refused to remove invalid video recovery state transition: {}",
+            path.display()
+        );
+    }
+    let entry = root.bind_entry(path, false)?;
+    root.remove_bound_file_if_identity(&entry, file.identity())
+        .with_context(|| {
+            format!(
+                "failed to remove interrupted video recovery state transition {}",
+                path.display()
+            )
+        })
+}
+
+fn video_recovery_state_is_clean(marker: &VideoRecoveryMarker) -> Result<bool> {
+    marker.file.validate_private_single_link(0o600)?;
+    Ok(marker.file.read_limited(1)? == [VIDEO_RECOVERY_STATE_CLEAN])
 }
 
 async fn video_output_lock(
@@ -3070,25 +4145,29 @@ async fn video_output_lock(
             format!("{job_label}: cross-process output slot acquired"),
         );
     }
-    let (recovery_state_file, recovery_state_existed) = video_recovery_state_file(&root)?;
+    let (mut recovery_state_file, recovery_state_existed) = video_recovery_state_file(&root)?;
     let mut recoveries = Vec::new();
     let mut unresolved_recovery = false;
     if recovery_state_existed && !video_recovery_state_is_clean(&recovery_state_file)? {
         let quarantine_recovery = root.reconcile_remove_quarantines_with_status()?;
+        let mux_recovery = recover_pending_bilibili_mux_transactions_locked(&root, video_dir)?;
         let overwrite_recovery = recover_pending_overwrite_transactions_locked(&root, video_dir)?;
-        unresolved_recovery = quarantine_recovery.unresolved || overwrite_recovery.unresolved;
+        unresolved_recovery = quarantine_recovery.unresolved
+            || mux_recovery.unresolved
+            || overwrite_recovery.unresolved;
         recoveries.extend(quarantine_recovery.messages);
+        recoveries.extend(mux_recovery.messages);
         recoveries.extend(overwrite_recovery.messages);
     }
     for recovery in recoveries {
         warn_recovered_overwrite(&recovery);
         send_progress(progress, format!("{job_label}: {recovery}"));
     }
-    recovery_state_file.write_prefix_and_sync(&[VIDEO_RECOVERY_STATE_DIRTY])?;
+    recovery_state_file.write_state(VIDEO_RECOVERY_STATE_DIRTY)?;
     Ok(VideoOutputGuard {
         root,
         recovery_state: VideoRecoveryState {
-            file: recovery_state_file,
+            marker: recovery_state_file,
             operation_clean: Cell::new(true),
             unresolved_before_operation: unresolved_recovery,
         },
@@ -6530,12 +7609,7 @@ fn remove_backups(
         ));
     }
     if failures.is_empty()
-        && let Err(err) = remove_committed_output_anchors(root, recovery, committed)
-    {
-        failures.push(format!("{err:#}"));
-    }
-    if failures.is_empty()
-        && let Err(err) = remove_overwrite_transaction_dir(root, recovery)
+        && let Err(err) = remove_committed_overwrite_transaction(root, backups, recovery, committed)
     {
         failures.push(format!("{err:#}"));
     }
@@ -6546,71 +7620,45 @@ fn remove_backups(
     }
 }
 
-fn remove_committed_output_anchors(
+fn remove_committed_overwrite_transaction(
     root: &RootedFs,
+    backups: &[FileBackup],
     recovery: &OverwriteRecoveryFiles,
     committed: &CommittedOverwriteState,
 ) -> Result<()> {
-    for record in &committed.manifest.committed_files {
-        let file_name = PathBuf::from(single_recovery_file_name(&record.file_name)?);
-        let anchor_name = PathBuf::from(committed_recovery_anchor_name(record)?);
-        let output = committed.files.get(&file_name).with_context(|| {
-            format!(
-                "committed overwrite descriptor is missing for {}",
-                file_name.display()
+    validate_committed_overwrite_state(root, backups, recovery, committed)?;
+    let expected_entries =
+        std::iter::once(std::ffi::OsString::from(OVERWRITE_RECOVERY_MANIFEST_NAME))
+            .chain(
+                committed
+                    .manifest
+                    .committed_files
+                    .iter()
+                    .map(committed_recovery_anchor_name)
+                    .collect::<Result<Vec<_>>>()?,
             )
-        })?;
-        let anchor = committed.anchors.get(&anchor_name).with_context(|| {
-            format!(
-                "committed overwrite anchor descriptor is missing for {}",
-                anchor_name.display()
-            )
-        })?;
-        output.validate_identity()?;
-        anchor.validate_identity()?;
-        if output.identity() != anchor.identity() {
-            bail!(
-                "committed overwrite anchor no longer binds {}",
-                file_name.display()
-            );
-        }
-        let output_path = recovery
-            .backup_dir
-            .parent()
-            .context("overwrite recovery directory has no parent")?
-            .join(&file_name);
-        if root.entry_identity(&output_path)? != Some(output.identity()) {
-            bail!(
-                "committed overwrite path changed before anchor cleanup: {}",
-                output_path.display()
-            );
-        }
-        let anchor_path = recovery.backup_dir.join(&anchor_name);
-        let anchor_entry = root.bind_entry(&anchor_path, false)?;
-        root.remove_bound_file_if_identity(&anchor_entry, anchor.identity())
-            .with_context(|| {
-                format!(
-                    "failed to remove committed output anchor {}",
-                    anchor_path.display()
-                )
-            })?;
+            .collect::<BTreeSet<_>>();
+    let actual_entries = root
+        .list_bound_directory(&recovery.backup_dir_entry, recovery.backup_dir_identity)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<BTreeSet<_>>();
+    if actual_entries != expected_entries {
+        bail!(
+            "refused to finalize overwrite transaction with unexpected entries in {}",
+            recovery.backup_dir.display()
+        );
     }
-
-    for (file_name, output) in &committed.files {
-        output.validate_identity()?;
-        let output_path = recovery
-            .backup_dir
-            .parent()
-            .context("overwrite recovery directory has no parent")?
-            .join(file_name);
-        if root.entry_identity(&output_path)? != Some(output.identity()) {
-            bail!(
-                "committed overwrite path changed after anchor cleanup: {}",
-                output_path.display()
-            );
-        }
-    }
-    Ok(())
+    root.remove_bound_tree_durably_if_identity(
+        &recovery.backup_dir_entry,
+        recovery.backup_dir_identity,
+    )
+    .with_context(|| {
+        format!(
+            "failed to durably remove committed overwrite transaction {}",
+            recovery.backup_dir.display()
+        )
+    })
 }
 
 fn remove_overwrite_transaction_dir(
@@ -6637,20 +7685,16 @@ fn remove_overwrite_transaction_dir(
                 .join(", ")
         );
     }
-    root.remove_bound_file_if_identity(&recovery.manifest_entry, recovery.manifest_identity)
-        .with_context(|| {
-            format!(
-                "failed to remove overwrite recovery manifest {}",
-                recovery.manifest_path.display()
-            )
-        })?;
-    root.remove_bound_dir_if_identity(&recovery.backup_dir_entry, recovery.backup_dir_identity)
-        .with_context(|| {
-            format!(
-                "failed to remove overwrite recovery directory {}",
-                recovery.backup_dir.display()
-            )
-        })
+    root.remove_bound_tree_durably_if_identity(
+        &recovery.backup_dir_entry,
+        recovery.backup_dir_identity,
+    )
+    .with_context(|| {
+        format!(
+            "failed to durably remove overwrite recovery directory {}",
+            recovery.backup_dir.display()
+        )
+    })
 }
 
 pub fn recover_pending_overwrite_transactions(video_dir: &Path) -> Result<Vec<String>> {
@@ -6659,16 +7703,19 @@ pub fn recover_pending_overwrite_transactions(video_dir: &Path) -> Result<Vec<St
     recovery_lock
         .lock_exclusive()
         .context("failed to serialize overwrite recovery with active downloads")?;
-    let (recovery_state, _) = video_recovery_state_file(&root)?;
+    let (mut recovery_state, _) = video_recovery_state_file(&root)?;
     let quarantine_recovery = root.reconcile_remove_quarantines_with_status()?;
+    let mux_recovery = recover_pending_bilibili_mux_transactions_locked(&root, video_dir)?;
     let overwrite_recovery = recover_pending_overwrite_transactions_locked(&root, video_dir)?;
-    let unresolved = quarantine_recovery.unresolved || overwrite_recovery.unresolved;
-    recovery_state.write_prefix_and_sync(&[if unresolved {
+    let unresolved =
+        quarantine_recovery.unresolved || mux_recovery.unresolved || overwrite_recovery.unresolved;
+    recovery_state.write_state(if unresolved {
         VIDEO_RECOVERY_STATE_DIRTY
     } else {
         VIDEO_RECOVERY_STATE_CLEAN
-    }])?;
+    })?;
     let mut messages = quarantine_recovery.messages;
+    messages.extend(mux_recovery.messages);
     messages.extend(overwrite_recovery.messages);
     Ok(messages)
 }
@@ -6892,7 +7939,7 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
         manifest_identity,
     };
     let mut report = Vec::new();
-    match manifest.phase {
+    let transaction_removed = match manifest.phase {
         OverwriteRecoveryPhase::Acquired => {
             if !manifest.committed_files.is_empty() {
                 bail!("acquired overwrite manifest unexpectedly contains committed files");
@@ -6929,6 +7976,7 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
                     original.display()
                 ));
             }
+            false
         }
         OverwriteRecoveryPhase::Committed => {
             if manifest.version != OVERWRITE_RECOVERY_MANIFEST_VERSION {
@@ -6970,11 +8018,14 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
                 ));
             }
             validate_recovery_committed_files(root, parent, &recovery, &committed)?;
-            remove_committed_output_anchors(root, &recovery, &committed)?;
+            remove_committed_overwrite_transaction(root, &[], &recovery, &committed)?;
+            true
         }
-    }
+    };
 
-    remove_overwrite_transaction_dir(root, &recovery)?;
+    if !transaction_removed {
+        remove_overwrite_transaction_dir(root, &recovery)?;
+    }
     report.push(format!(
         "Recovered overwrite transaction: {}",
         directory.display()
@@ -11082,6 +12133,106 @@ mod tests {
     }
 
     #[test]
+    fn startup_recovery_discards_interrupted_bilibili_mux_staging() {
+        let root = temp_test_dir("bilibili-mux-staging-recovery");
+        let raw = root.join("video.m4s");
+        let output = root.join("Episode.mp4");
+        fs::write(&raw, "raw-video").expect("raw input should write");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+        let inputs = vec![BilibiliMediaInput {
+            kind: "video".to_string(),
+            path: raw.clone(),
+        }];
+        let bound_inputs =
+            bind_bilibili_mux_inputs(&rooted, &inputs).expect("raw input should bind");
+        let reservation = ReservedMuxOutput::create(&rooted, &output, &bound_inputs)
+            .expect("mux transaction should reserve");
+        let transaction = reservation.staging_dir_entry.path().to_path_buf();
+        fs::write(reservation.command_path(), "partial-mux")
+            .expect("partial mux output should write");
+        std::mem::forget(reservation);
+
+        let report = recover_pending_bilibili_mux_transactions_locked(&rooted, &root)
+            .expect("interrupted mux staging should recover");
+
+        assert!(!report.unresolved);
+        assert!(raw.is_file());
+        assert!(!output.exists());
+        assert!(!transaction.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_recovery_restores_anchored_mux_output_and_finishes_raw_cleanup() {
+        let root = temp_test_dir("bilibili-mux-published-recovery");
+        let raw = root.join("video.m4s");
+        let output = root.join("Episode.mkv");
+        fs::write(&raw, "raw-video").expect("raw input should write");
+        fs::write(&output, "mux-output").expect("mux output should write");
+        let mut download_report = parse_bilibili_download_report(
+            r#"{"title":"Episode","output_dir":".","entries":[{"index":1,"title":"Episode","directory":".","files":[{"kind":"video","path":"video.m4s"}],"mux":{"output_path":"Episode.mkv"}}]}"#,
+        )
+        .expect("download report should parse");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+        bind_existing_bilibili_mux_state(&rooted, &root, &mut download_report)
+            .expect("mux recovery state should bind");
+        let transaction = download_report.entries[0]
+            .mux
+            .as_ref()
+            .and_then(|mux| mux.recovery.as_ref())
+            .expect("mux recovery transaction should exist")
+            .directory
+            .clone();
+        fs::remove_file(&output).expect("published output should unlink");
+
+        let report = recover_pending_bilibili_mux_transactions_locked(&rooted, &root)
+            .expect("published mux transaction should recover");
+
+        assert!(!report.unresolved);
+        assert_eq!(fs::read_to_string(&output).unwrap(), "mux-output");
+        assert!(!raw.exists());
+        assert!(!transaction.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_recovery_retains_anchor_when_mux_output_is_replaced() {
+        let root = temp_test_dir("bilibili-mux-output-replaced-recovery");
+        let raw = root.join("video.m4s");
+        let output = root.join("Episode.mkv");
+        fs::write(&raw, "raw-video").expect("raw input should write");
+        fs::write(&output, "mux-output").expect("mux output should write");
+        let mut download_report = parse_bilibili_download_report(
+            r#"{"title":"Episode","output_dir":".","entries":[{"index":1,"title":"Episode","directory":".","files":[{"kind":"video","path":"video.m4s"}],"mux":{"output_path":"Episode.mkv"}}]}"#,
+        )
+        .expect("download report should parse");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+        bind_existing_bilibili_mux_state(&rooted, &root, &mut download_report)
+            .expect("mux recovery state should bind");
+        let transaction = download_report.entries[0]
+            .mux
+            .as_ref()
+            .and_then(|mux| mux.recovery.as_ref())
+            .expect("mux recovery transaction should exist")
+            .directory
+            .clone();
+        fs::remove_file(&output).expect("published output should unlink");
+        fs::write(&output, "replacement").expect("replacement should write");
+
+        let report = recover_pending_bilibili_mux_transactions_locked(&rooted, &root)
+            .expect("replacement should be reported without destructive cleanup");
+
+        assert!(report.unresolved);
+        assert_eq!(fs::read_to_string(&output).unwrap(), "replacement");
+        assert_eq!(fs::read_to_string(&raw).unwrap(), "raw-video");
+        assert_eq!(
+            fs::read_to_string(transaction.join(BILIBILI_MUX_RECOVERY_ANCHOR_NAME)).unwrap(),
+            "mux-output"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn staging_support_files_only_include_managed_config() {
         let staging_dir = PathBuf::from("/tmp/staging");
 
@@ -12220,7 +13371,7 @@ mv video.original video.m4s || exit 46
         video_recovery_state_file(&root)
             .expect("recovery state should open")
             .0
-            .write_prefix_and_sync(&[VIDEO_RECOVERY_STATE_DIRTY])
+            .write_state(VIDEO_RECOVERY_STATE_DIRTY)
             .expect("crashed owner should leave a dirty recovery state");
 
         let blocker = video_output_lock_file(&root).expect("blocking lock should open");
@@ -12276,7 +13427,7 @@ mv video.original video.m4s || exit 46
         video_recovery_state_file(&root)
             .expect("recovery state should open")
             .0
-            .write_prefix_and_sync(&[VIDEO_RECOVERY_STATE_CLEAN])
+            .write_state(VIDEO_RECOVERY_STATE_CLEAN)
             .expect("recovery state should become clean");
         let (tx, rx) = job_progress_channel();
 
@@ -12287,6 +13438,84 @@ mv video.original video.m4s || exit 46
         assert_no_progress(&rx);
         assert!(unresolved.is_dir());
         drop(guard);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn recovery_state_ignores_legacy_root_marker_contents() {
+        let video_dir = temp_test_dir("legacy-root-recovery-marker");
+        let legacy = video_dir.join(LEGACY_VIDEO_RECOVERY_STATE_FILE_NAME);
+        fs::write(&legacy, "user-owned-legacy-data").expect("legacy file should write");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+
+        let (mut marker, existed) =
+            video_recovery_state_file(&root).expect("private recovery state should create");
+        marker
+            .write_state(VIDEO_RECOVERY_STATE_DIRTY)
+            .expect("private recovery state should update");
+
+        assert!(existed);
+        assert_eq!(
+            fs::read_to_string(legacy).unwrap(),
+            "user-owned-legacy-data"
+        );
+        assert_eq!(
+            fs::read(
+                video_dir
+                    .join(VIDEO_CONTROL_DIR_NAME)
+                    .join(VIDEO_RECOVERY_STATE_FILE_NAME)
+            )
+            .unwrap(),
+            [VIDEO_RECOVERY_STATE_DIRTY]
+        );
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_state_rejects_an_unowned_control_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let video_dir = temp_test_dir("unowned-video-control");
+        let control = video_dir.join(VIDEO_CONTROL_DIR_NAME);
+        fs::create_dir(&control).expect("unowned control directory should create");
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o700))
+            .expect("control permissions should set");
+        fs::write(control.join("user.txt"), "user-owned").expect("user file should write");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+
+        let error = video_recovery_state_file(&root)
+            .expect_err("control directory without ownership record must be rejected");
+
+        assert!(format!("{error:#}").contains("not app-owned"));
+        assert_eq!(
+            fs::read_to_string(control.join("user.txt")).unwrap(),
+            "user-owned"
+        );
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn recovery_state_rejects_hard_links_without_modifying_them() {
+        let video_dir = temp_test_dir("hard-linked-recovery-state");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+        drop(
+            video_recovery_state_file(&root)
+                .expect("private recovery state should create")
+                .0,
+        );
+        let state = video_dir
+            .join(VIDEO_CONTROL_DIR_NAME)
+            .join(VIDEO_RECOVERY_STATE_FILE_NAME);
+        let linked = video_dir.join("user-linked-state");
+        fs::hard_link(&state, &linked).expect("state hard link should create");
+
+        let error = video_recovery_state_file(&root)
+            .expect_err("hard-linked recovery state must be rejected");
+
+        assert!(format!("{error:#}").contains("link count"));
+        assert_eq!(fs::read(&state).unwrap(), [VIDEO_RECOVERY_STATE_CLEAN]);
+        assert_eq!(fs::read(&linked).unwrap(), [VIDEO_RECOVERY_STATE_CLEAN]);
         let _ = fs::remove_dir_all(video_dir);
     }
 
