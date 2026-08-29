@@ -629,17 +629,9 @@ async fn run_bilibili_job_locked(
     let plan = BilibiliDownloadPlan::from(&core_plan);
     let progress_reporter = BilibiliCoreProgress::new(progress.clone());
     let command_started_at = SystemTime::now();
-    let core_report = tokio_timeout(
-        Duration::from_secs(config.bot.command_timeout_seconds),
-        client.download_plan_with_progress(&core_plan, options, &progress_reporter),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "Bilibili direct download timed out after {} seconds",
-            config.bot.command_timeout_seconds
-        )
-    })??;
+    let core_report = client
+        .download_plan_with_progress(&core_plan, options, &progress_reporter)
+        .await?;
     let mut report = BilibiliDownloadReport::from(&core_report);
     let output_dir = bilibili_core::output_dir(config);
     if mux_locally {
@@ -7702,6 +7694,8 @@ mod tests {
         let video_dir = temp_test_dir("bilibili-direct-options");
         config.downloads.video_dir = video_dir.clone();
         config.tools.ffmpeg = PathBuf::from("/opt/bin/ffmpeg");
+        config.bot.command_timeout_seconds = 1;
+        config.bot.command_idle_timeout_seconds = 37;
         config.bilibili.danmaku.enabled = false;
         config.bilibili.download_args = vec!["--only".to_string(), "audio".to_string()];
 
@@ -7713,10 +7707,7 @@ mod tests {
         assert!(!options.include_danmaku);
         assert!(!options.sidecars.danmaku);
         assert!(!options.media_hosts.allow_pcdn);
-        assert_eq!(
-            options.download_idle_timeout,
-            Some(Duration::from_secs(config.bot.command_idle_timeout_seconds))
-        );
+        assert_eq!(options.download_idle_timeout, Some(Duration::from_secs(37)));
         assert!(
             matches!(options.mux, bbdown_core::MuxOptions::Ffmpeg { ref binary } if binary == &PathBuf::from("/opt/bin/ffmpeg"))
         );

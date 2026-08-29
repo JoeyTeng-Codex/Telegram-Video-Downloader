@@ -46,7 +46,7 @@ Bilibili 下载和登录不需要本机 `bbdown` 可执行文件；项目直接�
 
 `bilibili.auth.credential_file` 是 `bbdown-core` credential 文件，默认写到 `~/.local/state/telegram-video-downloader/bbdown-credentials.json`；可选的 `credential_profile` 会选择同一文件里的 profile。`/bbdown login` 默认等同 `/bbdown login web`，会直接创建并轮询 Web QR；`/bbdown login tv` 会保存 TV 专用 `tv_access_key`；`/bbdown login access-key` 会发送 BiliPlus/BALH 授权 QR 和链接，授权后把 callback URL 或 `balh-login-credentials:` 消息发回同一个私聊即可保存 generic intl/Bstar `access_key`。`/bbdown status` 通过 crate API 检查 cookie、`access_key` 和 `tv_access_key`；`/bbdown logout` 清理当前 credential/profile，并兼容删除旧版 bot Web cookie state。
 
-`bot.progress_update_seconds` 控制进度回复频率，默认 5 秒。YouTube/PDF 外部命令会按这个间隔刷新文件增长快照；Bilibili 会转发 `bbdown-core` 的关键 plan、download 和 mux 阶段。`bot.command_timeout_seconds` 是单个外部命令的总超时；`bot.command_idle_timeout_seconds` 会作为 Bilibili 下载 idle timeout 传给 `bbdown-core`。
+`bot.progress_update_seconds` 控制进度回复频率，默认 5 秒。YouTube/PDF 外部命令会按这个间隔刷新文件增长快照；Bilibili 会转发 `bbdown-core` 的关键 plan、download 和 mux 阶段。`bot.command_timeout_seconds` 是单个外部命令的总超时；direct Bilibili 下载不受这个总时限约束，而是把 `bot.command_idle_timeout_seconds` 作为媒体读取 idle timeout 传给 `bbdown-core`。Bilibili API 请求仍受独立的 request timeout 约束，bot 调用的 ffmpeg 等外部命令仍受总超时和 idle timeout 约束。
 
 ## 运行
 
