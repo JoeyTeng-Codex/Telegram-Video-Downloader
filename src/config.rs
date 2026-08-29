@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
     pub telegram: TelegramConfig,
     #[serde(default)]
@@ -23,7 +23,7 @@ pub struct AppConfig {
     project_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TelegramConfig {
     pub token: String,
     #[serde(default)]
@@ -32,7 +32,7 @@ pub struct TelegramConfig {
     pub allow_all_chats: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DownloadsConfig {
     #[serde(default = "default_video_dir")]
     pub video_dir: PathBuf,
@@ -40,7 +40,7 @@ pub struct DownloadsConfig {
     pub pdf_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ToolsConfig {
     #[serde(default = "default_bbdown")]
     pub bbdown: PathBuf,
@@ -56,13 +56,13 @@ pub struct ToolsConfig {
     pub ffmpeg: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PdfConfig {
     #[serde(default = "default_auto_pdf_domains")]
     pub auto_domains: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VideoConfig {
     #[serde(default = "default_subtitle_languages")]
     pub subtitle_languages: Vec<String>,
@@ -72,7 +72,7 @@ pub struct VideoConfig {
     pub keep_sidecars: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BilibiliConfig {
     #[serde(default)]
     pub extra_args: Vec<String>,
@@ -99,13 +99,13 @@ pub struct BilibiliConfig {
     pub auth: BilibiliAuthConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BilibiliDanmakuConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BilibiliAuthConfig {
     #[serde(default = "default_bilibili_auth_state_path")]
     pub state_path: PathBuf,
@@ -119,7 +119,7 @@ pub struct BilibiliAuthConfig {
     pub poll_interval_seconds: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BotConfig {
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,

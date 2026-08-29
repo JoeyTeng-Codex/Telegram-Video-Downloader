@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,7 +15,7 @@ pub enum JobRequest {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum BilibiliSelection {
     Latest,
     All,

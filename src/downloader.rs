@@ -3,9 +3,9 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::OnceLock;
@@ -28,7 +28,9 @@ use crate::bilibili_auth;
 use crate::bilibili_core;
 use crate::config::AppConfig;
 use crate::router::{BilibiliSelection, JobRequest};
-use crate::safe_fs::{BoundEntry, BoundFile, EntryIdentity, RootedFs, identity_for_open_file};
+use crate::safe_fs::{
+    BoundDirectory, BoundEntry, BoundFile, EntryIdentity, RootedFs, identity_for_open_file,
+};
 
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -38,6 +40,14 @@ const VIDEO_STAGING_INITIALIZING_DIR_PREFIX: &str = ".initializing-job-";
 const VIDEO_STAGING_OWNER_FILE_NAME: &str = ".owner.json";
 const VIDEO_STAGING_OWNER_VERSION: u32 = 1;
 const VIDEO_STAGING_OWNER_LIMIT: usize = 1024;
+const VIDEO_STAGING_PUBLICATION_MANIFEST_NAME: &str = ".publication.json";
+const VIDEO_STAGING_PUBLICATION_MANIFEST_VERSION: u32 = 1;
+const VIDEO_STAGING_PUBLICATION_MANIFEST_LIMIT: usize = 512 * 1024;
+const VIDEO_STAGING_PUBLICATION_MAX_STEPS: usize = 4096;
+const BILIBILI_WORKER_REQUEST_FILE_NAME: &str = ".bilibili-worker.json";
+const BILIBILI_WORKER_REQUEST_VERSION: u32 = 1;
+const BILIBILI_WORKER_REQUEST_LIMIT: usize = 1024 * 1024;
+const BILIBILI_STAGING_CONFIG_LIMIT: usize = 1024 * 1024;
 const VIDEO_OUTPUT_LOCK_FILE_NAME: &str = ".telegram-video-downloader.lock";
 const VIDEO_CONTROL_DIR_NAME: &str = ".telegram-video-downloader-control";
 const VIDEO_CONTROL_INITIALIZING_DIR_PREFIX: &str =
@@ -63,8 +73,9 @@ const OVERWRITE_BACKUP_DIR_PREFIX: &str = ".telegram-video-downloader-overwrite"
 const OVERWRITE_RECOVERY_MANIFEST_NAME: &str = ".transaction.json";
 const OVERWRITE_RECOVERY_MANIFEST_TEMP_NAME: &str = ".transaction.next.json";
 const OVERWRITE_COMMITTED_ANCHOR_PREFIX: &str = ".committed-output-";
-const OVERWRITE_RECOVERY_MANIFEST_VERSION: u32 = 3;
-const OVERWRITE_RECOVERY_LEGACY_MANIFEST_VERSION: u32 = 2;
+const OVERWRITE_RECOVERY_MANIFEST_VERSION: u32 = 4;
+const OVERWRITE_RECOVERY_LEGACY_MANIFEST_VERSION: u32 = 3;
+const OVERWRITE_RECOVERY_OLDEST_MANIFEST_VERSION: u32 = 2;
 const OVERWRITE_RECOVERY_MANIFEST_LIMIT: usize = 16 * 1024;
 const VIDEO_SIDECAR_EXTENSIONS: &[&str] = &[
     "nfo",
@@ -89,7 +100,7 @@ type CommandProcessGroup = Option<libc::pid_t>;
 #[cfg(not(unix))]
 type CommandProcessGroup = Option<()>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JobReport {
     pub saved_location: String,
     pub details: String,
@@ -102,6 +113,17 @@ pub struct JobProgress {
 
 pub type JobProgressSender = watch::Sender<Option<JobProgress>>;
 pub type JobProgressReceiver = watch::Receiver<Option<JobProgress>>;
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BilibiliWorkerRequest {
+    version: u32,
+    config: AppConfig,
+    url: String,
+    selection: Option<BilibiliSelection>,
+    expected_overwrite_identity: Option<VideoIdentity>,
+    logical_output_dir: PathBuf,
+}
 
 pub fn job_progress_channel() -> (JobProgressSender, JobProgressReceiver) {
     watch::channel(None)
@@ -174,13 +196,13 @@ impl VideoDuplicate {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 pub struct VideoIdentity {
     pub provider: VideoProvider,
     pub id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 pub enum VideoProvider {
     Bilibili,
     Youtube,
@@ -434,10 +456,9 @@ pub async fn run_job(
     progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
     match job {
-        JobRequest::Bilibili { url, selection } => {
-            run_bilibili_job(config, url, *selection, progress).await
+        JobRequest::Bilibili { .. } | JobRequest::Youtube { .. } => {
+            run_video_job_staged_keep_both(config, job, progress).await
         }
-        JobRequest::Youtube { url } => run_youtube_job(config, url, progress).await,
         JobRequest::Pdf { .. } => run_simple_job(config, job, progress).await,
     }
 }
@@ -468,7 +489,7 @@ pub async fn run_video_job_staged_keep_both(
     progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
     let Some(identity) = fallback_video_identity(job) else {
-        return run_job(config, job, progress).await;
+        return run_simple_job(config, job, progress).await;
     };
     let duplicate = VideoDuplicate {
         overwrite_confirmation: None,
@@ -754,25 +775,148 @@ async fn run_simple_job(
     })
 }
 
-async fn run_bilibili_job(
+async fn run_staged_bilibili_worker(
+    config: &AppConfig,
+    staging: &BoundStagingDir,
+    url: &str,
+    selection: Option<BilibiliSelection>,
+    expected_overwrite_identity: Option<&VideoIdentity>,
+    progress: Option<JobProgressSender>,
+) -> Result<JobReport> {
+    let request = build_bilibili_worker_request(
+        config,
+        url,
+        selection,
+        expected_overwrite_identity,
+        staging.path(),
+    );
+    let contents =
+        serde_json::to_vec(&request).context("failed to encode Bilibili worker request")?;
+    if contents.len() > BILIBILI_WORKER_REQUEST_LIMIT {
+        bail!("Bilibili worker request exceeds its size limit");
+    }
+    let request_path = staging.path().join(BILIBILI_WORKER_REQUEST_FILE_NAME);
+    let (_, request_identity) = staging
+        .root
+        .create_new_bound_file(&request_path, &contents, 0o600)
+        .context("failed to persist Bilibili worker request")?;
+    let request_file = staging
+        .root
+        .open_bound_file(&request_path)?
+        .context("Bilibili worker request disappeared")?;
+    if request_file.identity() != request_identity {
+        bail!("Bilibili worker request identity changed after creation");
+    }
+    request_file.validate_private_single_link(0o600)?;
+    let executable = std::env::current_exe().context("failed to resolve downloader executable")?;
+    let spec = CommandSpec {
+        program: executable,
+        args: vec!["--bilibili-worker".to_string()],
+        cwd: staging.path().to_path_buf(),
+        activity_dir: Some(staging.path().to_path_buf()),
+        cleanup_paths: Vec::new(),
+    };
+    let output = run_command_with_bound_cwd_and_inherited_files(
+        config,
+        &spec,
+        &staging.directory,
+        std::slice::from_ref(&request_file),
+        progress,
+    )
+    .await?;
+    staging.validate_for_path_access()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        bail!(
+            "Bilibili worker exited with status {}\n{}",
+            output.status,
+            summarize_output(&stdout, &stderr)
+        );
+    }
+    let report = last_nonempty_line(&stdout).context("Bilibili worker returned no report")?;
+    serde_json::from_str(report).context("failed to parse Bilibili worker report")
+}
+
+fn build_bilibili_worker_request(
     config: &AppConfig,
     url: &str,
     selection: Option<BilibiliSelection>,
-    progress: Option<JobProgressSender>,
-) -> Result<JobReport> {
-    let guard = video_output_lock(
-        &config.downloads.video_dir,
-        "Bilibili download",
-        progress.as_ref(),
-    )
-    .await?;
-    guard.begin_operation();
-    let root = guard.root().clone();
-    let result = run_bilibili_job_locked(config, &root, url, selection, None, progress).await;
-    if result.is_ok() {
-        guard.mark_operation_clean();
+    expected_overwrite_identity: Option<&VideoIdentity>,
+    logical_output_dir: &Path,
+) -> BilibiliWorkerRequest {
+    let mut worker_config = config.clone();
+    worker_config.telegram.token = "redacted-worker-token".to_string();
+    worker_config.telegram.allowed_chat_ids.clear();
+    worker_config.telegram.allow_all_chats = true;
+    worker_config.downloads.video_dir = PathBuf::from(".");
+    worker_config.downloads.pdf_dir = PathBuf::from(".");
+    BilibiliWorkerRequest {
+        version: BILIBILI_WORKER_REQUEST_VERSION,
+        config: worker_config,
+        url: url.to_string(),
+        selection,
+        expected_overwrite_identity: expected_overwrite_identity.cloned(),
+        logical_output_dir: logical_output_dir.to_path_buf(),
     }
-    result
+}
+
+#[cfg(unix)]
+pub async fn run_bilibili_worker() -> Result<()> {
+    let request_fd = unsafe { OwnedFd::from_raw_fd(BILIBILI_MUX_FD_BASE) };
+    let mut reader = std::fs::File::from(request_fd)
+        .take((BILIBILI_WORKER_REQUEST_LIMIT as u64).saturating_add(1));
+    let mut contents = Vec::new();
+    reader
+        .read_to_end(&mut contents)
+        .context("failed to read inherited Bilibili worker request")?;
+    if contents.len() > BILIBILI_WORKER_REQUEST_LIMIT {
+        bail!("inherited Bilibili worker request exceeds its size limit");
+    }
+    let request: BilibiliWorkerRequest =
+        serde_json::from_slice(&contents).context("failed to parse Bilibili worker request")?;
+    if request.version != BILIBILI_WORKER_REQUEST_VERSION
+        || request.config.downloads.video_dir != Path::new(".")
+    {
+        bail!("invalid Bilibili worker request");
+    }
+    let root = RootedFs::new(Path::new("."))?;
+    let (progress, mut progress_receiver) = job_progress_channel();
+    let progress_writer = tokio::spawn(async move {
+        while progress_receiver.changed().await.is_ok() {
+            let current = progress_receiver.borrow_and_update().clone();
+            if let Some(current) = current {
+                println!("{}", current.message);
+                let _ = std::io::stdout().flush();
+            }
+        }
+    });
+    let result = run_bilibili_job_locked(
+        &request.config,
+        &root,
+        &request.url,
+        request.selection,
+        request.expected_overwrite_identity.as_ref(),
+        Some(&request.logical_output_dir),
+        Some(progress),
+    )
+    .await;
+    progress_writer
+        .await
+        .context("failed to join Bilibili worker progress writer")?;
+    let report = result?;
+    println!(
+        "{}",
+        serde_json::to_string(&report).context("failed to encode Bilibili worker report")?
+    );
+    std::io::stdout()
+        .flush()
+        .context("failed to flush Bilibili worker report")
+}
+
+#[cfg(not(unix))]
+pub async fn run_bilibili_worker() -> Result<()> {
+    bail!("Bilibili worker requires a Unix platform")
 }
 
 async fn run_bilibili_job_locked(
@@ -781,6 +925,7 @@ async fn run_bilibili_job_locked(
     url: &str,
     selection: Option<BilibiliSelection>,
     expected_overwrite_identity: Option<&VideoIdentity>,
+    logical_output_dir: Option<&Path>,
     progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
     sync_bilibili_rust_credentials(config).await?;
@@ -823,6 +968,7 @@ async fn run_bilibili_job_locked(
     }
     cleanup_bilibili_mux_input_files(root, &output_dir, &report)?;
     let primary_videos = bilibili_report_primary_media(&output_dir, &report);
+    let reported_output_dir = logical_output_dir.unwrap_or(output_dir.as_path());
     let mut details = vec![format!(
         "BBDown-rust crate: {} entr{}",
         report.entries.len(),
@@ -838,22 +984,33 @@ async fn run_bilibili_job_locked(
     if config.video.write_nfo {
         match write_bilibili_nfos(&output_dir, url, &plan, &report) {
             Ok(created_nfos) if !created_nfos.is_empty() => {
-                details.push(format!("NFO: {}", join_paths(&created_nfos)));
+                let reported_nfos = created_nfos
+                    .iter()
+                    .map(|path| rebase_download_path(path, &output_dir, reported_output_dir))
+                    .collect::<Vec<_>>();
+                details.push(format!("NFO: {}", join_paths(&reported_nfos)));
             }
             Ok(_) => {}
             Err(err) => details.push(format!("NFO skipped: {err}")),
         }
     }
+    let reported_primary_videos = primary_videos
+        .iter()
+        .map(|path| rebase_download_path(path, &output_dir, reported_output_dir))
+        .collect::<Vec<_>>();
+    let fallback_output = rebase_download_path(
+        &resolve_command_output_path(&output_dir, &report.output_dir),
+        &output_dir,
+        reported_output_dir,
+    );
 
     Ok(JobReport {
-        saved_location: if primary_videos.is_empty() {
-            resolve_command_output_path(&output_dir, &report.output_dir)
-                .display()
-                .to_string()
-        } else if primary_videos.len() == 1 {
-            primary_videos[0].display().to_string()
+        saved_location: if reported_primary_videos.is_empty() {
+            fallback_output.display().to_string()
+        } else if reported_primary_videos.len() == 1 {
+            reported_primary_videos[0].display().to_string()
         } else {
-            join_paths(&primary_videos)
+            join_paths(&reported_primary_videos)
         },
         details: nonempty_join(details),
     })
@@ -950,6 +1107,16 @@ fn bilibili_report_primary_media(cwd: &Path, report: &BilibiliDownloadReport) ->
         }
     }
     media
+}
+
+fn rebase_download_path(path: &Path, access_root: &Path, logical_root: &Path) -> PathBuf {
+    if let Ok(relative) = path.strip_prefix(access_root) {
+        logical_root.join(relative)
+    } else if path.is_relative() {
+        logical_root.join(path)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2999,36 +3166,15 @@ fn stem_without_unique_suffix(stem: &str) -> &str {
     }
 }
 
-async fn run_youtube_job(
-    config: &AppConfig,
-    url: &str,
-    progress: Option<JobProgressSender>,
-) -> Result<JobReport> {
-    let metadata = fetch_youtube_metadata(config, url, progress.clone()).await?;
-    let subtitle_plan = select_subtitles(&metadata, &config.video.subtitle_languages);
-    let guard = video_output_lock(
-        &config.downloads.video_dir,
-        "YouTube download",
-        progress.as_ref(),
-    )
-    .await?;
-    guard.begin_operation();
-    let result = run_youtube_job_locked(config, url, metadata, subtitle_plan, progress).await;
-    if result.is_ok() {
-        guard.mark_operation_clean();
-    }
-    result
-}
-
 async fn run_youtube_job_locked(
     config: &AppConfig,
     url: &str,
-    metadata: YoutubeMetadata,
     subtitle_plan: SubtitlePlan,
     progress: Option<JobProgressSender>,
+    bound_cwd: &BoundDirectory,
 ) -> Result<JobReport> {
     let spec = youtube_download_command_spec(config, url, &subtitle_plan);
-    let output = run_command(config, &spec, progress).await?;
+    let output = run_command_with_bound_cwd(config, &spec, bound_cwd, progress).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -3046,39 +3192,9 @@ async fn run_youtube_job_locked(
         .map(str::to_string)
         .unwrap_or_else(|| config.downloads.video_dir.display().to_string());
 
-    let mut details = vec![subtitle_plan.describe(), tail_lines(&stderr, 6)];
-    if config.video.write_nfo {
-        let video_path = Path::new(&saved_location);
-        if video_path.is_absolute() && video_path.is_file() && is_video_file(video_path) {
-            let title = metadata
-                .title
-                .as_deref()
-                .or_else(|| video_path.file_stem()?.to_str());
-            let source_url = metadata.webpage_url.as_deref().unwrap_or(url);
-            let studio = metadata.uploader.as_deref().or(metadata.channel.as_deref());
-            let premiered = metadata.upload_date.as_deref().and_then(format_yt_date);
-            match write_nfo_for_media(
-                video_path,
-                &MediaNfo {
-                    title,
-                    plot: metadata.description.as_deref(),
-                    unique_id_type: "youtube",
-                    unique_id: metadata.id.as_deref().unwrap_or(url),
-                    alternate_unique_ids: Vec::new(),
-                    source_url,
-                    studio,
-                    premiered: premiered.as_deref(),
-                },
-            ) {
-                Ok(nfo_path) => details.push(format!("NFO: {}", nfo_path.display())),
-                Err(err) => details.push(format!("NFO skipped: {err}")),
-            }
-        }
-    }
-
     Ok(JobReport {
         saved_location,
-        details: nonempty_join(details),
+        details: nonempty_join(vec![subtitle_plan.describe(), tail_lines(&stderr, 6)]),
     })
 }
 
@@ -3102,7 +3218,7 @@ async fn run_staged_video_job(
     let staging = create_video_staging_dir(&root)?;
     let staging_dir = staging.path().to_path_buf();
     staging.validate_for_path_access()?;
-    copy_bbdown_config_for_staging(&final_dir, &staging_dir)?;
+    copy_bbdown_config_for_staging(&root, &final_dir, &staging_dir)?;
     staging.validate_for_path_access()?;
     send_progress(
         progress.as_ref(),
@@ -3112,13 +3228,14 @@ async fn run_staged_video_job(
     let mut staging_config = config.clone();
     staging_config.downloads.video_dir = staging_dir.clone();
     preserve_bilibili_config_paths_for_staging(&mut staging_config, &final_dir);
+    let mut youtube_metadata = None;
     let result = match job {
         JobRequest::Bilibili { url, selection } => {
             let expected_identity =
                 matches!(action, VideoDuplicateAction::Overwrite).then_some(&duplicate.identity);
-            run_bilibili_job_locked(
+            run_staged_bilibili_worker(
                 &staging_config,
-                &root,
+                &staging,
                 url,
                 *selection,
                 expected_identity,
@@ -3127,27 +3244,33 @@ async fn run_staged_video_job(
             .await
         }
         JobRequest::Youtube { url } => {
-            let metadata = fetch_youtube_metadata(&staging_config, url, progress.clone()).await;
+            let metadata =
+                fetch_youtube_metadata(&staging_config, url, progress.clone(), &staging.directory)
+                    .await;
             match metadata {
                 Ok(metadata) => {
                     let subtitle_plan =
                         select_subtitles(&metadata, &staging_config.video.subtitle_languages);
-                    run_youtube_job_locked(
+                    let result = run_youtube_job_locked(
                         &staging_config,
                         url,
-                        metadata,
                         subtitle_plan,
                         progress.clone(),
+                        &staging.directory,
                     )
-                    .await
+                    .await;
+                    if result.is_ok() {
+                        youtube_metadata = Some((url.clone(), metadata));
+                    }
+                    result
                 }
                 Err(err) => Err(err),
             }
         }
-        JobRequest::Pdf { .. } => run_job(config, job, progress.clone()).await,
+        JobRequest::Pdf { .. } => run_simple_job(config, job, progress.clone()).await,
     };
 
-    let report = match result {
+    let mut report = match result {
         Ok(report) => report,
         Err(err) => return Err(err),
     };
@@ -3155,7 +3278,7 @@ async fn run_staged_video_job(
     staging
         .validate_for_path_access()
         .context("output root or staging directory changed during download")?;
-    let staged_files = collect_regular_files(&staging_dir)?
+    let mut staged_files = collect_regular_files(&staging_dir)?
         .into_iter()
         .filter(|path| !is_staging_support_file(&staging_dir, path))
         .collect::<Vec<_>>();
@@ -3181,6 +3304,26 @@ async fn run_staged_video_job(
         );
     }
 
+    if config.video.write_nfo
+        && let Some((url, metadata)) = youtube_metadata.as_ref()
+    {
+        let detail = if staged_media.len() == 1 {
+            match write_youtube_nfo_bound(&root, &staged_media[0], url, metadata) {
+                Ok(nfo_path) => {
+                    staged_files.push(nfo_path.clone());
+                    format!("NFO: {}", nfo_path.display())
+                }
+                Err(err) => format!("NFO skipped: {err}"),
+            }
+        } else {
+            format!(
+                "NFO skipped: expected one YouTube media file but found {}",
+                staged_media.len()
+            )
+        };
+        report.details = nonempty_join(vec![report.details, detail]);
+    }
+
     let preserved_existing_for_multiple_media =
         matches!(action, VideoDuplicateAction::Overwrite) && staged_media.len() > 1;
     if preserved_existing_for_multiple_media {
@@ -3193,9 +3336,13 @@ async fn run_staged_video_job(
         );
     }
 
+    let move_context = MoveExecutionContext {
+        root: &root,
+        staging: Some(&staging),
+    };
     let moved_files = if staged_media.is_empty() && artifact_only {
         move_staged_artifact_files_with_root(
-            &root,
+            move_context,
             &staging_dir,
             &final_dir,
             &staged_files,
@@ -3205,7 +3352,7 @@ async fn run_staged_video_job(
         )
     } else {
         move_staged_video_files_with_root(
-            &root,
+            move_context,
             &staging_dir,
             &final_dir,
             &staged_files,
@@ -3729,6 +3876,9 @@ fn command_path_arg(path: &Path) -> String {
 }
 
 fn command_progress_name(spec: &CommandSpec) -> String {
+    if spec.args.iter().any(|arg| arg == "--bilibili-worker") {
+        return "BBDown-rust".to_string();
+    }
     let command_name = spec
         .program
         .file_name()
@@ -3750,9 +3900,10 @@ async fn fetch_youtube_metadata(
     config: &AppConfig,
     url: &str,
     progress: Option<JobProgressSender>,
+    bound_cwd: &BoundDirectory,
 ) -> Result<YoutubeMetadata> {
     let spec = youtube_metadata_command_spec(config, url);
-    let output = run_command(config, &spec, progress).await?;
+    let output = run_command_with_bound_cwd(config, &spec, bound_cwd, progress).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -3878,6 +4029,35 @@ struct VideoStagingOwner {
     root_inode: u64,
     staging_device: u64,
     staging_inode: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagedPublicationManifest {
+    version: u32,
+    root_device: u64,
+    root_inode: u64,
+    staging_device: u64,
+    staging_inode: u64,
+    overwrite: Option<StagedPublicationOverwrite>,
+    steps: Vec<StagedPublicationStep>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagedPublicationOverwrite {
+    transaction_path: PathBuf,
+    transaction_device: u64,
+    transaction_inode: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagedPublicationStep {
+    source_path: PathBuf,
+    destination_path: PathBuf,
+    device: u64,
+    inode: u64,
 }
 
 #[derive(Debug)]
@@ -4329,6 +4509,36 @@ async fn run_command_with_inherited_files(
     inherited_files: &[BoundFile],
     progress: Option<JobProgressSender>,
 ) -> Result<CommandOutput> {
+    run_command_with_execution_context(config, spec, None, inherited_files, progress).await
+}
+
+async fn run_command_with_bound_cwd(
+    config: &AppConfig,
+    spec: &CommandSpec,
+    bound_cwd: &BoundDirectory,
+    progress: Option<JobProgressSender>,
+) -> Result<CommandOutput> {
+    run_command_with_bound_cwd_and_inherited_files(config, spec, bound_cwd, &[], progress).await
+}
+
+async fn run_command_with_bound_cwd_and_inherited_files(
+    config: &AppConfig,
+    spec: &CommandSpec,
+    bound_cwd: &BoundDirectory,
+    inherited_files: &[BoundFile],
+    progress: Option<JobProgressSender>,
+) -> Result<CommandOutput> {
+    run_command_with_execution_context(config, spec, Some(bound_cwd), inherited_files, progress)
+        .await
+}
+
+async fn run_command_with_execution_context(
+    config: &AppConfig,
+    spec: &CommandSpec,
+    bound_cwd: Option<&BoundDirectory>,
+    inherited_files: &[BoundFile],
+    progress: Option<JobProgressSender>,
+) -> Result<CommandOutput> {
     let _cleanup = CommandCleanup::new(spec.cleanup_paths.clone());
     let mut file_activity = match &spec.activity_dir {
         Some(activity_dir) => match FileActivityTracker::new(activity_dir).await {
@@ -4351,15 +4561,23 @@ async fn run_command_with_inherited_files(
 
     #[cfg(unix)]
     let inherited_fds = prepare_inherited_command_fds(inherited_files)?;
+    #[cfg(unix)]
+    let bound_cwd_fd = bound_cwd
+        .map(|directory| prepare_bound_command_cwd_fd(directory, inherited_files.len()))
+        .transpose()?;
     #[cfg(not(unix))]
-    if !inherited_files.is_empty() {
-        bail!("inherited command files require a Unix platform");
+    if !inherited_files.is_empty() || bound_cwd.is_some() {
+        bail!("inherited command files and bound working directories require a Unix platform");
     }
 
     let mut command = Command::new(&spec.program);
     command
         .args(&spec.args)
-        .current_dir(&spec.cwd)
+        .current_dir(if bound_cwd.is_some() {
+            Path::new("/")
+        } else {
+            &spec.cwd
+        })
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -4367,11 +4585,16 @@ async fn run_command_with_inherited_files(
     #[cfg(unix)]
     {
         command.process_group(0);
-        if !inherited_fds.is_empty() {
+        if bound_cwd_fd.is_some() || !inherited_fds.is_empty() {
             // The source descriptors are CLOEXEC duplicates above the target range. dup2 clears
             // CLOEXEC on each fixed child descriptor without allowing an argv pathname lookup.
             unsafe {
                 command.pre_exec(move || {
+                    if let Some(directory) = &bound_cwd_fd
+                        && libc::fchdir(directory.as_raw_fd()) == -1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
                     for (source, target) in &inherited_fds {
                         if libc::dup2(source.as_raw_fd(), *target) == -1 {
                             return Err(std::io::Error::last_os_error());
@@ -4481,11 +4704,30 @@ async fn run_command_with_inherited_files(
 
     let (stdout, stderr) =
         collect_stream_outputs(stdout_handle, stderr_handle, process_group).await;
+    if let Some(bound_cwd) = bound_cwd {
+        bound_cwd
+            .validate_identity()
+            .context("bound command working directory identity changed")?;
+    }
     Ok(CommandOutput {
         status,
         stdout,
         stderr,
     })
+}
+
+#[cfg(unix)]
+fn prepare_bound_command_cwd_fd(
+    directory: &BoundDirectory,
+    inherited_file_count: usize,
+) -> Result<OwnedFd> {
+    let inherited_file_count = i32::try_from(inherited_file_count)
+        .context("too many inherited command files for a bound working directory")?;
+    let minimum = BILIBILI_MUX_FD_BASE
+        .checked_add(inherited_file_count.saturating_mul(2))
+        .and_then(|descriptor| descriptor.checked_add(32))
+        .context("too many inherited command files for a bound working directory")?;
+    directory.duplicate_fd_cloexec_at_least(minimum)
 }
 
 #[cfg(unix)]
@@ -5995,9 +6237,11 @@ fn create_video_staging_dir(root: &RootedFs) -> Result<BoundStagingDir> {
                     };
                 }
                 let entry = validate_video_staging_directory(root, &candidate, identity)?;
+                let directory = root.open_bound_directory(&entry, identity)?;
                 return Ok(BoundStagingDir {
                     root: root.clone(),
                     entry,
+                    directory,
                     identity,
                     removed: false,
                 });
@@ -6011,25 +6255,35 @@ fn create_video_staging_dir(root: &RootedFs) -> Result<BoundStagingDir> {
     )
 }
 
-fn copy_bbdown_config_for_staging(final_dir: &Path, staging_dir: &Path) -> Result<()> {
+fn copy_bbdown_config_for_staging(
+    root: &RootedFs,
+    final_dir: &Path,
+    staging_dir: &Path,
+) -> Result<()> {
     let source = final_dir.join("BBDown.config");
-    if !source.is_file() {
+    let Some(source_file) = root.open_bound_file(&source)? else {
         return Ok(());
-    }
+    };
+    let contents = source_file
+        .read_limited(BILIBILI_STAGING_CONFIG_LIMIT)
+        .with_context(|| format!("failed to read {}", source.display()))?;
     let destination = staging_dir.join("BBDown.config");
-    fs::copy(&source, &destination).with_context(|| {
-        format!(
-            "failed to copy {} to {}",
-            source.display(),
-            destination.display()
-        )
-    })?;
+    root.create_new_bound_file(&destination, &contents, 0o600)
+        .with_context(|| {
+            format!(
+                "failed to copy {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
     Ok(())
 }
 
 fn is_staging_support_file(staging_dir: &Path, path: &Path) -> bool {
     path == staging_dir.join("BBDown.config")
         || path == staging_dir.join(VIDEO_STAGING_OWNER_FILE_NAME)
+        || path == staging_dir.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME)
+        || path == staging_dir.join(BILIBILI_WORKER_REQUEST_FILE_NAME)
 }
 
 fn validate_video_staging_directory(
@@ -6078,6 +6332,12 @@ struct VideoStagingRecoveryReport {
     unresolved: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagedPublicationDirection {
+    RollForward,
+    RollBack,
+}
+
 fn recover_pending_video_staging_directories_locked(
     root: &RootedFs,
 ) -> Result<VideoStagingRecoveryReport> {
@@ -6110,11 +6370,9 @@ fn recover_pending_video_staging_directories_locked(
             continue;
         }
         match validate_video_staging_directory(root, &path, identity) {
-            Ok(entry) => match root.remove_bound_tree_durably_if_identity(&entry, identity) {
-                Ok(()) => report.messages.push(format!(
-                    "Discarded interrupted staged video job: {}",
-                    path.display()
-                )),
+            Ok(entry) => match recover_owned_video_staging_directory(root, &path, &entry, identity)
+            {
+                Ok(message) => report.messages.push(message),
                 Err(err) => {
                     report.unresolved = true;
                     report.messages.push(format!(
@@ -6133,6 +6391,197 @@ fn recover_pending_video_staging_directories_locked(
         }
     }
     Ok(report)
+}
+
+fn recover_owned_video_staging_directory(
+    root: &RootedFs,
+    path: &Path,
+    entry: &BoundEntry,
+    identity: EntryIdentity,
+) -> Result<String> {
+    let manifest_path = path.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME);
+    let Some(manifest_file) = root.open_bound_file(&manifest_path)? else {
+        root.remove_bound_tree_durably_if_identity(entry, identity)?;
+        return Ok(format!(
+            "Discarded interrupted staged video job: {}",
+            path.display()
+        ));
+    };
+    manifest_file.validate_private_single_link(0o600)?;
+    let manifest: StagedPublicationManifest = serde_json::from_slice(
+        &manifest_file.read_limited(VIDEO_STAGING_PUBLICATION_MANIFEST_LIMIT)?,
+    )
+    .context("failed to parse staged publication manifest")?;
+    validate_staged_publication_manifest(root, path, identity, &manifest)?;
+    let direction = staged_publication_direction(root, manifest.overwrite.as_ref())?;
+    match direction {
+        StagedPublicationDirection::RollForward => {
+            for step in &manifest.steps {
+                recover_staged_publication_step(root, step, direction)?;
+            }
+        }
+        StagedPublicationDirection::RollBack => {
+            for step in manifest.steps.iter().rev() {
+                recover_staged_publication_step(root, step, direction)?;
+            }
+        }
+    }
+    validate_video_staging_directory(root, path, identity)?;
+    root.remove_bound_tree_durably_if_identity(entry, identity)?;
+    let action = match direction {
+        StagedPublicationDirection::RollForward => "Rolled forward",
+        StagedPublicationDirection::RollBack => "Rolled back",
+    };
+    Ok(format!(
+        "{action} interrupted staged video publication: {}",
+        path.display()
+    ))
+}
+
+fn validate_staged_publication_manifest(
+    root: &RootedFs,
+    staging_path: &Path,
+    staging_identity: EntryIdentity,
+    manifest: &StagedPublicationManifest,
+) -> Result<()> {
+    if manifest.version != VIDEO_STAGING_PUBLICATION_MANIFEST_VERSION
+        || manifest.root_device != root.root_identity().device()
+        || manifest.root_inode != root.root_identity().inode()
+        || manifest.staging_device != staging_identity.device()
+        || manifest.staging_inode != staging_identity.inode()
+        || manifest.steps.is_empty()
+        || manifest.steps.len() > VIDEO_STAGING_PUBLICATION_MAX_STEPS
+    {
+        bail!("staged publication manifest does not match the owned staging directory");
+    }
+    let mut sources = BTreeSet::new();
+    let mut destinations = BTreeSet::new();
+    for step in &manifest.steps {
+        validate_relative_publication_path(&step.source_path)?;
+        validate_relative_publication_path(&step.destination_path)?;
+        let source = root.logical_root_path().join(&step.source_path);
+        let destination = root.logical_root_path().join(&step.destination_path);
+        let staged_relative = source.strip_prefix(staging_path).with_context(|| {
+            format!(
+                "staged publication source is outside the owned job directory: {}",
+                source.display()
+            )
+        })?;
+        validate_relative_publication_path(staged_relative)?;
+        if destination.starts_with(staging_path)
+            || !sources.insert(step.source_path.clone())
+            || !destinations.insert(step.destination_path.clone())
+        {
+            bail!("staged publication manifest contains conflicting paths");
+        }
+    }
+    if let Some(overwrite) = &manifest.overwrite {
+        validate_relative_publication_path(&overwrite.transaction_path)?;
+    }
+    Ok(())
+}
+
+fn staged_publication_direction(
+    root: &RootedFs,
+    overwrite: Option<&StagedPublicationOverwrite>,
+) -> Result<StagedPublicationDirection> {
+    let Some(overwrite) = overwrite else {
+        return Ok(StagedPublicationDirection::RollForward);
+    };
+    let transaction = root.logical_root_path().join(&overwrite.transaction_path);
+    let Some(transaction_identity) = root.entry_identity(&transaction)? else {
+        return Ok(StagedPublicationDirection::RollForward);
+    };
+    if !transaction_identity.is_dir()
+        || transaction_identity.device() != overwrite.transaction_device
+        || transaction_identity.inode() != overwrite.transaction_inode
+    {
+        bail!("staged publication overwrite transaction identity changed");
+    }
+    let transaction_entry = root.bind_entry(&transaction, false)?;
+    root.validate_private_bound_directory(&transaction_entry, transaction_identity, 0o700)?;
+    let manifest_path = transaction.join(OVERWRITE_RECOVERY_MANIFEST_NAME);
+    let manifest_file = root
+        .open_bound_file(&manifest_path)?
+        .context("staged publication overwrite transaction has no recovery manifest")?;
+    manifest_file.validate_private_single_link(0o600)?;
+    let manifest: OverwriteRecoveryManifest =
+        serde_json::from_slice(&manifest_file.read_limited(OVERWRITE_RECOVERY_MANIFEST_LIMIT)?)
+            .context("failed to parse staged publication overwrite transaction")?;
+    if manifest.version != OVERWRITE_RECOVERY_MANIFEST_VERSION {
+        bail!("staged publication overwrite transaction has no ownership binding");
+    }
+    validate_overwrite_recovery_ownership(root, &transaction, transaction_identity, &manifest)?;
+    Ok(match manifest.phase {
+        OverwriteRecoveryPhase::Acquired => StagedPublicationDirection::RollBack,
+        OverwriteRecoveryPhase::Committed => StagedPublicationDirection::RollForward,
+    })
+}
+
+fn recover_staged_publication_step(
+    root: &RootedFs,
+    step: &StagedPublicationStep,
+    direction: StagedPublicationDirection,
+) -> Result<()> {
+    let source = root.logical_root_path().join(&step.source_path);
+    let destination = root.logical_root_path().join(&step.destination_path);
+    let (from, to) = match direction {
+        StagedPublicationDirection::RollForward => (&source, &destination),
+        StagedPublicationDirection::RollBack => (&destination, &source),
+    };
+    let from_identity = publication_step_identity(root, from, step)?;
+    let to_identity = publication_step_identity(root, to, step)?;
+    let identity = match (from_identity, to_identity) {
+        (Some(identity), None) => {
+            let from_entry = root.bind_entry(from, false)?;
+            let to_entry = root.bind_entry(to, true)?;
+            root.rename_via_bound_parents_noreplace_if_identity(&from_entry, &to_entry, identity)?;
+            identity
+        }
+        (None, Some(identity)) => identity,
+        (Some(_), Some(_)) => bail!(
+            "staged publication object exists at both recovery paths: {} and {}",
+            from.display(),
+            to.display()
+        ),
+        (None, None) => bail!(
+            "staged publication object is missing from both recovery paths: {} and {}",
+            from.display(),
+            to.display()
+        ),
+    };
+    let file = root
+        .open_bound_file(to)?
+        .with_context(|| format!("recovered publication file is missing: {}", to.display()))?;
+    if file.identity() != identity {
+        bail!(
+            "recovered publication file identity changed: {}",
+            to.display()
+        );
+    }
+    file.sync_all().with_context(|| {
+        format!(
+            "failed to persist recovered publication file {}",
+            to.display()
+        )
+    })
+}
+
+fn publication_step_identity(
+    root: &RootedFs,
+    path: &Path,
+    step: &StagedPublicationStep,
+) -> Result<Option<EntryIdentity>> {
+    let Some(identity) = root.entry_identity(path)? else {
+        return Ok(None);
+    };
+    if !identity.is_file() || identity.device() != step.device || identity.inode() != step.inode {
+        bail!(
+            "staged publication path contains an unexpected object: {}",
+            path.display()
+        );
+    }
+    Ok(Some(identity))
 }
 
 fn collect_regular_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -6165,6 +6614,13 @@ fn collect_regular_files_recursive(path: &Path, files: &mut Vec<PathBuf>) -> Res
 struct MoveStep {
     source: PathBuf,
     destination: PathBuf,
+    expected_identity: Option<EntryIdentity>,
+}
+
+#[derive(Clone, Copy)]
+struct MoveExecutionContext<'a> {
+    root: &'a RootedFs,
+    staging: Option<&'a BoundStagingDir>,
 }
 
 #[derive(Debug)]
@@ -6195,6 +6651,18 @@ struct FileBackup {
 #[serde(deny_unknown_fields)]
 struct OverwriteRecoveryManifest {
     version: u32,
+    #[serde(default)]
+    root_device: Option<u64>,
+    #[serde(default)]
+    root_inode: Option<u64>,
+    #[serde(default)]
+    parent_device: Option<u64>,
+    #[serde(default)]
+    parent_inode: Option<u64>,
+    #[serde(default)]
+    transaction_device: Option<u64>,
+    #[serde(default)]
+    transaction_inode: Option<u64>,
     target_file_name: PathBuf,
     phase: OverwriteRecoveryPhase,
     committed_files: Vec<OverwriteCommittedFile>,
@@ -6315,6 +6783,7 @@ impl AcquiredOverwrite {
 struct BoundStagingDir {
     root: RootedFs,
     entry: BoundEntry,
+    directory: BoundDirectory,
     identity: EntryIdentity,
     removed: bool,
 }
@@ -6326,6 +6795,7 @@ impl BoundStagingDir {
 
     fn validate_for_path_access(&self) -> Result<()> {
         self.root.validate_configured_root()?;
+        self.directory.validate_identity()?;
         validate_video_staging_directory(&self.root, self.path(), self.identity).map(|_| ())
     }
 
@@ -6344,7 +6814,7 @@ impl Drop for BoundStagingDir {
         }
         if let Err(err) = self
             .root
-            .remove_bound_tree_if_identity(&self.entry, self.identity)
+            .remove_bound_tree_durably_if_identity(&self.entry, self.identity)
         {
             info!(
                 path = %self.entry.path().display(),
@@ -6353,6 +6823,135 @@ impl Drop for BoundStagingDir {
             );
         }
     }
+}
+
+fn prepare_staged_publication(
+    root: &RootedFs,
+    staging: &BoundStagingDir,
+    plan: &mut [MoveStep],
+    overwrite: Option<&AcquiredOverwrite>,
+) -> Result<()> {
+    if plan.is_empty() || plan.len() > VIDEO_STAGING_PUBLICATION_MAX_STEPS {
+        bail!("staged publication has an invalid number of move steps");
+    }
+    staging.validate_for_path_access()?;
+    let mut sources = BTreeSet::new();
+    let mut destinations = BTreeSet::new();
+    let mut records = Vec::with_capacity(plan.len());
+    for step in plan {
+        let source_relative = publication_relative_path(root, &step.source)?;
+        let destination_relative = publication_relative_path(root, &step.destination)?;
+        let staged_relative = step.source.strip_prefix(staging.path()).with_context(|| {
+            format!(
+                "staged publication source is outside its owned job directory: {}",
+                step.source.display()
+            )
+        })?;
+        validate_relative_publication_path(staged_relative)?;
+        if step.destination.starts_with(staging.path()) {
+            bail!(
+                "staged publication destination remains inside staging: {}",
+                step.destination.display()
+            );
+        }
+        if !sources.insert(source_relative.clone())
+            || !destinations.insert(destination_relative.clone())
+        {
+            bail!("staged publication repeats a source or destination path");
+        }
+        if root.entry_identity(&step.destination)?.is_some() {
+            bail!(
+                "staged publication destination is already occupied: {}",
+                step.destination.display()
+            );
+        }
+        let source = root.open_bound_file(&step.source)?.with_context(|| {
+            format!(
+                "staged publication source is missing: {}",
+                step.source.display()
+            )
+        })?;
+        source.sync_all().with_context(|| {
+            format!(
+                "failed to persist staged publication source {}",
+                step.source.display()
+            )
+        })?;
+        let identity = source.identity();
+        step.expected_identity = Some(identity);
+        records.push(StagedPublicationStep {
+            source_path: source_relative,
+            destination_path: destination_relative,
+            device: identity.device(),
+            inode: identity.inode(),
+        });
+    }
+
+    let overwrite = overwrite
+        .map(|acquired| {
+            if acquired.root.root_identity() != root.root_identity() {
+                bail!("overwrite transaction belongs to a different output root");
+            }
+            Ok(StagedPublicationOverwrite {
+                transaction_path: publication_relative_path(root, &acquired.recovery.backup_dir)?,
+                transaction_device: acquired.recovery.backup_dir_identity.device(),
+                transaction_inode: acquired.recovery.backup_dir_identity.inode(),
+            })
+        })
+        .transpose()?;
+    let manifest = StagedPublicationManifest {
+        version: VIDEO_STAGING_PUBLICATION_MANIFEST_VERSION,
+        root_device: root.root_identity().device(),
+        root_inode: root.root_identity().inode(),
+        staging_device: staging.identity.device(),
+        staging_inode: staging.identity.inode(),
+        overwrite,
+        steps: records,
+    };
+    let contents = serde_json::to_vec_pretty(&manifest)
+        .context("failed to encode staged publication manifest")?;
+    if contents.len() > VIDEO_STAGING_PUBLICATION_MANIFEST_LIMIT {
+        bail!("staged publication manifest exceeds its size limit");
+    }
+    let manifest_path = staging.path().join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME);
+    let (_, identity) = root
+        .create_new_bound_file(&manifest_path, &contents, 0o600)
+        .context("failed to persist staged publication manifest")?;
+    let file = root
+        .open_bound_file(&manifest_path)?
+        .context("staged publication manifest disappeared")?;
+    if file.identity() != identity {
+        bail!("staged publication manifest identity changed after creation");
+    }
+    file.validate_private_single_link(0o600)?;
+    staging.validate_for_path_access()
+}
+
+fn publication_relative_path(root: &RootedFs, path: &Path) -> Result<PathBuf> {
+    let relative = path
+        .strip_prefix(root.logical_root_path())
+        .with_context(|| {
+            format!(
+                "publication path is outside the output root: {}",
+                path.display()
+            )
+        })?;
+    validate_relative_publication_path(relative)?;
+    Ok(relative.to_path_buf())
+}
+
+fn validate_relative_publication_path(path: &Path) -> Result<()> {
+    let mut count = 0;
+    for component in path.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            bail!("publication manifest contains an invalid relative path");
+        }
+        count += 1;
+    }
+    if count == 0 {
+        bail!("publication manifest contains an empty relative path");
+    }
+    Ok(())
 }
 
 fn acquire_and_validate_overwrite_target(
@@ -6393,7 +6992,7 @@ fn acquire_and_validate_overwrite_target(
     let (backup_dir, backup_dir_entry, backup_dir_identity) =
         create_overwrite_backup_dir(root, backup_parent)?;
     let (manifest_path, manifest_entry, manifest_identity) =
-        match create_overwrite_recovery_manifest(root, &backup_dir, &target) {
+        match create_overwrite_recovery_manifest(root, &backup_dir, backup_dir_identity, &target) {
             Ok(manifest) => manifest,
             Err(err) => {
                 let cleanup =
@@ -6479,6 +7078,7 @@ fn create_overwrite_backup_dir(
 fn create_overwrite_recovery_manifest(
     root: &RootedFs,
     backup_dir: &Path,
+    backup_dir_identity: EntryIdentity,
     target: &Path,
 ) -> Result<(PathBuf, BoundEntry, EntryIdentity)> {
     if target.parent() != backup_dir.parent() {
@@ -6492,12 +7092,14 @@ fn create_overwrite_recovery_manifest(
             .file_name()
             .context("overwrite target has no file name")?,
     );
-    let manifest = OverwriteRecoveryManifest {
-        version: OVERWRITE_RECOVERY_MANIFEST_VERSION,
+    let manifest = overwrite_recovery_manifest(
+        root,
+        backup_dir,
+        backup_dir_identity,
         target_file_name,
-        phase: OverwriteRecoveryPhase::Acquired,
-        committed_files: Vec::new(),
-    };
+        OverwriteRecoveryPhase::Acquired,
+        Vec::new(),
+    )?;
     let contents = serde_json::to_vec_pretty(&manifest)
         .context("failed to encode overwrite recovery manifest")?;
     let manifest_path = backup_dir.join(OVERWRITE_RECOVERY_MANIFEST_NAME);
@@ -6510,6 +7112,69 @@ fn create_overwrite_recovery_manifest(
             )
         })?;
     Ok((manifest_path, manifest_entry, manifest_identity))
+}
+
+fn overwrite_recovery_manifest(
+    root: &RootedFs,
+    backup_dir: &Path,
+    backup_dir_identity: EntryIdentity,
+    target_file_name: PathBuf,
+    phase: OverwriteRecoveryPhase,
+    committed_files: Vec<OverwriteCommittedFile>,
+) -> Result<OverwriteRecoveryManifest> {
+    let backup_entry = root.bind_entry(backup_dir, false)?;
+    root.validate_private_bound_directory(&backup_entry, backup_dir_identity, 0o700)?;
+    let parent = backup_dir
+        .parent()
+        .context("overwrite transaction has no parent")?;
+    let parent_identity = output_directory_identity(root, parent)?;
+    if !parent_identity.is_dir() {
+        bail!("overwrite transaction parent is not a directory");
+    }
+    Ok(OverwriteRecoveryManifest {
+        version: OVERWRITE_RECOVERY_MANIFEST_VERSION,
+        root_device: Some(root.root_identity().device()),
+        root_inode: Some(root.root_identity().inode()),
+        parent_device: Some(parent_identity.device()),
+        parent_inode: Some(parent_identity.inode()),
+        transaction_device: Some(backup_dir_identity.device()),
+        transaction_inode: Some(backup_dir_identity.inode()),
+        target_file_name,
+        phase,
+        committed_files,
+    })
+}
+
+fn validate_overwrite_recovery_ownership(
+    root: &RootedFs,
+    backup_dir: &Path,
+    backup_dir_identity: EntryIdentity,
+    manifest: &OverwriteRecoveryManifest,
+) -> Result<()> {
+    let parent = backup_dir
+        .parent()
+        .context("overwrite transaction has no parent")?;
+    let parent_identity = output_directory_identity(root, parent)?;
+    if !parent_identity.is_dir()
+        || manifest.root_device != Some(root.root_identity().device())
+        || manifest.root_inode != Some(root.root_identity().inode())
+        || manifest.parent_device != Some(parent_identity.device())
+        || manifest.parent_inode != Some(parent_identity.inode())
+        || manifest.transaction_device != Some(backup_dir_identity.device())
+        || manifest.transaction_inode != Some(backup_dir_identity.inode())
+    {
+        bail!("overwrite recovery ownership record does not match the bound output tree");
+    }
+    let entry = root.bind_entry(backup_dir, false)?;
+    root.validate_private_bound_directory(&entry, backup_dir_identity, 0o700)
+}
+
+fn output_directory_identity(root: &RootedFs, path: &Path) -> Result<EntryIdentity> {
+    if path == root.logical_root_path() {
+        return Ok(root.root_identity());
+    }
+    root.entry_identity(path)?
+        .context("output transaction parent is missing")
 }
 
 fn persist_committed_overwrite_manifest(
@@ -6586,12 +7251,14 @@ fn persist_committed_overwrite_manifest(
     }
     let (committed_files, anchors) =
         create_committed_output_anchors(acquired, transaction_parent, &identities)?;
-    let manifest = OverwriteRecoveryManifest {
-        version: OVERWRITE_RECOVERY_MANIFEST_VERSION,
+    let manifest = overwrite_recovery_manifest(
+        &acquired.root,
+        &acquired.recovery.backup_dir,
+        acquired.recovery.backup_dir_identity,
         target_file_name,
-        phase: OverwriteRecoveryPhase::Committed,
+        OverwriteRecoveryPhase::Committed,
         committed_files,
-    };
+    )?;
     let contents = serde_json::to_vec_pretty(&manifest)
         .context("failed to encode committed overwrite recovery manifest")?;
     let temp_path = acquired
@@ -6939,7 +7606,10 @@ fn move_staged_video_files(
     let root = RootedFs::new(final_dir)?;
     let duplicate = bind_test_overwrite_confirmation(&root, action, duplicate)?;
     move_staged_video_files_with_root(
-        &root,
+        MoveExecutionContext {
+            root: &root,
+            staging: None,
+        },
         staging_dir,
         final_dir,
         staged_files,
@@ -6950,7 +7620,7 @@ fn move_staged_video_files(
 }
 
 fn move_staged_video_files_with_root(
-    root: &RootedFs,
+    context: MoveExecutionContext<'_>,
     staging_dir: &Path,
     final_dir: &Path,
     staged_files: &[PathBuf],
@@ -6958,6 +7628,7 @@ fn move_staged_video_files_with_root(
     duplicate: &VideoDuplicate,
     primary_media_kind: StagedPrimaryMediaKind,
 ) -> Result<Vec<PathBuf>> {
+    let root = context.root;
     let staged_media_count = staged_files
         .iter()
         .filter(|path| is_primary_media_file(path, primary_media_kind))
@@ -6983,12 +7654,13 @@ fn move_staged_video_files_with_root(
     let overwrite_target = acquisition.as_ref().map(AcquiredOverwrite::target);
 
     let move_result = move_staged_video_files_inner(
-        root,
+        context,
         staging_dir,
         final_dir,
         staged_files,
         overwrite_target,
         primary_media_kind,
+        acquisition.as_ref(),
     );
     match move_result {
         Ok(moved) => {
@@ -7011,20 +7683,25 @@ fn move_staged_video_files_with_root(
 }
 
 fn move_staged_video_files_inner(
-    root: &RootedFs,
+    context: MoveExecutionContext<'_>,
     staging_dir: &Path,
     final_dir: &Path,
     staged_files: &[PathBuf],
     overwrite_target: Option<&Path>,
     primary_media_kind: StagedPrimaryMediaKind,
+    acquisition: Option<&AcquiredOverwrite>,
 ) -> Result<MovePlanResult> {
-    let plan = staged_move_plan(
+    let root = context.root;
+    let mut plan = staged_move_plan(
         staging_dir,
         final_dir,
         staged_files,
         overwrite_target,
         primary_media_kind,
     )?;
+    if let Some(staging) = context.staging {
+        prepare_staged_publication(root, staging, &mut plan, acquisition)?;
+    }
     execute_move_plan(root, plan, primary_media_kind)
 }
 
@@ -7040,7 +7717,10 @@ fn move_staged_artifact_files(
     let root = RootedFs::new(final_dir)?;
     let duplicate = bind_test_overwrite_confirmation(&root, action, duplicate)?;
     move_staged_artifact_files_with_root(
-        &root,
+        MoveExecutionContext {
+            root: &root,
+            staging: None,
+        },
         staging_dir,
         final_dir,
         staged_files,
@@ -7051,7 +7731,7 @@ fn move_staged_artifact_files(
 }
 
 fn move_staged_artifact_files_with_root(
-    root: &RootedFs,
+    context: MoveExecutionContext<'_>,
     staging_dir: &Path,
     final_dir: &Path,
     staged_files: &[PathBuf],
@@ -7059,6 +7739,7 @@ fn move_staged_artifact_files_with_root(
     duplicate: &VideoDuplicate,
     primary_media_kind: StagedPrimaryMediaKind,
 ) -> Result<Vec<PathBuf>> {
+    let root = context.root;
     let mut acquisition = if matches!(action, VideoDuplicateAction::Overwrite) {
         Some(acquire_and_validate_overwrite_target(
             root,
@@ -7071,7 +7752,7 @@ fn move_staged_artifact_files_with_root(
     let overwrite_target = acquisition.as_ref().map(AcquiredOverwrite::target);
     let plan_result =
         staged_artifact_move_plan(staging_dir, final_dir, staged_files, overwrite_target);
-    let plan = match plan_result {
+    let mut plan = match plan_result {
         Ok(plan) => plan,
         Err(err) => {
             return Err(match acquisition {
@@ -7080,6 +7761,14 @@ fn move_staged_artifact_files_with_root(
             });
         }
     };
+    if let Some(staging) = context.staging
+        && let Err(err) = prepare_staged_publication(root, staging, &mut plan, acquisition.as_ref())
+    {
+        return Err(match acquisition {
+            Some(acquired) => rollback_acquired_overwrite(err, acquired),
+            None => err,
+        });
+    }
     let replaced_destinations = plan
         .iter()
         .map(|step| step.destination.clone())
@@ -7133,6 +7822,7 @@ fn staged_artifact_move_plan(
         steps.push(MoveStep {
             source: source.clone(),
             destination,
+            expected_identity: None,
         });
     }
     Ok(steps)
@@ -7268,6 +7958,7 @@ fn staged_move_plan(
         steps.push(MoveStep {
             source: source.clone(),
             destination,
+            expected_identity: None,
         });
     }
 
@@ -7489,6 +8180,15 @@ fn move_step_with_bound_parents(root: &RootedFs, step: MoveStep) -> Result<Moved
             step.source.display()
         );
     }
+    if step
+        .expected_identity
+        .is_some_and(|expected| expected != identity)
+    {
+        bail!(
+            "move source identity changed after publication planning: {}",
+            step.source.display()
+        );
+    }
     root.validate_configured_root()?;
     root.rename_via_bound_parents_noreplace_if_identity(
         &source_entry,
@@ -7508,6 +8208,29 @@ fn move_step_with_bound_parents(root: &RootedFs, step: MoveStep) -> Result<Moved
         return Err(with_move_rollback_error(
             root,
             err.context("failed to validate moved destination through the configured output root"),
+            std::slice::from_ref(&moved),
+        ));
+    }
+    let destination = root
+        .open_bound_file(&moved.destination)?
+        .context("moved destination disappeared before durability validation")?;
+    if destination.identity() != identity {
+        return Err(with_move_rollback_error(
+            root,
+            anyhow!(
+                "moved destination identity changed before durability validation: {}",
+                moved.destination.display()
+            ),
+            std::slice::from_ref(&moved),
+        ));
+    }
+    if let Err(err) = destination.sync_all() {
+        return Err(with_move_rollback_error(
+            root,
+            err.context(format!(
+                "failed to persist moved destination {}",
+                moved.destination.display()
+            )),
             std::slice::from_ref(&moved),
         ));
     }
@@ -7957,16 +8680,20 @@ pub fn recover_pending_overwrite_transactions(video_dir: &Path) -> Result<Vec<St
         .context("failed to serialize overwrite recovery with active downloads")?;
     let (mut recovery_state, _) = video_recovery_state_file(&root)?;
     let quarantine_recovery = root.reconcile_remove_quarantines_with_status()?;
+    let staging_recovery = recover_pending_video_staging_directories_locked(&root)?;
     let mux_recovery = recover_pending_bilibili_mux_transactions_locked(&root, video_dir)?;
     let overwrite_recovery = recover_pending_overwrite_transactions_locked(&root, video_dir)?;
-    let unresolved =
-        quarantine_recovery.unresolved || mux_recovery.unresolved || overwrite_recovery.unresolved;
+    let unresolved = quarantine_recovery.unresolved
+        || staging_recovery.unresolved
+        || mux_recovery.unresolved
+        || overwrite_recovery.unresolved;
     recovery_state.write_state(if unresolved {
         VIDEO_RECOVERY_STATE_DIRTY
     } else {
         VIDEO_RECOVERY_STATE_CLEAN
     })?;
     let mut messages = quarantine_recovery.messages;
+    messages.extend(staging_recovery.messages);
     messages.extend(mux_recovery.messages);
     messages.extend(overwrite_recovery.messages);
     Ok(messages)
@@ -8107,6 +8834,7 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
             directory.display()
         );
     }
+    root.validate_private_bound_directory(&directory_entry, directory_identity, 0o700)?;
 
     let manifest_path = directory.join(OVERWRITE_RECOVERY_MANIFEST_NAME);
     let manifest_file = root.open_bound_file(&manifest_path)?.with_context(|| {
@@ -8115,6 +8843,7 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
             manifest_path.display()
         )
     })?;
+    manifest_file.validate_private_single_link(0o600)?;
     let manifest_identity = manifest_file.identity();
     let manifest_entry = root.bind_entry(&manifest_path, false)?;
     if root.bound_entry_identity(&manifest_entry)? != Some(manifest_identity) {
@@ -8133,7 +8862,9 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
             })?;
     if !matches!(
         manifest.version,
-        OVERWRITE_RECOVERY_LEGACY_MANIFEST_VERSION | OVERWRITE_RECOVERY_MANIFEST_VERSION
+        OVERWRITE_RECOVERY_OLDEST_MANIFEST_VERSION
+            | OVERWRITE_RECOVERY_LEGACY_MANIFEST_VERSION
+            | OVERWRITE_RECOVERY_MANIFEST_VERSION
     ) {
         bail!(
             "unsupported overwrite recovery manifest version {} in {}",
@@ -8141,28 +8872,29 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
             manifest_path.display()
         );
     }
+    if manifest.version != OVERWRITE_RECOVERY_MANIFEST_VERSION {
+        bail!(
+            "legacy overwrite recovery manifest version {} has no authenticated ownership binding",
+            manifest.version
+        );
+    }
+    validate_overwrite_recovery_ownership(root, directory, directory_identity, &manifest)?;
     let target_file_name = single_recovery_file_name(&manifest.target_file_name)?;
     let parent = directory
         .parent()
         .context("overwrite recovery directory has no parent")?;
     let target = parent.join(&target_file_name);
 
-    if manifest.version == OVERWRITE_RECOVERY_MANIFEST_VERSION {
-        remove_recovery_transition_temp(root, directory)?;
-    }
+    remove_recovery_transition_temp(root, directory)?;
     let entries = root
         .list_bound_directory(&directory_entry, directory_identity)?
         .into_iter()
         .filter(|(name, _)| name != std::ffi::OsStr::new(OVERWRITE_RECOVERY_MANIFEST_NAME))
         .collect::<Vec<_>>();
-    let (mut anchors, mut backups) = if manifest.version == OVERWRITE_RECOVERY_MANIFEST_VERSION {
-        entries.into_iter().partition::<Vec<_>, _>(|(name, _)| {
-            name.to_string_lossy()
-                .starts_with(OVERWRITE_COMMITTED_ANCHOR_PREFIX)
-        })
-    } else {
-        (Vec::new(), entries)
-    };
+    let (mut anchors, mut backups) = entries.into_iter().partition::<Vec<_>, _>(|(name, _)| {
+        name.to_string_lossy()
+            .starts_with(OVERWRITE_COMMITTED_ANCHOR_PREFIX)
+    });
     for (name, identity) in anchors.iter().chain(&backups) {
         if !identity.is_file() {
             bail!(
@@ -8542,6 +9274,68 @@ struct MediaNfo<'a> {
     source_url: &'a str,
     studio: Option<&'a str>,
     premiered: Option<&'a str>,
+}
+
+fn write_youtube_nfo_bound(
+    root: &RootedFs,
+    video_path: &Path,
+    requested_url: &str,
+    metadata: &YoutubeMetadata,
+) -> Result<PathBuf> {
+    let video = root
+        .open_bound_file(video_path)?
+        .with_context(|| format!("downloaded media disappeared: {}", video_path.display()))?;
+    let title = metadata
+        .title
+        .as_deref()
+        .or_else(|| video_path.file_stem().and_then(|stem| stem.to_str()));
+    let source_url = metadata.webpage_url.as_deref().unwrap_or(requested_url);
+    let studio = metadata.uploader.as_deref().or(metadata.channel.as_deref());
+    let premiered = metadata.upload_date.as_deref().and_then(format_yt_date);
+    let nfo = MediaNfo {
+        title,
+        plot: metadata.description.as_deref(),
+        unique_id_type: "youtube",
+        unique_id: metadata.id.as_deref().unwrap_or(requested_url),
+        alternate_unique_ids: Vec::new(),
+        source_url,
+        studio,
+        premiered: premiered.as_deref(),
+    };
+    let title = nfo
+        .title
+        .or_else(|| video_path.file_stem().and_then(|stem| stem.to_str()))
+        .unwrap_or("Untitled");
+    let nfo_path = video_path.with_extension("nfo");
+    let (nfo_entry, nfo_identity) =
+        root.create_new_bound_file(&nfo_path, render_nfo(title, &nfo).as_bytes(), 0o644)?;
+
+    let media_still_matches = root
+        .open_bound_file(video_path)
+        .map(|current| current.as_ref() == Some(&video));
+    match media_still_matches {
+        Ok(true) => Ok(nfo_path),
+        Ok(false) => {
+            root.remove_bound_file_if_identity(&nfo_entry, nfo_identity)?;
+            bail!(
+                "downloaded media identity changed while writing {}",
+                nfo_path.display()
+            );
+        }
+        Err(err) => {
+            let cleanup = root.remove_bound_file_if_identity(&nfo_entry, nfo_identity);
+            match cleanup {
+                Ok(()) => Err(err.context(format!(
+                    "failed to revalidate downloaded media while writing {}",
+                    nfo_path.display()
+                ))),
+                Err(cleanup) => Err(err.context(format!(
+                    "failed to revalidate downloaded media while writing {}; NFO cleanup also failed: {cleanup:#}",
+                    nfo_path.display()
+                ))),
+            }
+        }
+    }
 }
 
 fn write_nfo_for_media(video_path: &Path, nfo: &MediaNfo<'_>) -> Result<PathBuf> {
@@ -9639,8 +10433,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn bound_staging_rejects_retargeted_root_and_cleans_only_the_original() {
+    #[tokio::test]
+    async fn bound_staging_rejects_retargeted_root_and_cleans_only_the_original() {
         use std::os::unix::fs::symlink;
 
         let parent = temp_test_dir("bound-staging-root-retarget");
@@ -9657,8 +10451,6 @@ mod tests {
             .strip_prefix(&configured)
             .expect("staging should be output-relative")
             .to_path_buf();
-        fs::write(staging.path().join("download.mkv"), "original")
-            .expect("original staged file should write");
 
         fs::remove_file(&configured).expect("configured symlink should remove");
         symlink(&replacement, &configured).expect("configured symlink should retarget");
@@ -9667,6 +10459,26 @@ mod tests {
             .expect("replacement staging directory should create");
         fs::write(replacement_staging.join("sentinel"), "replacement")
             .expect("replacement sentinel should write");
+        let spec = CommandSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_string(),
+                "printf original > download.mkv".to_string(),
+            ],
+            cwd: staging.path().to_path_buf(),
+            activity_dir: None,
+            cleanup_paths: Vec::new(),
+        };
+        let output = run_command_with_bound_cwd(&test_config(), &spec, &staging.directory, None)
+            .await
+            .expect("bound child writer should run after root retarget");
+        assert!(output.status.success());
+
+        assert_eq!(
+            fs::read_to_string(original.join(&relative_staging).join("download.mkv")).unwrap(),
+            "original"
+        );
+        assert!(!replacement_staging.join("download.mkv").exists());
 
         let error = staging
             .validate_for_path_access()
@@ -9680,6 +10492,117 @@ mod tests {
             "replacement"
         );
         let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn startup_recovery_rolls_forward_partial_keep_both_publication() {
+        let final_dir = temp_test_dir("staged-publication-roll-forward");
+        let root = RootedFs::new(&final_dir).expect("output root should bind");
+        let mut staging =
+            create_video_staging_dir(&root).expect("production staging directory should create");
+        let staging_dir = staging.path().to_path_buf();
+        let staged_video = staging_dir.join("Episode.mkv");
+        let staged_nfo = staging_dir.join("Episode.nfo");
+        fs::write(&staged_video, "new-video").expect("staged video should write");
+        fs::write(&staged_nfo, "new-nfo").expect("staged NFO should write");
+        let mut plan = staged_move_plan(
+            &staging_dir,
+            &final_dir,
+            &[staged_video, staged_nfo],
+            None,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("keep-both move plan should build");
+        prepare_staged_publication(&root, &staging, &mut plan, None)
+            .expect("publication manifest should persist");
+        assert_eq!(plan.len(), 2);
+        move_step_with_bound_parents(&root, plan[0].clone())
+            .expect("first publication step should move");
+        staging.removed = true;
+        drop(staging);
+        drop(root);
+
+        let report = recover_pending_overwrite_transactions(&final_dir)
+            .expect("public startup recovery should roll publication forward");
+
+        assert_eq!(
+            fs::read_to_string(final_dir.join("Episode.mkv")).unwrap(),
+            "new-video"
+        );
+        assert_eq!(
+            fs::read_to_string(final_dir.join("Episode.nfo")).unwrap(),
+            "new-nfo"
+        );
+        assert!(!staging_dir.exists());
+        assert!(
+            report.iter().any(|line| {
+                line.contains("Rolled forward interrupted staged video publication")
+            })
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn startup_recovery_rolls_back_partial_overwrite_publication() {
+        let final_dir = temp_test_dir("staged-publication-roll-back");
+        let existing = final_dir.join("Episode.mkv");
+        fs::write(&existing, "original-video").expect("existing video should write");
+        write_bilibili_identity_nfo(&existing, "cid123");
+        let root = RootedFs::new(&final_dir).expect("output root should bind");
+        let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        let duplicate =
+            bind_test_overwrite_confirmation(&root, VideoDuplicateAction::Overwrite, &duplicate)
+                .expect("overwrite confirmation should bind");
+        let acquired =
+            acquire_and_validate_overwrite_target(&root, &duplicate, StagedPrimaryMediaKind::Video)
+                .expect("overwrite target should be acquired");
+        let mut staging =
+            create_video_staging_dir(&root).expect("production staging directory should create");
+        let staging_dir = staging.path().to_path_buf();
+        let staged_video = staging_dir.join("Episode.mkv");
+        fs::write(&staged_video, "replacement-video").expect("replacement should stage");
+        let mut plan = staged_move_plan(
+            &staging_dir,
+            &final_dir,
+            &[staged_video],
+            Some(&existing),
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("overwrite move plan should build");
+        prepare_staged_publication(&root, &staging, &mut plan, Some(&acquired))
+            .expect("overwrite publication manifest should persist");
+        move_step_with_bound_parents(&root, plan[0].clone())
+            .expect("replacement publication step should move");
+        staging.removed = true;
+        drop(staging);
+        drop(acquired);
+        drop(root);
+
+        let report = recover_pending_overwrite_transactions(&final_dir)
+            .expect("public startup recovery should roll overwrite back");
+
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "original-video");
+        assert!(existing.with_extension("nfo").is_file());
+        assert!(!staging_dir.exists());
+        assert!(overwrite_backup_dirs(&final_dir).is_empty());
+        assert!(
+            report
+                .iter()
+                .any(|line| { line.contains("Rolled back interrupted staged video publication") })
+        );
+        assert!(
+            report
+                .iter()
+                .any(|line| line.contains("Restored interrupted"))
+        );
+        let _ = fs::remove_dir_all(final_dir);
     }
 
     #[test]
@@ -9699,6 +10622,7 @@ mod tests {
             MoveStep {
                 source: source.clone(),
                 destination: destination.clone(),
+                expected_identity: None,
             },
         )
         .expect("staged file should move");
@@ -9746,7 +10670,10 @@ mod tests {
         let root = RootedFs::new(&final_dir).expect("output root should bind");
 
         let error = move_staged_video_files_with_root(
-            &root,
+            MoveExecutionContext {
+                root: &root,
+                staging: None,
+            },
             &staging_dir,
             &final_dir,
             &staged_files,
@@ -11814,8 +12741,12 @@ mod tests {
         let final_dir = temp_test_dir("overwrite-startup-malformed");
         let transaction = final_dir.join(format!("{OVERWRITE_BACKUP_DIR_PREFIX}-malformed"));
         fs::create_dir(&transaction).expect("transaction directory should create");
+        fs::set_permissions(&transaction, fs::Permissions::from_mode(0o700))
+            .expect("transaction directory should become private");
         let manifest = transaction.join(OVERWRITE_RECOVERY_MANIFEST_NAME);
         fs::write(&manifest, b"{").expect("malformed manifest should write");
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600))
+            .expect("manifest should become private");
 
         let report = recover_pending_overwrite_transactions(&final_dir)
             .expect("malformed recovery state should be reported without aborting startup");
@@ -11841,6 +12772,8 @@ mod tests {
             .expect("output should exist");
         let transaction = final_dir.join(format!("{OVERWRITE_BACKUP_DIR_PREFIX}-legacy-committed"));
         fs::create_dir(&transaction).expect("transaction directory should create");
+        fs::set_permissions(&transaction, fs::Permissions::from_mode(0o700))
+            .expect("transaction directory should become private");
         fs::write(transaction.join("Episode.mkv"), "old-video")
             .expect("legacy backup should write");
         let manifest = serde_json::json!({
@@ -11853,11 +12786,14 @@ mod tests {
                 "inode": identity.inode()
             }]
         });
+        let manifest_path = transaction.join(OVERWRITE_RECOVERY_MANIFEST_NAME);
         fs::write(
-            transaction.join(OVERWRITE_RECOVERY_MANIFEST_NAME),
+            &manifest_path,
             serde_json::to_vec_pretty(&manifest).expect("legacy manifest should encode"),
         )
         .expect("legacy manifest should write");
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))
+            .expect("legacy manifest should become private");
 
         let report = recover_pending_overwrite_transactions(&final_dir)
             .expect("legacy committed transaction should be retained without blocking startup");
@@ -11869,7 +12805,70 @@ mod tests {
         );
         assert!(report.iter().any(|line| {
             line.contains("Retained unresolved overwrite transaction")
-                && line.contains("no durable output anchors")
+                && line.contains("no authenticated ownership binding")
+        }));
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_recovery_retains_a_copied_current_overwrite_transaction() {
+        let final_dir = temp_test_dir("overwrite-startup-copied-current");
+        let existing = final_dir.join("Episode.mkv");
+        fs::write(&existing, "original-video").expect("existing video should write");
+        write_bilibili_identity_nfo(&existing, "cid123");
+        let root = RootedFs::new(&final_dir).expect("output root should bind");
+        let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        let duplicate =
+            bind_test_overwrite_confirmation(&root, VideoDuplicateAction::Overwrite, &duplicate)
+                .expect("overwrite confirmation should bind");
+        let acquired =
+            acquire_and_validate_overwrite_target(&root, &duplicate, StagedPrimaryMediaKind::Video)
+                .expect("overwrite target should be acquired");
+        let forged = final_dir.join(format!("{OVERWRITE_BACKUP_DIR_PREFIX}-copied"));
+        fs::create_dir(&forged).expect("copied transaction directory should create");
+        fs::set_permissions(&forged, fs::Permissions::from_mode(0o700))
+            .expect("copied transaction directory should become private");
+        for entry in
+            fs::read_dir(&acquired.recovery.backup_dir).expect("authentic transaction should scan")
+        {
+            let entry = entry.expect("authentic transaction entry should read");
+            if entry
+                .file_type()
+                .expect("transaction entry type should read")
+                .is_file()
+            {
+                fs::copy(entry.path(), forged.join(entry.file_name()))
+                    .expect("transaction entry should copy");
+            }
+        }
+        let forged_manifest = forged.join(OVERWRITE_RECOVERY_MANIFEST_NAME);
+        fs::set_permissions(&forged_manifest, fs::Permissions::from_mode(0o600))
+            .expect("copied manifest should become private");
+        acquired
+            .restore()
+            .expect("authentic transaction should restore before startup recovery");
+        drop(root);
+
+        let report = recover_pending_overwrite_transactions(&final_dir)
+            .expect("copied transaction should be retained without blocking startup");
+
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "original-video");
+        assert_eq!(
+            fs::read_to_string(forged.join("Episode.mkv")).unwrap(),
+            "original-video"
+        );
+        assert!(forged.is_dir());
+        assert!(report.iter().any(|line| {
+            line.contains("Retained unresolved overwrite transaction")
+                && line.contains("ownership record does not match")
         }));
         let _ = fs::remove_dir_all(final_dir);
     }
@@ -11970,6 +12969,7 @@ mod tests {
             MoveStep {
                 source: staged,
                 destination: existing.clone(),
+                expected_identity: None,
             },
         )
         .expect("replacement should move into the acquired target");
@@ -12031,6 +13031,7 @@ mod tests {
             MoveStep {
                 source: staged,
                 destination: existing.clone(),
+                expected_identity: None,
             },
         )
         .expect("replacement should move into the acquired target");
@@ -12405,16 +13406,22 @@ mod tests {
         fs::write(reservation.command_path(), "partial-mux")
             .expect("partial mux output should write");
         std::mem::forget(reservation);
-        std::mem::forget(staging);
+        let mut staging = staging;
+        staging.removed = true;
+        drop(staging);
 
-        let report = recover_pending_video_staging_directories_locked(&rooted)
-            .expect("interrupted production staging should recover");
+        let report = recover_pending_overwrite_transactions(&root)
+            .expect("public startup recovery should recover interrupted production staging");
 
-        assert!(!report.unresolved);
         assert!(!raw.exists());
         assert!(!output.exists());
         assert!(!transaction.exists());
         assert!(!staging_path.exists());
+        assert!(
+            report
+                .iter()
+                .any(|line| { line.contains("Discarded interrupted staged video job") })
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -12517,6 +13524,14 @@ mod tests {
             &staging_dir,
             &staging_dir.join(VIDEO_STAGING_OWNER_FILE_NAME)
         ));
+        assert!(is_staging_support_file(
+            &staging_dir,
+            &staging_dir.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME)
+        ));
+        assert!(is_staging_support_file(
+            &staging_dir,
+            &staging_dir.join(BILIBILI_WORKER_REQUEST_FILE_NAME)
+        ));
         assert!(!is_staging_support_file(
             &staging_dir,
             &staging_dir.join("ffmpeg-concat.txt")
@@ -12525,6 +13540,35 @@ mod tests {
             &staging_dir,
             &staging_dir.join("Episode 1.mkv")
         ));
+    }
+
+    #[test]
+    fn bilibili_worker_request_redacts_telegram_configuration() {
+        let mut config = test_config();
+        config.telegram.token = "telegram-secret-token".to_string();
+        config.telegram.allowed_chat_ids = vec![42];
+        let expected_identity = VideoIdentity {
+            provider: VideoProvider::Bilibili,
+            id: "cid123".to_string(),
+        };
+        let logical_output_dir = PathBuf::from("/videos/staging/job-1");
+
+        let request = build_bilibili_worker_request(
+            &config,
+            "https://www.bilibili.com/video/BV123",
+            Some(BilibiliSelection::Latest),
+            Some(&expected_identity),
+            &logical_output_dir,
+        );
+        let encoded = serde_json::to_string(&request).expect("worker request should encode");
+
+        assert!(!encoded.contains("telegram-secret-token"));
+        assert_eq!(request.config.telegram.token, "redacted-worker-token");
+        assert!(request.config.telegram.allowed_chat_ids.is_empty());
+        assert!(request.config.telegram.allow_all_chats);
+        assert_eq!(request.config.downloads.video_dir, Path::new("."));
+        assert_eq!(request.expected_overwrite_identity, Some(expected_identity));
+        assert_eq!(request.logical_output_dir, logical_output_dir);
     }
 
     #[test]
@@ -13314,6 +14358,73 @@ mv video.original video.m4s || exit 46
         assert!(nfo.contains("<uniqueid type=\"youtube-alt\">alt &amp; id</uniqueid>"));
         assert!(nfo.contains("<plot>x &lt; y</plot>"));
         assert!(nfo.contains("<year>2026</year>"));
+    }
+
+    #[test]
+    fn writes_youtube_nfo_through_bound_output_root() {
+        let root_dir = temp_test_dir("youtube-bound-nfo");
+        let video = root_dir.join("Example.mkv");
+        fs::write(&video, "video").expect("video should write");
+        let root = RootedFs::new(&root_dir).expect("output root should bind");
+        let metadata = YoutubeMetadata {
+            id: Some("PHH1wTDF-1M".to_string()),
+            title: Some("Example & title".to_string()),
+            description: Some("Description".to_string()),
+            uploader: Some("Uploader".to_string()),
+            upload_date: Some("20260517".to_string()),
+            webpage_url: Some("https://www.youtube.com/watch?v=PHH1wTDF-1M".to_string()),
+            ..YoutubeMetadata::default()
+        };
+
+        let nfo_path =
+            write_youtube_nfo_bound(&root, &video, "https://youtu.be/PHH1wTDF-1M", &metadata)
+                .expect("bound NFO should write");
+        let nfo = fs::read_to_string(&nfo_path).expect("NFO should read");
+
+        assert_eq!(nfo_path, video.with_extension("nfo"));
+        assert!(nfo.contains("<title>Example &amp; title</title>"));
+        assert!(nfo.contains("<uniqueid type=\"youtube\" default=\"true\">PHH1wTDF-1M</uniqueid>"));
+        assert!(nfo.contains("<premiered>2026-05-17</premiered>"));
+        let _ = fs::remove_dir_all(root_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_youtube_nfo_rejects_a_retargeted_output_root() {
+        use std::os::unix::fs::symlink;
+
+        let parent = temp_test_dir("youtube-bound-nfo-root-retarget");
+        let original = parent.join("original");
+        let replacement = parent.join("replacement");
+        let configured = parent.join("configured");
+        fs::create_dir_all(&original).expect("original root should create");
+        fs::create_dir_all(&replacement).expect("replacement root should create");
+        let original_video = original.join("Example.mkv");
+        fs::write(&original_video, "video").expect("original video should write");
+        fs::write(replacement.join("sentinel"), "replacement")
+            .expect("replacement sentinel should write");
+        symlink(&original, &configured).expect("configured root symlink should create");
+        let root = RootedFs::new(&configured).expect("configured root should bind");
+        let configured_video = configured.join("Example.mkv");
+
+        fs::remove_file(&configured).expect("configured symlink should remove");
+        symlink(&replacement, &configured).expect("configured symlink should retarget");
+        let error = write_youtube_nfo_bound(
+            &root,
+            &configured_video,
+            "https://youtu.be/PHH1wTDF-1M",
+            &YoutubeMetadata::default(),
+        )
+        .expect_err("retargeted output root must reject NFO creation");
+
+        assert!(format!("{error:#}").contains("different directory"));
+        assert!(!original_video.with_extension("nfo").exists());
+        assert!(!replacement.join("Example.nfo").exists());
+        assert_eq!(
+            fs::read_to_string(replacement.join("sentinel")).unwrap(),
+            "replacement"
+        );
+        let _ = fs::remove_dir_all(parent);
     }
 
     #[test]

@@ -28,7 +28,7 @@ use crate::config::AppConfig;
 use crate::downloader::{
     JobProgress, JobProgressReceiver, VideoDuplicate, VideoDuplicateAction,
     find_video_duplicate_with_probe, job_progress_channel, recover_pending_overwrite_transactions,
-    run_job, run_job_with_duplicate_action, run_video_job_staged_keep_both,
+    run_bilibili_worker, run_job, run_job_with_duplicate_action, run_video_job_staged_keep_both,
 };
 use crate::router::{
     BilibiliAuthCommand, BilibiliAuthLoginMode, BilibiliSelection, JobRequest, RouteResult,
@@ -54,7 +54,8 @@ static DUPLICATE_CALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
 static BILIBILI_SELECTION_CALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
 static BILIBILI_ACCESS_KEY_TICKET_COUNTER: AtomicU64 = AtomicU64::new(1);
 const DUPLICATE_DECISION_TTL: Duration = Duration::from_secs(30 * 60);
-const MAX_PENDING_DUPLICATE_JOBS: usize = 256;
+const MAX_PENDING_DUPLICATE_JOBS: usize = 64;
+const PENDING_DUPLICATE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const BILIBILI_SELECTION_DECISION_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_PENDING_BILIBILI_SELECTION_JOBS: usize = 256;
 const BILIBILI_ACCESS_KEY_LOGIN_TTL: Duration = Duration::from_secs(30 * 60);
@@ -124,6 +125,12 @@ async fn main() -> Result<()> {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     if args
         .first()
+        .is_some_and(|arg| arg == std::ffi::OsStr::new("--bilibili-worker"))
+    {
+        return run_bilibili_worker().await;
+    }
+    if args
+        .first()
         .is_some_and(|arg| arg == std::ffi::OsStr::new("--replay-message"))
     {
         let config_path = args
@@ -149,6 +156,7 @@ async fn main() -> Result<()> {
     for recovery in recover_pending_overwrite_transactions(&config.downloads.video_dir)? {
         warn!(message = %recovery, "recovered interrupted overwrite transaction");
     }
+    tokio::spawn(expire_pending_duplicate_jobs());
 
     let telegram = TelegramClient::new(config.telegram.token.clone());
     if let Err(err) = telegram.set_my_commands(default_bot_commands()).await {
@@ -2117,7 +2125,8 @@ fn cap_pending_duplicate_jobs(
     jobs: &mut HashMap<u64, PendingDuplicateJob>,
     protected_token: Option<u64>,
 ) {
-    while jobs.len() > MAX_PENDING_DUPLICATE_JOBS {
+    let limit = pending_duplicate_job_limit();
+    while jobs.len() > limit {
         let Some(oldest_job_id) = jobs
             .iter()
             .filter(|(token, _)| Some(**token) != protected_token)
@@ -2127,6 +2136,36 @@ fn cap_pending_duplicate_jobs(
             break;
         };
         jobs.remove(&oldest_job_id);
+    }
+}
+
+fn pending_duplicate_job_limit() -> usize {
+    #[cfg(unix)]
+    {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+            let descriptor_budget = usize::try_from(limit.rlim_cur)
+                .unwrap_or(usize::MAX)
+                .saturating_div(4)
+                .max(1);
+            return descriptor_budget.min(MAX_PENDING_DUPLICATE_JOBS);
+        }
+    }
+    MAX_PENDING_DUPLICATE_JOBS
+}
+
+async fn expire_pending_duplicate_jobs() {
+    let mut ticker = interval(PENDING_DUPLICATE_SWEEP_INTERVAL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let mut jobs = pending_duplicate_jobs().lock().await;
+        prune_expired_pending_duplicate_jobs(&mut jobs, Instant::now());
+        cap_pending_duplicate_jobs(&mut jobs, None);
     }
 }
 
@@ -3239,7 +3278,7 @@ mod tests {
             jobs.insert(index, pending_duplicate_job(index, now));
         }
         cap_pending_duplicate_jobs(&mut jobs, None);
-        assert!(jobs.len() <= MAX_PENDING_DUPLICATE_JOBS);
+        assert!(jobs.len() <= pending_duplicate_job_limit());
     }
 
     #[test]
@@ -3253,7 +3292,7 @@ mod tests {
 
         cap_pending_duplicate_jobs(&mut jobs, Some(protected_token));
 
-        assert_eq!(jobs.len(), MAX_PENDING_DUPLICATE_JOBS);
+        assert_eq!(jobs.len(), pending_duplicate_job_limit());
         assert!(jobs.contains_key(&protected_token));
     }
 

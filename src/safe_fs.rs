@@ -75,6 +75,12 @@ pub(crate) struct BoundFile {
     identity: EntryIdentity,
 }
 
+#[derive(Clone)]
+pub(crate) struct BoundDirectory {
+    fd: Arc<OwnedFd>,
+    identity: EntryIdentity,
+}
+
 #[derive(Debug)]
 pub(crate) struct RemoveQuarantineRecoveryReport {
     pub(crate) messages: Vec<String>,
@@ -112,6 +118,15 @@ impl std::fmt::Debug for BoundFile {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BoundFile")
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for BoundDirectory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundDirectory")
             .field("identity", &self.identity)
             .finish_non_exhaustive()
     }
@@ -214,6 +229,25 @@ impl BoundFile {
             Err(err) if errno_to_io(err).kind() == std::io::ErrorKind::WouldBlock => Ok(false),
             Err(err) => Err(errno_to_io(err)).context("failed to lock bound file"),
         }
+    }
+}
+
+impl BoundDirectory {
+    pub(crate) fn validate_identity(&self) -> Result<()> {
+        if identity_for_fd(self.fd.as_ref())? != self.identity {
+            bail!("bound directory descriptor identity changed");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn duplicate_fd_cloexec_at_least(&self, minimum: RawFd) -> Result<OwnedFd> {
+        self.validate_identity()?;
+        let duplicate = rustix::io::fcntl_dupfd_cloexec(self.fd.as_ref(), minimum)
+            .map_err(errno_to_io)
+            .context("failed to duplicate bound directory descriptor for a child process")?;
+        self.validate_identity()?;
+        Ok(duplicate)
     }
 }
 
@@ -330,6 +364,29 @@ impl RootedFs {
             fd: Arc::new(fd),
             identity,
         }))
+    }
+
+    pub(crate) fn open_bound_directory(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+    ) -> Result<BoundDirectory> {
+        self.validate_bound_parent(&entry.parent)?;
+        if identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected)
+            || !expected.is_dir()
+        {
+            bail!("bound directory identity changed: {}", entry.path.display());
+        }
+        let fd = openat_directory(entry.parent.fd.as_ref(), &entry.leaf)
+            .with_context(|| format!("failed to open bound directory {}", entry.path.display()))?;
+        if identity_for_fd(&fd)? != expected {
+            bail!("bound directory identity changed: {}", entry.path.display());
+        }
+        self.validate_bound_parent(&entry.parent)?;
+        Ok(BoundDirectory {
+            fd: Arc::new(fd),
+            identity: expected,
+        })
     }
 
     pub(crate) fn open_or_create_bound_file(&self, path: &Path, mode: u16) -> Result<BoundFile> {
