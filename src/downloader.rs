@@ -1,8 +1,11 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::OnceLock;
@@ -32,8 +35,13 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static OVERWRITE_BACKUP_COUNTER: AtomicU64 = AtomicU64::new(1);
 const VIDEO_STAGING_DIR_NAME: &str = ".telegram-video-downloader-staging";
 const VIDEO_OUTPUT_LOCK_FILE_NAME: &str = ".telegram-video-downloader.lock";
+const VIDEO_RECOVERY_STATE_FILE_NAME: &str = ".telegram-video-downloader.recovery";
+const VIDEO_RECOVERY_STATE_CLEAN: u8 = b'C';
+const VIDEO_RECOVERY_STATE_DIRTY: u8 = b'D';
 const BILIBILI_FFMPEG_CONCAT_FILE_PREFIX: &str = ".telegram-video-downloader-ffmpeg-concat";
 const BILIBILI_MUX_STAGING_DIR_PREFIX: &str = ".telegram-video-downloader-mux";
+#[cfg(unix)]
+const BILIBILI_MUX_FD_BASE: i32 = 64;
 const OVERWRITE_BACKUP_DIR_PREFIX: &str = ".telegram-video-downloader-overwrite";
 const OVERWRITE_RECOVERY_MANIFEST_NAME: &str = ".transaction.json";
 const OVERWRITE_RECOVERY_MANIFEST_TEMP_NAME: &str = ".transaction.next.json";
@@ -440,6 +448,11 @@ pub async fn find_video_duplicate_with_probe(
                 push_bilibili_plan_identities(&mut identities, &plan);
                 overwrite_identities = bilibili_plan_overwrite_identities(&plan);
             }
+            Err(err) if should_propagate_bilibili_probe_error(*selection, &err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to probe Bilibili plan for duplicate check: {url}")
+                });
+            }
             Err(err) if identities.is_empty() && direct_duplicate.is_none() => {
                 return Err(err).with_context(|| {
                     format!("failed to probe Bilibili plan for duplicate check: {url}")
@@ -566,12 +579,12 @@ fn build_video_identity_index_in_dir(
     read_policy: IdentityIndexReadPolicy,
 ) -> Result<VideoIdentityIndex> {
     let root = RootedFs::new(root)?;
-    let media_files = list_primary_media_files(root.logical_root_path(), primary_media_kind)?;
+    let inventory = build_identity_media_inventory(root.logical_root_path(), primary_media_kind)?;
     let mut index = VideoIdentityIndex {
         root: Some(root.clone()),
         ..VideoIdentityIndex::default()
     };
-    for video in media_files {
+    for video in inventory.media_files {
         let Some(file_identity) = root.entry_identity(&video)? else {
             continue;
         };
@@ -579,7 +592,12 @@ fn build_video_identity_index_in_dir(
             continue;
         }
         index.file_identities.insert(video.clone(), file_identity);
-        index_video_identities(&mut index, &video, read_policy)?;
+        let sidecars = inventory
+            .metadata_sidecars
+            .get(&video)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        index_video_identities(&mut index, &video, sidecars, read_policy)?;
     }
     Ok(index)
 }
@@ -685,8 +703,13 @@ async fn run_bilibili_job(
         progress.as_ref(),
     )
     .await?;
+    guard.begin_operation();
     let root = guard.root().clone();
-    run_bilibili_job_locked(config, &root, url, selection, None, progress).await
+    let result = run_bilibili_job_locked(config, &root, url, selection, None, progress).await;
+    if result.is_ok() {
+        guard.mark_operation_clean();
+    }
+    result
 }
 
 async fn run_bilibili_job_locked(
@@ -697,7 +720,7 @@ async fn run_bilibili_job_locked(
     expected_overwrite_identity: Option<&VideoIdentity>,
     progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
-    sync_bilibili_rust_credentials(config)?;
+    sync_bilibili_rust_credentials(config).await?;
     let mut options = bilibili_core::download_options(config)?;
     let mux_locally = matches!(options.mode, DownloadMode::All)
         && matches!(options.mux, bbdown_core::MuxOptions::Ffmpeg { .. });
@@ -877,12 +900,24 @@ struct OwnedTemporaryFile {
     root: RootedFs,
     entry: BoundEntry,
     identity: EntryIdentity,
+    file: BoundFile,
 }
 
 impl OwnedTemporaryFile {
     fn path(&self) -> &Path {
         self.entry.path()
     }
+
+    fn bound_file(&self) -> &BoundFile {
+        &self.file
+    }
+}
+
+#[derive(Debug)]
+struct BilibiliMuxCommand {
+    spec: CommandSpec,
+    concat_file: Option<OwnedTemporaryFile>,
+    inherited_files: Vec<BoundFile>,
 }
 
 impl Drop for OwnedTemporaryFile {
@@ -1139,14 +1174,21 @@ async fn mux_bilibili_report_media(
         let output_path = unique_bilibili_mux_output_path(&entry_dir, title, "mp4", since);
         let bound_inputs = bind_bilibili_mux_inputs(root, &media_inputs)?;
         let output_reservation = ReservedMuxOutput::create(root, &output_path)?;
-        let (spec, concat_file) = bilibili_local_mux_command_spec(
+        let BilibiliMuxCommand {
+            spec,
+            concat_file,
+            inherited_files,
+        } = bilibili_local_mux_command_spec(
             config,
             root,
             &media_inputs,
+            &bound_inputs,
             &entry_dir,
             output_reservation.command_path(),
         )?;
-        let output_result = run_command(config, &spec, progress.clone()).await;
+        let output_result =
+            run_command_with_inherited_files(config, &spec, &inherited_files, progress.clone())
+                .await;
         drop(concat_file);
         let output_result = match output_result {
             Ok(output_result) => output_result,
@@ -1212,19 +1254,28 @@ fn bilibili_local_mux_command_spec(
     config: &AppConfig,
     root: &RootedFs,
     media_inputs: &[BilibiliMediaInput],
+    bound_inputs: &[BoundBilibiliMuxInput],
     entry_dir: &Path,
     output: &Path,
-) -> Result<(CommandSpec, Option<OwnedTemporaryFile>)> {
+) -> Result<BilibiliMuxCommand> {
+    if media_inputs.len() != bound_inputs.len()
+        || media_inputs
+            .iter()
+            .zip(bound_inputs)
+            .any(|(media, bound)| media.path != bound.path)
+    {
+        bail!("Bilibili mux inputs do not match their bound file descriptors");
+    }
     let mut args = vec![
         "-hide_banner".to_string(),
         "-y".to_string(),
         "-nostdin".to_string(),
     ];
-    let concat_file = if only_bilibili_flv_segments(media_inputs) {
+    let (concat_file, inherited_files) = if only_bilibili_flv_segments(media_inputs) {
         let concat_file = create_bilibili_concat_file(
             root,
             entry_dir,
-            ffmpeg_concat_file_list(media_inputs).as_bytes(),
+            ffmpeg_concat_file_list(media_inputs.len(), 1)?.as_bytes(),
         )?;
         args.extend([
             "-f".to_string(),
@@ -1232,19 +1283,28 @@ fn bilibili_local_mux_command_spec(
             "-safe".to_string(),
             "0".to_string(),
             "-i".to_string(),
-            command_path_arg(concat_file.path()),
+            inherited_command_path(0)?,
         ]);
-        Some(concat_file)
+        let mut inherited_files = Vec::with_capacity(bound_inputs.len() + 1);
+        inherited_files.push(concat_file.bound_file().clone());
+        inherited_files.extend(bound_inputs.iter().map(|input| input.file.clone()));
+        (Some(concat_file), inherited_files)
     } else {
-        for media_input in media_inputs {
+        for index in 0..media_inputs.len() {
             args.push("-i".to_string());
-            args.push(command_path_arg(&media_input.path));
+            args.push(inherited_command_path(index)?);
         }
         for index in 0..media_inputs.len() {
             args.push("-map".to_string());
             args.push(format!("{index}:0"));
         }
-        None
+        (
+            None,
+            bound_inputs
+                .iter()
+                .map(|input| input.file.clone())
+                .collect(),
+        )
     };
     args.extend([
         "-c".to_string(),
@@ -1253,8 +1313,8 @@ fn bilibili_local_mux_command_spec(
         "+faststart".to_string(),
         command_path_arg(output),
     ]);
-    Ok((
-        CommandSpec {
+    Ok(BilibiliMuxCommand {
+        spec: CommandSpec {
             program: config.tools.ffmpeg.clone(),
             args,
             cwd: entry_dir.to_path_buf(),
@@ -1262,7 +1322,8 @@ fn bilibili_local_mux_command_spec(
             cleanup_paths: Vec::new(),
         },
         concat_file,
-    ))
+        inherited_files,
+    })
 }
 
 fn create_bilibili_concat_file(
@@ -1281,7 +1342,16 @@ fn create_bilibili_concat_file(
             std::process::id()
         ));
         root.validate_configured_root()?;
-        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        let mut file = match options.open(&path) {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => {
@@ -1301,7 +1371,7 @@ fn create_bilibili_concat_file(
                 path.display()
             );
         }
-        if let Err(err) = file.write_all(contents) {
+        if let Err(err) = file.write_all(contents).and_then(|()| file.sync_all()) {
             drop(file);
             let error = anyhow!(err).context(format!(
                 "failed to write Bilibili ffmpeg concat list {}",
@@ -1314,10 +1384,45 @@ fn create_bilibili_concat_file(
                 )),
             };
         }
+        let bound_file = match root.open_bound_file(&path).and_then(|file| {
+            file.with_context(|| {
+                format!(
+                    "Bilibili ffmpeg concat list disappeared after creation: {}",
+                    path.display()
+                )
+            })
+        }) {
+            Ok(bound_file) => bound_file,
+            Err(error) => {
+                drop(file);
+                return match root.remove_bound_file_if_identity(&entry, identity) {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(anyhow!(
+                        "{error:#}; failed to clean Bilibili ffmpeg concat list: {cleanup:#}"
+                    )),
+                };
+            }
+        };
+        if bound_file.identity() != identity || root.bound_entry_identity(&entry)? != Some(identity)
+        {
+            drop(file);
+            let error = anyhow!(
+                "Bilibili ffmpeg concat list identity changed after creation: {}",
+                path.display()
+            );
+            return match root.remove_bound_file_if_identity(&entry, identity) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(anyhow!(
+                    "{error:#}; failed to clean Bilibili ffmpeg concat list: {cleanup:#}"
+                )),
+            };
+        }
+        drop(file);
         return Ok(OwnedTemporaryFile {
             root: root.clone(),
             entry,
             identity,
+            file: bound_file,
         });
     }
     bail!("failed to allocate a unique Bilibili ffmpeg concat list")
@@ -1327,16 +1432,26 @@ fn only_bilibili_flv_segments(media_inputs: &[BilibiliMediaInput]) -> bool {
     !media_inputs.is_empty() && media_inputs.iter().all(|input| input.kind == "flv_segment")
 }
 
-fn ffmpeg_concat_file_list(media_inputs: &[BilibiliMediaInput]) -> String {
-    media_inputs
-        .iter()
-        .map(|input| {
-            format!(
-                "file '{}'\n",
-                command_path_arg(&input.path).replace('\'', "'\\''")
-            )
+fn ffmpeg_concat_file_list(input_count: usize, inherited_offset: usize) -> Result<String> {
+    (0..input_count)
+        .map(|index| {
+            inherited_command_path(inherited_offset + index).map(|path| format!("file '{path}'\n"))
         })
         .collect()
+}
+
+#[cfg(unix)]
+fn inherited_command_path(index: usize) -> Result<String> {
+    let index = i32::try_from(index).context("too many inherited Bilibili mux inputs")?;
+    let descriptor = BILIBILI_MUX_FD_BASE
+        .checked_add(index)
+        .context("too many inherited Bilibili mux inputs")?;
+    Ok(format!("/dev/fd/{descriptor}"))
+}
+
+#[cfg(not(unix))]
+fn inherited_command_path(_index: usize) -> Result<String> {
+    bail!("descriptor-bound Bilibili muxing requires a Unix platform")
 }
 
 fn cleanup_bilibili_mux_input_files(
@@ -1999,13 +2114,18 @@ async fn run_youtube_job(
 ) -> Result<JobReport> {
     let metadata = fetch_youtube_metadata(config, url, progress.clone()).await?;
     let subtitle_plan = select_subtitles(&metadata, &config.video.subtitle_languages);
-    let _guard = video_output_lock(
+    let guard = video_output_lock(
         &config.downloads.video_dir,
         "YouTube download",
         progress.as_ref(),
     )
     .await?;
-    run_youtube_job_locked(config, url, metadata, subtitle_plan, progress).await
+    guard.begin_operation();
+    let result = run_youtube_job_locked(config, url, metadata, subtitle_plan, progress).await;
+    if result.is_ok() {
+        guard.mark_operation_clean();
+    }
+    result
 }
 
 async fn run_youtube_job_locked(
@@ -2083,6 +2203,7 @@ async fn run_staged_video_job(
         progress.as_ref(),
     )
     .await?;
+    guard.begin_operation();
     let final_dir = config.downloads.video_dir.clone();
     let primary_media_kind = staged_primary_media_kind(config, job)?;
     let root = guard.root().clone();
@@ -2223,10 +2344,12 @@ async fn run_staged_video_job(
         overwrite_fallback_detail,
         format!("Moved: {}", join_paths(&moved_files)),
     ]);
-    Ok(JobReport {
+    let report = JobReport {
         saved_location,
         details,
-    })
+    };
+    guard.mark_operation_clean();
+    Ok(report)
 }
 
 fn staged_primary_media_kind(
@@ -2278,12 +2401,19 @@ fn fallback_video_identity(job: &JobRequest) -> Option<VideoIdentity> {
     })
 }
 
-fn sync_bilibili_rust_credentials(config: &AppConfig) -> Result<()> {
-    bilibili_auth::sync_bbdown_rust_credentials_from_state(
-        &config.bilibili.auth.state_path,
-        &config.bilibili.auth.credential_file,
-        config.bilibili.auth.credential_profile.as_deref(),
-    )?;
+async fn sync_bilibili_rust_credentials(config: &AppConfig) -> Result<()> {
+    let state_path = config.bilibili.auth.state_path.clone();
+    let credential_file = config.bilibili.auth.credential_file.clone();
+    let credential_profile = config.bilibili.auth.credential_profile.clone();
+    tokio::task::spawn_blocking(move || {
+        bilibili_auth::sync_bbdown_rust_credentials_from_state(
+            &state_path,
+            &credential_file,
+            credential_profile.as_deref(),
+        )
+    })
+    .await
+    .context("BBDown credential migration task failed")??;
     Ok(())
 }
 
@@ -2750,7 +2880,7 @@ async fn probe_bilibili_plan(
     selection: Option<BilibiliSelection>,
     timeout: Duration,
 ) -> Result<BilibiliDownloadPlan> {
-    sync_bilibili_rust_credentials(config)?;
+    sync_bilibili_rust_credentials(config).await?;
     let client = bilibili_core::client(config)?;
     let mode = bilibili_core::download_mode_from_config(config)?;
     let plan = probe_bilibili_plan_with_mode(&client, url, selection, mode, timeout).await?;
@@ -2830,6 +2960,7 @@ async fn probe_bilibili_metadata(
 
 struct VideoOutputGuard {
     root: RootedFs,
+    recovery_state: VideoRecoveryState,
     _process_guard: MutexGuard<'static, ()>,
     _file_guard: BoundFile,
 }
@@ -2837,6 +2968,31 @@ struct VideoOutputGuard {
 impl VideoOutputGuard {
     fn root(&self) -> &RootedFs {
         &self.root
+    }
+
+    fn begin_operation(&self) {
+        self.recovery_state.operation_clean.set(false);
+    }
+
+    fn mark_operation_clean(&self) {
+        self.recovery_state.operation_clean.set(true);
+    }
+}
+
+struct VideoRecoveryState {
+    file: BoundFile,
+    operation_clean: Cell<bool>,
+    unresolved_before_operation: bool,
+}
+
+impl Drop for VideoRecoveryState {
+    fn drop(&mut self) {
+        let state = if self.operation_clean.get() && !self.unresolved_before_operation {
+            VIDEO_RECOVERY_STATE_CLEAN
+        } else {
+            VIDEO_RECOVERY_STATE_DIRTY
+        };
+        let _ = self.file.write_prefix_and_sync(&[state]);
     }
 }
 
@@ -2846,6 +3002,34 @@ fn video_output_lock_file(root: &RootedFs) -> Result<BoundFile> {
         0o600,
     )
     .context("failed to open the cross-process video output lock")
+}
+
+fn video_recovery_state_file(root: &RootedFs) -> Result<(BoundFile, bool)> {
+    let path = root
+        .logical_root_path()
+        .join(VIDEO_RECOVERY_STATE_FILE_NAME);
+    let entry = root.bind_entry(&path, false)?;
+    let previous = root.bound_entry_identity(&entry)?;
+    if previous.is_some_and(|identity| !identity.is_file()) {
+        bail!(
+            "video recovery state path is not a regular file: {}",
+            path.display()
+        );
+    }
+    let file = root
+        .open_or_create_bound_file(&path, 0o600)
+        .context("failed to open the video recovery state marker")?;
+    if previous.is_some_and(|identity| identity != file.identity()) {
+        bail!(
+            "video recovery state identity changed while opening: {}",
+            path.display()
+        );
+    }
+    Ok((file, previous.is_some()))
+}
+
+fn video_recovery_state_is_clean(file: &BoundFile) -> Result<bool> {
+    Ok(file.read_limited(1)?.first().copied() == Some(VIDEO_RECOVERY_STATE_CLEAN))
 }
 
 async fn video_output_lock(
@@ -2886,16 +3070,28 @@ async fn video_output_lock(
             format!("{job_label}: cross-process output slot acquired"),
         );
     }
-    let mut recoveries = root.reconcile_remove_quarantines()?;
-    recoveries.extend(recover_pending_overwrite_transactions_locked(
-        &root, video_dir,
-    )?);
+    let (recovery_state_file, recovery_state_existed) = video_recovery_state_file(&root)?;
+    let mut recoveries = Vec::new();
+    let mut unresolved_recovery = false;
+    if recovery_state_existed && !video_recovery_state_is_clean(&recovery_state_file)? {
+        let quarantine_recovery = root.reconcile_remove_quarantines_with_status()?;
+        let overwrite_recovery = recover_pending_overwrite_transactions_locked(&root, video_dir)?;
+        unresolved_recovery = quarantine_recovery.unresolved || overwrite_recovery.unresolved;
+        recoveries.extend(quarantine_recovery.messages);
+        recoveries.extend(overwrite_recovery.messages);
+    }
     for recovery in recoveries {
         warn_recovered_overwrite(&recovery);
         send_progress(progress, format!("{job_label}: {recovery}"));
     }
+    recovery_state_file.write_prefix_and_sync(&[VIDEO_RECOVERY_STATE_DIRTY])?;
     Ok(VideoOutputGuard {
         root,
+        recovery_state: VideoRecoveryState {
+            file: recovery_state_file,
+            operation_clean: Cell::new(true),
+            unresolved_before_operation: unresolved_recovery,
+        },
         _process_guard: process_guard,
         _file_guard: file_guard,
     })
@@ -2957,6 +3153,15 @@ async fn run_command(
     spec: &CommandSpec,
     progress: Option<JobProgressSender>,
 ) -> Result<CommandOutput> {
+    run_command_with_inherited_files(config, spec, &[], progress).await
+}
+
+async fn run_command_with_inherited_files(
+    config: &AppConfig,
+    spec: &CommandSpec,
+    inherited_files: &[BoundFile],
+    progress: Option<JobProgressSender>,
+) -> Result<CommandOutput> {
     let _cleanup = CommandCleanup::new(spec.cleanup_paths.clone());
     let mut file_activity = match &spec.activity_dir {
         Some(activity_dir) => match FileActivityTracker::new(activity_dir).await {
@@ -2977,6 +3182,13 @@ async fn run_command(
         }
     };
 
+    #[cfg(unix)]
+    let inherited_fds = prepare_inherited_command_fds(inherited_files)?;
+    #[cfg(not(unix))]
+    if !inherited_files.is_empty() {
+        bail!("inherited command files require a Unix platform");
+    }
+
     let mut command = Command::new(&spec.program);
     command
         .args(&spec.args)
@@ -2986,7 +3198,23 @@ async fn run_command(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(unix)]
-    command.process_group(0);
+    {
+        command.process_group(0);
+        if !inherited_fds.is_empty() {
+            // The source descriptors are CLOEXEC duplicates above the target range. dup2 clears
+            // CLOEXEC on each fixed child descriptor without allowing an argv pathname lookup.
+            unsafe {
+                command.pre_exec(move || {
+                    for (source, target) in &inherited_fds {
+                        if libc::dup2(source.as_raw_fd(), *target) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
 
     let mut child = command
         .spawn()
@@ -3091,6 +3319,27 @@ async fn run_command(
         stdout,
         stderr,
     })
+}
+
+#[cfg(unix)]
+fn prepare_inherited_command_fds(files: &[BoundFile]) -> Result<Vec<(OwnedFd, i32)>> {
+    let count = i32::try_from(files.len()).context("too many inherited command files")?;
+    let minimum_source_fd = BILIBILI_MUX_FD_BASE
+        .checked_add(count)
+        .and_then(|descriptor| descriptor.checked_add(16))
+        .context("too many inherited command files")?;
+    files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| {
+            let index = i32::try_from(index).context("too many inherited command files")?;
+            let target = BILIBILI_MUX_FD_BASE
+                .checked_add(index)
+                .context("too many inherited command files")?;
+            let source = file.duplicate_fd_cloexec_at_least(minimum_source_fd)?;
+            Ok((source, target))
+        })
+        .collect()
 }
 
 fn file_activity_poll_interval(progress_interval: Duration, idle_timeout: Duration) -> Duration {
@@ -3957,16 +4206,44 @@ fn push_unique_video_identity(identities: &mut Vec<VideoIdentity>, identity: Vid
     identities.push(identity);
 }
 
+fn is_bilibili_selection_required_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<bbdown_core::Error>()
+            .is_some_and(|error| matches!(error, bbdown_core::Error::SelectionRequired { .. }))
+    })
+}
+
+fn should_propagate_bilibili_probe_error(
+    selection: Option<BilibiliSelection>,
+    error: &anyhow::Error,
+) -> bool {
+    selection.is_none() && is_bilibili_selection_required_error(error)
+}
+
 fn bilibili_id_from_url(raw_url: &str) -> Option<String> {
     let url = url::Url::parse(raw_url).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    if !domain_or_subdomain(&host, "bilibili.com") && !domain_or_subdomain(&host, "bilibili.tv") {
+        return None;
+    }
     url.path_segments()?
-        .find(|segment| {
-            segment.starts_with("BV")
-                || segment.starts_with("bv")
-                || segment.starts_with("av")
-                || segment.starts_with("ep")
-        })
+        .find(|segment| is_direct_bilibili_id(segment))
         .map(str::to_string)
+}
+
+fn is_direct_bilibili_id(value: &str) -> bool {
+    value
+        .strip_prefix("BV")
+        .or_else(|| value.strip_prefix("bv"))
+        .is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+        || ["av", "ep"].into_iter().any(|prefix| {
+            value.strip_prefix(prefix).is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        })
 }
 
 fn video_identity(job: &JobRequest) -> Option<VideoIdentity> {
@@ -4028,12 +4305,13 @@ fn domain_or_subdomain(host: &str, domain: &str) -> bool {
 fn index_video_identities(
     index: &mut VideoIdentityIndex,
     video: &Path,
+    metadata_sidecars: &[PathBuf],
     read_policy: IdentityIndexReadPolicy,
 ) -> Result<()> {
     index_video_filename_identities(index, video);
 
-    for path in existing_metadata_sidecar_paths(video)? {
-        index_metadata_sidecar(index, video, &path, &path, read_policy)?;
+    for path in metadata_sidecars {
+        index_metadata_sidecar(index, video, path, path, read_policy)?;
     }
 
     Ok(())
@@ -4318,6 +4596,95 @@ fn existing_metadata_sidecar_paths(video: &Path) -> Result<Vec<PathBuf>> {
                 && best_primary_stem_for_sidecar(path, &primary_stems).as_deref() == Some(stem)
         })
         .collect())
+}
+
+#[derive(Debug, Default)]
+struct IdentityMediaInventory {
+    media_files: BTreeSet<PathBuf>,
+    metadata_sidecars: BTreeMap<PathBuf, Vec<PathBuf>>,
+    #[cfg(test)]
+    directory_scan_count: usize,
+}
+
+fn build_identity_media_inventory(
+    root: &Path,
+    primary_media_kind: StagedPrimaryMediaKind,
+) -> Result<IdentityMediaInventory> {
+    let mut inventory = IdentityMediaInventory::default();
+    collect_identity_media_inventory(root, primary_media_kind, &mut inventory)?;
+    Ok(inventory)
+}
+
+fn collect_identity_media_inventory(
+    directory: &Path,
+    primary_media_kind: StagedPrimaryMediaKind,
+    inventory: &mut IdentityMediaInventory,
+) -> Result<()> {
+    #[cfg(test)]
+    {
+        inventory.directory_scan_count += 1;
+    }
+
+    let mut regular_files = Vec::new();
+    for entry in fs::read_dir(directory)
+        .with_context(|| format!("failed to read {}", directory.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name == VIDEO_STAGING_DIR_NAME || name.starts_with(OVERWRITE_BACKUP_DIR_PREFIX)
+                })
+            {
+                continue;
+            }
+            collect_identity_media_inventory(&path, primary_media_kind, inventory)?;
+        } else if file_type.is_file() {
+            regular_files.push(path);
+        }
+    }
+
+    let mut all_primary_stems = BTreeSet::new();
+    let mut indexed_media_by_stem = BTreeMap::<String, Vec<PathBuf>>::new();
+    for path in &regular_files {
+        if (is_video_file(path) || is_audio_file(path))
+            && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+        {
+            all_primary_stems.insert(stem.to_string());
+            if is_primary_media_file(path, primary_media_kind) {
+                inventory.media_files.insert(path.clone());
+                indexed_media_by_stem
+                    .entry(stem.to_string())
+                    .or_default()
+                    .push(path.clone());
+            }
+        }
+    }
+
+    for sidecar in regular_files
+        .iter()
+        .filter(|path| identity_metadata_kind(path).is_some())
+    {
+        let Some(stem) = best_primary_stem_for_sidecar(sidecar, &all_primary_stems) else {
+            continue;
+        };
+        let Some(media_files) = indexed_media_by_stem.get(&stem) else {
+            continue;
+        };
+        for media_file in media_files {
+            inventory
+                .metadata_sidecars
+                .entry(media_file.clone())
+                .or_default()
+                .push(sidecar.clone());
+        }
+    }
+
+    Ok(())
 }
 
 fn list_video_files(root: &Path) -> Result<BTreeSet<PathBuf>> {
@@ -6292,49 +6659,72 @@ pub fn recover_pending_overwrite_transactions(video_dir: &Path) -> Result<Vec<St
     recovery_lock
         .lock_exclusive()
         .context("failed to serialize overwrite recovery with active downloads")?;
-    let mut recovered = root.reconcile_remove_quarantines()?;
-    recovered.extend(recover_pending_overwrite_transactions_locked(
-        &root, video_dir,
-    )?);
-    Ok(recovered)
+    let (recovery_state, _) = video_recovery_state_file(&root)?;
+    let quarantine_recovery = root.reconcile_remove_quarantines_with_status()?;
+    let overwrite_recovery = recover_pending_overwrite_transactions_locked(&root, video_dir)?;
+    let unresolved = quarantine_recovery.unresolved || overwrite_recovery.unresolved;
+    recovery_state.write_prefix_and_sync(&[if unresolved {
+        VIDEO_RECOVERY_STATE_DIRTY
+    } else {
+        VIDEO_RECOVERY_STATE_CLEAN
+    }])?;
+    let mut messages = quarantine_recovery.messages;
+    messages.extend(overwrite_recovery.messages);
+    Ok(messages)
+}
+
+#[derive(Debug, Default)]
+struct OverwriteRecoveryReport {
+    messages: Vec<String>,
+    unresolved: bool,
 }
 
 fn recover_pending_overwrite_transactions_locked(
     root: &RootedFs,
     video_dir: &Path,
-) -> Result<Vec<String>> {
+) -> Result<OverwriteRecoveryReport> {
     let mut directories = Vec::new();
-    let mut recovered = Vec::new();
+    let mut report = OverwriteRecoveryReport::default();
     collect_overwrite_recovery_directories(
         root,
         video_dir,
         video_dir,
         &mut directories,
-        &mut recovered,
+        &mut report.messages,
     )?;
+    report.unresolved = !report.messages.is_empty();
     directories.sort();
 
     for directory in directories {
         let manifest_path = directory.join(OVERWRITE_RECOVERY_MANIFEST_NAME);
         match root.open_bound_file(&manifest_path) {
-            Ok(None) => recovered.push(format!(
-                "Retained unrecognized legacy overwrite backup directory: {}",
-                directory.display()
-            )),
-            Ok(Some(_)) => match recover_overwrite_transaction(root, &directory) {
-                Ok(report) => recovered.extend(report),
-                Err(err) => recovered.push(format!(
-                    "Retained unresolved overwrite transaction {}: {err:#}",
+            Ok(None) => {
+                report.unresolved = true;
+                report.messages.push(format!(
+                    "Retained unrecognized legacy overwrite backup directory: {}",
                     directory.display()
-                )),
+                ));
+            }
+            Ok(Some(_)) => match recover_overwrite_transaction(root, &directory) {
+                Ok(messages) => report.messages.extend(messages),
+                Err(err) => {
+                    report.unresolved = true;
+                    report.messages.push(format!(
+                        "Retained unresolved overwrite transaction {}: {err:#}",
+                        directory.display()
+                    ));
+                }
             },
-            Err(err) => recovered.push(format!(
-                "Retained unreadable overwrite transaction {}: {err:#}",
-                directory.display()
-            )),
+            Err(err) => {
+                report.unresolved = true;
+                report.messages.push(format!(
+                    "Retained unreadable overwrite transaction {}: {err:#}",
+                    directory.display()
+                ));
+            }
         }
     }
-    Ok(recovered)
+    Ok(report)
 }
 
 fn collect_overwrite_recovery_directories(
@@ -7239,10 +7629,38 @@ mod tests {
             }),
             None
         );
+        for token in ["BVopaque", "bvopaque", "av123", "ep456"] {
+            assert_eq!(
+                video_identity(&JobRequest::Bilibili {
+                    url: format!("https://b23.tv/{token}"),
+                    selection: None,
+                }),
+                None,
+                "short-link tokens must not be treated as direct Bilibili identities"
+            );
+        }
         assert_eq!(
             youtube_id_from_url("https://notyoutube.com/watch?v=PHH1wTDF-1M"),
             None
         );
+    }
+
+    #[test]
+    fn selection_required_probe_errors_override_duplicate_identity_fallbacks() {
+        let error = anyhow::Error::from(bbdown_core::Error::SelectionRequired {
+            input_kind: "season",
+        })
+        .context("Bilibili plan probe failed");
+
+        assert!(should_propagate_bilibili_probe_error(None, &error));
+        assert!(!should_propagate_bilibili_probe_error(
+            Some(BilibiliSelection::Latest),
+            &error
+        ));
+        assert!(!should_propagate_bilibili_probe_error(
+            None,
+            &anyhow!("ordinary probe failure")
+        ));
     }
 
     #[test]
@@ -7587,6 +8005,34 @@ mod tests {
             };
             assert_eq!(index.videos(&identity), std::slice::from_ref(&video));
         }
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn duplicate_identity_inventory_scans_each_directory_once() {
+        let video_dir = temp_test_dir("duplicate-identity-linear-scan");
+        for index in 0..64 {
+            let video = video_dir.join(format!("Video {index}.mp4"));
+            fs::write(&video, "video").expect("video should write");
+            fs::write(
+                video.with_extension("nfo"),
+                format!("<movie><uniqueid type=\"youtube\">id-{index}</uniqueid></movie>"),
+            )
+            .expect("sidecar should write");
+        }
+
+        let inventory = build_identity_media_inventory(&video_dir, StagedPrimaryMediaKind::Video)
+            .expect("identity inventory should build");
+
+        assert_eq!(inventory.directory_scan_count, 1);
+        assert_eq!(inventory.media_files.len(), 64);
+        assert_eq!(inventory.metadata_sidecars.len(), 64);
+        assert!(
+            inventory
+                .metadata_sidecars
+                .values()
+                .all(|sidecars| sidecars.len() == 1)
+        );
         let _ = fs::remove_dir_all(video_dir);
     }
 
@@ -10766,17 +11212,37 @@ mod tests {
                 path: entry_dir.join("audio.m4s"),
             },
         ];
+        for input in &inputs {
+            fs::write(&input.path, &input.kind).expect("mux input should write");
+        }
         let output = entry_dir.join("Episode.mp4");
         let root = RootedFs::new(&entry_dir).expect("entry root should bind");
+        let bound_inputs =
+            bind_bilibili_mux_inputs(&root, &inputs).expect("mux inputs should bind");
 
-        let (spec, concat_file) =
-            bilibili_local_mux_command_spec(&config, &root, &inputs, &entry_dir, &output)
-                .expect("dash mux spec should build");
+        let BilibiliMuxCommand {
+            spec,
+            concat_file,
+            inherited_files,
+        } = bilibili_local_mux_command_spec(
+            &config,
+            &root,
+            &inputs,
+            &bound_inputs,
+            &entry_dir,
+            &output,
+        )
+        .expect("dash mux spec should build");
 
         assert!(concat_file.is_none());
+        assert_eq!(inherited_files.len(), 2);
         assert_eq!(spec.program, PathBuf::from("/opt/bin/ffmpeg"));
         assert_eq!(spec.cwd, entry_dir);
         assert!(spec.args.contains(&"-nostdin".to_string()));
+        assert!(spec.args.contains(&"/dev/fd/64".to_string()));
+        assert!(spec.args.contains(&"/dev/fd/65".to_string()));
+        assert!(!spec.args.iter().any(|arg| arg.ends_with("video.m4s")));
+        assert!(!spec.args.iter().any(|arg| arg.ends_with("audio.m4s")));
         assert!(spec.args.windows(2).any(|args| args == ["-map", "0:0"]));
         assert!(spec.args.windows(2).any(|args| args == ["-map", "1:0"]));
         assert!(!spec.args.windows(2).any(|args| args == ["-f", "concat"]));
@@ -10880,6 +11346,62 @@ printf replacement > "$output"
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bilibili_mux_reads_the_bound_input_across_a_path_aba_replacement() {
+        let root = temp_test_dir("bilibili-local-mux-bound-input");
+        let video = root.join("video.m4s");
+        let fake_ffmpeg = root.join("fake-ffmpeg.sh");
+        fs::write(&video, "original-video").expect("raw video should write");
+        fs::write(
+            &fake_ffmpeg,
+            r#"#!/bin/sh
+input=
+output=
+next_is_input=no
+for arg do
+    output=$arg
+    if test "$next_is_input" = yes; then
+        input=$arg
+        next_is_input=no
+    elif test "$arg" = -i; then
+        next_is_input=yes
+    fi
+done
+test -n "$input" || exit 41
+mv video.m4s video.original || exit 42
+printf replacement > video.m4s || exit 43
+cat "$input" > "$output" || exit 44
+rm video.m4s || exit 45
+mv video.original video.m4s || exit 46
+"#,
+        )
+        .expect("fake ffmpeg should write");
+        fs::set_permissions(&fake_ffmpeg, fs::Permissions::from_mode(0o700))
+            .expect("fake ffmpeg should become executable");
+
+        let mut config = test_config();
+        config.tools.ffmpeg = fake_ffmpeg;
+        config.bot.command_timeout_seconds = 5;
+        config.bot.command_idle_timeout_seconds = 5;
+        let mut report = parse_bilibili_download_report(
+            r#"{"title":"Episode","output_dir":".","entries":[{"index":1,"title":"Episode","files":[{"kind":"video","path":"video.m4s"}]}]}"#,
+        )
+        .expect("download report should parse");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+
+        mux_bilibili_report_media(&config, &rooted, &root, &mut report, UNIX_EPOCH, None)
+            .await
+            .expect("descriptor-bound mux should succeed");
+
+        assert_eq!(
+            fs::read_to_string(root.join("Episode.mp4")).expect("mux output should exist"),
+            "original-video"
+        );
+        assert_eq!(fs::read_to_string(&video).unwrap(), "original-video");
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn builds_bilibili_local_flv_concat_mux_command() {
         let config = test_config();
@@ -10896,18 +11418,33 @@ printf replacement > "$output"
                 path: entry_dir.join("segment-002.flv"),
             },
         ];
+        for input in &inputs {
+            fs::write(&input.path, &input.kind).expect("mux input should write");
+        }
         let output = entry_dir.join("Episode.mp4");
         let root = RootedFs::new(&entry_dir).expect("entry root should bind");
+        let bound_inputs =
+            bind_bilibili_mux_inputs(&root, &inputs).expect("mux inputs should bind");
 
-        let (spec, concat_file) =
-            bilibili_local_mux_command_spec(&config, &root, &inputs, &entry_dir, &output)
-                .expect("flv mux spec should build");
+        let BilibiliMuxCommand {
+            spec,
+            concat_file,
+            inherited_files,
+        } = bilibili_local_mux_command_spec(
+            &config,
+            &root,
+            &inputs,
+            &bound_inputs,
+            &entry_dir,
+            &output,
+        )
+        .expect("flv mux spec should build");
 
         let concat_file = concat_file.expect("flv mux should create concat list");
+        assert_eq!(inherited_files.len(), 3);
         let concat_path = concat_file.path().to_path_buf();
         let concat = fs::read_to_string(&concat_path).expect("concat list should read");
-        assert!(concat.contains("segment-001.flv"));
-        assert!(concat.contains("segment-002.flv"));
+        assert_eq!(concat, "file '/dev/fd/65'\nfile '/dev/fd/66'\n");
         assert_ne!(concat_path, user_concat);
         assert!(
             concat_path
@@ -10916,11 +11453,10 @@ printf replacement > "$output"
                 .is_some_and(|name| name.starts_with(BILIBILI_FFMPEG_CONCAT_FILE_PREFIX))
         );
         assert!(spec.args.windows(2).any(|args| args == ["-f", "concat"]));
-        let concat_arg = command_path_arg(&concat_path);
         assert!(
             spec.args
                 .windows(2)
-                .any(|args| args[0] == "-i" && args[1] == concat_arg)
+                .any(|args| args[0] == "-i" && args[1] == "/dev/fd/64")
         );
         drop(concat_file);
         assert!(!concat_path.exists());
@@ -11681,6 +12217,11 @@ printf replacement > "$output"
                 .expect("overwrite target should be acquired");
         drop(acquired);
         assert!(!existing.exists());
+        video_recovery_state_file(&root)
+            .expect("recovery state should open")
+            .0
+            .write_prefix_and_sync(&[VIDEO_RECOVERY_STATE_DIRTY])
+            .expect("crashed owner should leave a dirty recovery state");
 
         let blocker = video_output_lock_file(&root).expect("blocking lock should open");
         assert!(
@@ -11713,6 +12254,38 @@ printf replacement > "$output"
         assert_eq!(fs::read_to_string(&existing).unwrap(), "original-video");
         assert!(existing.with_extension("nfo").is_file());
         assert!(overwrite_backup_dirs(&video_dir).is_empty());
+        drop(guard);
+        assert!(
+            video_recovery_state_is_clean(
+                &video_recovery_state_file(&root)
+                    .expect("recovery state should reopen")
+                    .0
+            )
+            .expect("recovery state should read")
+        );
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[tokio::test]
+    async fn clean_video_output_lock_skips_recursive_recovery_scans() {
+        let video_dir = temp_test_dir("video-output-lock-clean-recovery-state");
+        let nested = video_dir.join("library");
+        let unresolved = nested.join(format!("{OVERWRITE_BACKUP_DIR_PREFIX}-legacy"));
+        fs::create_dir_all(&unresolved).expect("legacy recovery directory should create");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+        video_recovery_state_file(&root)
+            .expect("recovery state should open")
+            .0
+            .write_prefix_and_sync(&[VIDEO_RECOVERY_STATE_CLEAN])
+            .expect("recovery state should become clean");
+        let (tx, rx) = job_progress_channel();
+
+        let guard = video_output_lock(&video_dir, "Bilibili download", Some(&tx))
+            .await
+            .expect("clean output lock should acquire");
+
+        assert_no_progress(&rx);
+        assert!(unresolved.is_dir());
         drop(guard);
         let _ = fs::remove_dir_all(video_dir);
     }

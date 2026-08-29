@@ -1,6 +1,8 @@
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::fd::RawFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     Arc,
@@ -69,6 +71,12 @@ pub(crate) struct BoundEntry {
 pub(crate) struct BoundFile {
     fd: Arc<OwnedFd>,
     identity: EntryIdentity,
+}
+
+#[derive(Debug)]
+pub(crate) struct RemoveQuarantineRecoveryReport {
+    pub(crate) messages: Vec<String>,
+    pub(crate) unresolved: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -145,6 +153,10 @@ impl BoundFile {
             .map_err(errno_to_io)
             .context("failed to duplicate bound file descriptor")?;
         let mut reader = File::from(duplicate).take((limit as u64).saturating_add(1));
+        reader
+            .get_mut()
+            .seek(SeekFrom::Start(0))
+            .context("failed to seek bound file")?;
         let mut contents = Vec::new();
         reader
             .read_to_end(&mut contents)
@@ -154,6 +166,32 @@ impl BoundFile {
         }
         self.validate_identity()?;
         Ok(contents)
+    }
+
+    pub(crate) fn write_prefix_and_sync(&self, contents: &[u8]) -> Result<()> {
+        self.validate_identity()?;
+        let duplicate = rustix::io::dup(self.fd.as_ref())
+            .map_err(errno_to_io)
+            .context("failed to duplicate writable bound file descriptor")?;
+        let mut writer = File::from(duplicate);
+        writer
+            .seek(SeekFrom::Start(0))
+            .context("failed to seek writable bound file")?;
+        writer
+            .write_all(contents)
+            .and_then(|()| writer.sync_all())
+            .context("failed to persist bound file contents")?;
+        self.validate_identity()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn duplicate_fd_cloexec_at_least(&self, minimum: RawFd) -> Result<OwnedFd> {
+        self.validate_identity()?;
+        let duplicate = rustix::io::fcntl_dupfd_cloexec(self.fd.as_ref(), minimum)
+            .map_err(errno_to_io)
+            .context("failed to duplicate bound file descriptor for a child process")?;
+        self.validate_identity()?;
+        Ok(duplicate)
     }
 
     pub(crate) fn lock_exclusive(&self) -> Result<()> {
@@ -214,17 +252,29 @@ impl RootedFs {
         self.validate_root()
     }
 
+    #[cfg(test)]
     pub(crate) fn reconcile_remove_quarantines(&self) -> Result<Vec<String>> {
+        Ok(self.reconcile_remove_quarantines_with_status()?.messages)
+    }
+
+    pub(crate) fn reconcile_remove_quarantines_with_status(
+        &self,
+    ) -> Result<RemoveQuarantineRecoveryReport> {
         self.validate_root()?;
         let mut reports = Vec::new();
+        let mut unresolved = false;
         reconcile_remove_quarantines_in_directory(
             self.root_fd.as_ref(),
             self.root_identity,
             &self.logical_root,
             &mut reports,
+            &mut unresolved,
         )?;
         self.validate_root()?;
-        Ok(reports)
+        Ok(RemoveQuarantineRecoveryReport {
+            messages: reports,
+            unresolved,
+        })
     }
 
     pub(crate) fn bind_entry(&self, path: &Path, create_parent: bool) -> Result<BoundEntry> {
@@ -1134,6 +1184,7 @@ fn reconcile_remove_quarantines_in_directory(
     expected_directory: EntryIdentity,
     display_path: &Path,
     reports: &mut Vec<String>,
+    unresolved: &mut bool,
 ) -> Result<()> {
     if identity_for_fd(directory)? != expected_directory {
         bail!(
@@ -1168,6 +1219,7 @@ fn reconcile_remove_quarantines_in_directory(
         }
         let path = display_path.join(name.to_string_lossy().as_ref());
         let Some(identity) = identity_at_cstr(directory, &name)? else {
+            *unresolved = true;
             reports.push(format!(
                 "Skipped disappearing entry during interrupted-removal scan: {}",
                 path.display()
@@ -1189,10 +1241,13 @@ fn reconcile_remove_quarantines_in_directory(
                     "Recovered interrupted bound-path removal: {}",
                     path.display()
                 )),
-                Err(err) => reports.push(format!(
-                    "Retained unresolved interrupted-removal quarantine {}: {err:#}",
-                    path.display()
-                )),
+                Err(err) => {
+                    *unresolved = true;
+                    reports.push(format!(
+                        "Retained unresolved interrupted-removal quarantine {}: {err:#}",
+                        path.display()
+                    ));
+                }
             }
             continue;
         }
@@ -1202,6 +1257,7 @@ fn reconcile_remove_quarantines_in_directory(
         let child = match openat_directory_cstr(directory, &name) {
             Ok(child) => child,
             Err(err) => {
+                *unresolved = true;
                 reports.push(format!(
                     "Skipped unreadable directory during interrupted-removal scan {}: {err}",
                     path.display()
@@ -1210,6 +1266,7 @@ fn reconcile_remove_quarantines_in_directory(
             }
         };
         if identity_for_fd(&child)? != identity {
+            *unresolved = true;
             reports.push(format!(
                 "Skipped replaced directory during interrupted-removal scan: {}",
                 path.display()
@@ -1217,8 +1274,9 @@ fn reconcile_remove_quarantines_in_directory(
             continue;
         }
         if let Err(err) =
-            reconcile_remove_quarantines_in_directory(&child, identity, &path, reports)
+            reconcile_remove_quarantines_in_directory(&child, identity, &path, reports, unresolved)
         {
+            *unresolved = true;
             reports.push(format!(
                 "Skipped directory during interrupted-removal scan {}: {err:#}",
                 path.display()

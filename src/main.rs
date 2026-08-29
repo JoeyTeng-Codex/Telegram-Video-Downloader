@@ -819,14 +819,15 @@ async fn save_bbdown_login_credentials(
     auth_epoch: u64,
     credentials: bbdown_core::Credentials,
 ) -> Result<SavedBilibiliLogin> {
+    let credential_profile = config.bilibili.auth.credential_profile.clone();
     save_bbdown_login_credentials_with_sync(
         config,
         auth_generation,
         auth_epoch,
         credentials,
-        |transaction| {
+        move |transaction| {
             transaction
-                .sync_legacy_cookie(config.bilibili.auth.credential_profile.as_deref())
+                .sync_legacy_cookie(credential_profile.as_deref())
                 .context(
                     "failed to migrate legacy BBDown auth state before saving fresh credentials",
                 )?;
@@ -844,31 +845,39 @@ async fn save_bbdown_login_credentials_with_sync<F>(
     sync_legacy: F,
 ) -> Result<SavedBilibiliLogin>
 where
-    F: for<'a> FnOnce(&bilibili_auth::LockedAuthMutation<'a>) -> Result<()>,
+    F: for<'a> FnOnce(&bilibili_auth::LockedAuthMutation<'a>) -> Result<()> + Send + 'static,
 {
     let _state_guard = bbdown_auth_state_lock().lock().await;
     ensure_bbdown_login_active(auth_generation)?;
-    let (summary, auth_epoch) = bilibili_auth::with_auth_mutation_transaction_at_epoch(
-        &config.bilibili.auth.state_path,
-        &config.bilibili.auth.credential_file,
-        auth_epoch,
-        |transaction| {
-            ensure_bbdown_login_active(auth_generation)?;
-            sync_legacy(transaction)?;
-            ensure_bbdown_login_active(auth_generation)?;
-            let summary = bilibili_core::credential_runtime(config)?.save_merged(credentials)?;
-            ensure_bbdown_login_active(auth_generation)?;
-            if let Err(err) = transaction.delete_legacy_state() {
-                warn!(
-                    error = %err,
-                    path = %config.bilibili.auth.state_path.display(),
-                    "fresh BBDown credentials saved but legacy auth state cleanup failed"
-                );
-            }
-            ensure_bbdown_login_active(auth_generation)?;
-            Ok(summary)
-        },
-    )?;
+    let blocking_config = config.clone();
+    let state_path = config.bilibili.auth.state_path.clone();
+    let credential_file = config.bilibili.auth.credential_file.clone();
+    let (summary, auth_epoch) = tokio::task::spawn_blocking(move || {
+        bilibili_auth::with_auth_mutation_transaction_at_epoch(
+            &state_path,
+            &credential_file,
+            auth_epoch,
+            |transaction| {
+                ensure_bbdown_login_active(auth_generation)?;
+                sync_legacy(transaction)?;
+                ensure_bbdown_login_active(auth_generation)?;
+                let summary = bilibili_core::credential_runtime(&blocking_config)?
+                    .save_merged(credentials)?;
+                ensure_bbdown_login_active(auth_generation)?;
+                if let Err(err) = transaction.delete_legacy_state() {
+                    warn!(
+                        error = %err,
+                        path = %state_path.display(),
+                        "fresh BBDown credentials saved but legacy auth state cleanup failed"
+                    );
+                }
+                ensure_bbdown_login_active(auth_generation)?;
+                Ok(summary)
+            },
+        )
+    })
+    .await
+    .context("BBDown credential save task failed")??;
     ensure_bbdown_login_active(auth_generation)?;
     let credential_revision = BILIBILI_CREDENTIAL_REVISION
         .fetch_add(1, Ordering::SeqCst)
@@ -889,35 +898,28 @@ async fn send_current_bbdown_login_success(
     success_message: String,
 ) {
     let _reply_guard = bbdown_auth_reply_lock().lock().await;
-    match acquire_bbdown_auth_reply_file_lock(config).await {
-        Ok(file_lock) => {
-            let message = match file_lock.current_epoch() {
-                Ok(current_epoch) => current_bbdown_login_success_message(
-                    saved.auth_generation,
-                    saved.credential_revision,
-                    saved.auth_epoch,
-                    current_epoch,
-                    success_message,
-                ),
-                Err(err) => format!(
-                    "Failed to confirm BBDown login state:\n{}",
-                    summarize_bbdown_auth_error(&err)
-                ),
-            };
-            send_or_log(telegram, chat_id, message).await;
-        }
-        Err(err) => {
-            send_or_log(
-                telegram,
-                chat_id,
-                format!(
-                    "Failed to lock BBDown credential state for login confirmation:\n{}",
-                    summarize_bbdown_auth_error(&err)
-                ),
-            )
-            .await;
-        }
-    }
+    let auth_generation = saved.auth_generation;
+    let credential_revision = saved.credential_revision;
+    let auth_epoch = saved.auth_epoch;
+    send_bbdown_auth_reply(
+        telegram,
+        config,
+        chat_id,
+        move |current_epoch| match current_epoch {
+            Ok(current_epoch) => current_bbdown_login_success_message(
+                auth_generation,
+                credential_revision,
+                auth_epoch,
+                current_epoch,
+                success_message,
+            ),
+            Err(err) => format!(
+                "Failed to confirm BBDown login state:\n{}",
+                summarize_bbdown_auth_error(&err)
+            ),
+        },
+    )
+    .await;
 }
 
 fn current_bbdown_login_success_message(
@@ -1314,36 +1316,23 @@ async fn run_bbdown_status(telegram: TelegramClient, config: Arc<AppConfig>, cha
         ),
     };
     let _reply_guard = bbdown_auth_reply_lock().lock().await;
-    match acquire_bbdown_auth_reply_file_lock(&config).await {
-        Ok(file_lock) => {
-            let message = match (auth_epoch, file_lock.current_epoch()) {
-                (Some(auth_epoch), Ok(current_auth_epoch)) => current_bbdown_status_message(
-                    auth_generation,
-                    credential_revision,
-                    auth_epoch,
-                    current_auth_epoch,
-                    message,
-                ),
-                (None, Ok(_)) => message,
-                (_, Err(err)) => format!(
-                    "Failed to confirm BBDown credential state after status check:\n{}",
-                    summarize_bbdown_auth_error(&err)
-                ),
-            };
-            send_or_log(&telegram, chat_id, message).await;
+    send_bbdown_auth_reply(&telegram, &config, chat_id, move |current_epoch| {
+        match (auth_epoch, current_epoch) {
+            (Some(auth_epoch), Ok(current_auth_epoch)) => current_bbdown_status_message(
+                auth_generation,
+                credential_revision,
+                auth_epoch,
+                current_auth_epoch,
+                message,
+            ),
+            (None, Ok(_)) => message,
+            (_, Err(err)) => format!(
+                "Failed to confirm BBDown credential state after status check:\n{}",
+                summarize_bbdown_auth_error(&err)
+            ),
         }
-        Err(err) => {
-            send_or_log(
-                &telegram,
-                chat_id,
-                format!(
-                    "Failed to lock BBDown credential state for status reply:\n{}",
-                    summarize_bbdown_auth_error(&err)
-                ),
-            )
-            .await;
-        }
-    }
+    })
+    .await;
 }
 
 fn current_bbdown_status_message(
@@ -1385,6 +1374,39 @@ async fn acquire_bbdown_auth_reply_file_lock(
     .context("BBDown auth lock task failed")?
 }
 
+async fn send_bbdown_auth_reply<F>(
+    telegram: &TelegramClient,
+    config: &AppConfig,
+    chat_id: i64,
+    message_for_epoch: F,
+) where
+    F: FnOnce(Result<u64>) -> String + Send + 'static,
+{
+    let blocking_telegram = telegram.clone();
+    let state_path = config.bilibili.auth.state_path.clone();
+    let credential_file = config.bilibili.auth.credential_file.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let sent = tokio::task::spawn_blocking(move || {
+        let file_lock = bilibili_auth::acquire_auth_reply_file_lock(&state_path, &credential_file);
+        let current_epoch = match &file_lock {
+            Ok(file_lock) => file_lock.current_epoch(),
+            Err(err) => Err(anyhow::anyhow!("{err:#}")),
+        };
+        let message = message_for_epoch(current_epoch);
+        runtime.block_on(send_or_log(&blocking_telegram, chat_id, message));
+        drop(file_lock);
+    })
+    .await;
+    if let Err(err) = sent {
+        send_or_log(
+            telegram,
+            chat_id,
+            format!("Failed to send BBDown auth reply from blocking task: {err}"),
+        )
+        .await;
+    }
+}
+
 async fn current_bbdown_auth_epoch(config: &AppConfig) -> Result<u64> {
     let file_lock = acquire_bbdown_auth_reply_file_lock(config).await?;
     file_lock.current_epoch()
@@ -1402,11 +1424,22 @@ async fn run_bbdown_logout(telegram: TelegramClient, config: Arc<AppConfig>, cha
     pending_bilibili_access_key_logins().lock().await.clear();
     let cleanup = {
         let _state_guard = bbdown_auth_state_lock().lock().await;
-        let cleanup = bilibili_auth::clear_auth_state_and_credentials_with_epoch(
-            &config.bilibili.auth.state_path,
-            &config.bilibili.auth.credential_file,
-            || bilibili_core::credential_runtime(&config).and_then(|runtime| runtime.logout()),
-        );
+        let blocking_config = Arc::clone(&config);
+        let state_path = config.bilibili.auth.state_path.clone();
+        let credential_file = config.bilibili.auth.credential_file.clone();
+        let cleanup = tokio::task::spawn_blocking(move || {
+            bilibili_auth::clear_auth_state_and_credentials_with_epoch(
+                &state_path,
+                &credential_file,
+                || {
+                    bilibili_core::credential_runtime(&blocking_config)
+                        .and_then(|runtime| runtime.logout())
+                },
+            )
+        })
+        .await
+        .context("BBDown logout task failed")
+        .and_then(|result| result);
         // Return to a stable even generation and invalidate status checks that started after
         // logout was requested but before the credential files were cleared.
         BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
@@ -1441,32 +1474,19 @@ async fn run_bbdown_logout(telegram: TelegramClient, config: Arc<AppConfig>, cha
         ),
     };
     let _reply_guard = bbdown_auth_reply_lock().lock().await;
-    match acquire_bbdown_auth_reply_file_lock(&config).await {
-        Ok(file_lock) => {
-            let message = match (auth_epoch, file_lock.current_epoch()) {
-                (Some(auth_epoch), Ok(current_auth_epoch)) => {
-                    current_bbdown_logout_message(auth_epoch, current_auth_epoch, message)
-                }
-                (None, Ok(_)) => message,
-                (_, Err(err)) => format!(
-                    "Failed to confirm BBDown credential state after logout:\n{}",
-                    summarize_bbdown_auth_error(&err)
-                ),
-            };
-            send_or_log(&telegram, chat_id, message).await;
+    send_bbdown_auth_reply(&telegram, &config, chat_id, move |current_epoch| {
+        match (auth_epoch, current_epoch) {
+            (Some(auth_epoch), Ok(current_auth_epoch)) => {
+                current_bbdown_logout_message(auth_epoch, current_auth_epoch, message)
+            }
+            (None, Ok(_)) => message,
+            (_, Err(err)) => format!(
+                "Failed to confirm BBDown credential state after logout:\n{}",
+                summarize_bbdown_auth_error(&err)
+            ),
         }
-        Err(err) => {
-            send_or_log(
-                &telegram,
-                chat_id,
-                format!(
-                    "Failed to lock BBDown credential state for logout reply:\n{}",
-                    summarize_bbdown_auth_error(&err)
-                ),
-            )
-            .await;
-        }
-    }
+    })
+    .await;
 }
 
 fn current_bbdown_logout_message(
@@ -2864,6 +2884,47 @@ mod tests {
         assert!(error.to_string().contains("synthetic migration failure"));
         assert!(config.bilibili.auth.state_path.is_file());
         assert!(!config.bilibili.auth.credential_file.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fresh_login_runs_the_file_lock_transaction_off_the_runtime_thread() {
+        let _guard = TEST_AUTH_GENERATION_LOCK.lock().await;
+        let root = temp_main_test_dir("fresh-login-blocking-transaction");
+        fs::create_dir_all(&root).expect("temp dir should create");
+        let mut config = AppConfig::for_test();
+        config.bilibili.auth.state_path = root.join("bilibili-auth.json");
+        config.bilibili.auth.credential_file = root.join("bbdown-credentials.json");
+        let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+        let revision = BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst);
+        let auth_epoch = current_bbdown_auth_epoch(&config)
+            .await
+            .expect("auth epoch should load");
+        let runtime_thread = std::thread::current().id();
+        let (thread_tx, thread_rx) = std::sync::mpsc::sync_channel(1);
+
+        save_bbdown_login_credentials_with_sync(
+            &config,
+            generation,
+            auth_epoch,
+            bbdown_core::Credentials::default().with_access_key("fresh-access-key"),
+            move |_| {
+                thread_tx
+                    .send(std::thread::current().id())
+                    .expect("test should receive the transaction thread");
+                Ok(())
+            },
+        )
+        .await
+        .expect("fresh credentials should save");
+
+        assert_ne!(
+            thread_rx
+                .recv()
+                .expect("transaction thread should be recorded"),
+            runtime_thread
+        );
+        BILIBILI_CREDENTIAL_REVISION.store(revision, Ordering::SeqCst);
         let _ = fs::remove_dir_all(root);
     }
 
