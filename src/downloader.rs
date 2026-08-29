@@ -9,7 +9,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -6244,6 +6244,7 @@ fn create_video_staging_dir(root: &RootedFs) -> Result<BoundStagingDir> {
                     directory,
                     identity,
                     removed: false,
+                    preserve_on_drop: AtomicBool::new(false),
                 });
             }
             None => continue,
@@ -6702,6 +6703,14 @@ struct CommittedOverwriteState {
     anchors: BTreeMap<PathBuf, BoundFile>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverwriteCommitCheckpoint {
+    BeforeOutputSync,
+    BeforeAnchorCreation,
+    BeforeManifestReplace,
+    AfterManifestReplace,
+}
+
 #[derive(Debug)]
 struct AcquiredOverwrite {
     root: RootedFs,
@@ -6773,8 +6782,21 @@ impl AcquiredOverwrite {
         }
     }
 
-    fn commit(mut self, moved: &[MovedFile], committed_target: &Path) -> Result<()> {
-        let committed = persist_committed_overwrite_manifest(&mut self, moved, committed_target)?;
+    fn commit_with_hook<F>(
+        mut self,
+        moved: &[MovedFile],
+        committed_target: &Path,
+        hook: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(OverwriteCommitCheckpoint) -> Result<()>,
+    {
+        let committed = persist_committed_overwrite_manifest_with_hook(
+            &mut self,
+            moved,
+            committed_target,
+            hook,
+        )?;
         remove_backups(&self.root, &self.backups, &self.recovery, &committed)
     }
 }
@@ -6786,6 +6808,7 @@ struct BoundStagingDir {
     directory: BoundDirectory,
     identity: EntryIdentity,
     removed: bool,
+    preserve_on_drop: AtomicBool,
 }
 
 impl BoundStagingDir {
@@ -6805,11 +6828,15 @@ impl BoundStagingDir {
         self.removed = true;
         Ok(())
     }
+
+    fn preserve_for_recovery(&self) {
+        self.preserve_on_drop.store(true, Ordering::Release);
+    }
 }
 
 impl Drop for BoundStagingDir {
     fn drop(&mut self) {
-        if self.removed {
+        if self.removed || self.preserve_on_drop.load(Ordering::Acquire) {
             return;
         }
         if let Err(err) = self
@@ -7182,6 +7209,20 @@ fn persist_committed_overwrite_manifest(
     moved: &[MovedFile],
     committed_target: &Path,
 ) -> Result<CommittedOverwriteState> {
+    persist_committed_overwrite_manifest_with_hook(acquired, moved, committed_target, &mut |_| {
+        Ok(())
+    })
+}
+
+fn persist_committed_overwrite_manifest_with_hook<F>(
+    acquired: &mut AcquiredOverwrite,
+    moved: &[MovedFile],
+    committed_target: &Path,
+    hook: &mut F,
+) -> Result<CommittedOverwriteState>
+where
+    F: FnMut(OverwriteCommitCheckpoint) -> Result<()>,
+{
     let transaction_parent = acquired
         .recovery
         .backup_dir
@@ -7241,6 +7282,7 @@ fn persist_committed_overwrite_manifest(
                 path.display()
             );
         }
+        hook(OverwriteCommitCheckpoint::BeforeOutputSync)?;
         file.sync_all().with_context(|| {
             format!(
                 "failed to persist committed overwrite file {} before publishing recovery state",
@@ -7250,7 +7292,7 @@ fn persist_committed_overwrite_manifest(
         files.insert(file_name.clone(), file);
     }
     let (committed_files, anchors) =
-        create_committed_output_anchors(acquired, transaction_parent, &identities)?;
+        create_committed_output_anchors(acquired, transaction_parent, &identities, hook)?;
     let manifest = overwrite_recovery_manifest(
         &acquired.root,
         &acquired.recovery.backup_dir,
@@ -7265,6 +7307,7 @@ fn persist_committed_overwrite_manifest(
         .recovery
         .backup_dir
         .join(OVERWRITE_RECOVERY_MANIFEST_TEMP_NAME);
+    hook(OverwriteCommitCheckpoint::BeforeManifestReplace)?;
     let (manifest_entry, manifest_identity) = acquired
         .root
         .replace_bound_file_atomically_if_identity(
@@ -7282,6 +7325,7 @@ fn persist_committed_overwrite_manifest(
         })?;
     acquired.recovery.manifest_entry = manifest_entry;
     acquired.recovery.manifest_identity = manifest_identity;
+    hook(OverwriteCommitCheckpoint::AfterManifestReplace)?;
     let committed = CommittedOverwriteState {
         manifest,
         files,
@@ -7296,11 +7340,15 @@ fn persist_committed_overwrite_manifest(
     Ok(committed)
 }
 
-fn create_committed_output_anchors(
+fn create_committed_output_anchors<F>(
     acquired: &AcquiredOverwrite,
     transaction_parent: &Path,
     identities: &BTreeMap<PathBuf, EntryIdentity>,
-) -> Result<(Vec<OverwriteCommittedFile>, BTreeMap<PathBuf, BoundFile>)> {
+    hook: &mut F,
+) -> Result<(Vec<OverwriteCommittedFile>, BTreeMap<PathBuf, BoundFile>)>
+where
+    F: FnMut(OverwriteCommitCheckpoint) -> Result<()>,
+{
     let mut records = Vec::with_capacity(identities.len());
     let mut anchors = BTreeMap::new();
     for (index, (file_name, identity)) in identities.iter().enumerate() {
@@ -7309,6 +7357,7 @@ fn create_committed_output_anchors(
         let anchor_path = acquired.recovery.backup_dir.join(&anchor_name);
         let source_entry = acquired.root.bind_entry(&source_path, false)?;
         let anchor_entry = acquired.root.bind_entry(&anchor_path, false)?;
+        hook(OverwriteCommitCheckpoint::BeforeAnchorCreation)?;
         acquired
             .root
             .hard_link_via_bound_parents_noreplace_if_identity(
@@ -7569,6 +7618,34 @@ fn rollback_acquired_overwrite(error: anyhow::Error, acquired: AcquiredOverwrite
     }
 }
 
+fn commit_acquired_overwrite(
+    acquired: AcquiredOverwrite,
+    moved: &[MovedFile],
+    committed_target: &Path,
+    staging: Option<&BoundStagingDir>,
+) -> Result<()> {
+    commit_acquired_overwrite_with_hook(acquired, moved, committed_target, staging, &mut |_| Ok(()))
+}
+
+fn commit_acquired_overwrite_with_hook<F>(
+    acquired: AcquiredOverwrite,
+    moved: &[MovedFile],
+    committed_target: &Path,
+    staging: Option<&BoundStagingDir>,
+    hook: &mut F,
+) -> Result<()>
+where
+    F: FnMut(OverwriteCommitCheckpoint) -> Result<()>,
+{
+    let result = acquired.commit_with_hook(moved, committed_target, hook);
+    if result.is_err()
+        && let Some(staging) = staging
+    {
+        staging.preserve_for_recovery();
+    }
+    result
+}
+
 #[cfg(test)]
 fn bind_test_overwrite_confirmation(
     root: &RootedFs,
@@ -7669,9 +7746,13 @@ fn move_staged_video_files_with_root(
                     .moved_videos
                     .first()
                     .context("overwrite commit did not produce a primary media destination")?;
-                acquisition
-                    .commit(&moved.moved, committed_target)
-                    .context("video overwrite succeeded but old-file cleanup failed")?;
+                commit_acquired_overwrite(
+                    acquisition,
+                    &moved.moved,
+                    committed_target,
+                    context.staging,
+                )
+                .context("video overwrite succeeded but old-file cleanup failed")?;
             }
             Ok(moved.moved_videos)
         }
@@ -7782,8 +7863,7 @@ fn move_staged_artifact_files_with_root(
                     return Err(rollback_acquired_overwrite(err, acquired));
                 }
                 let committed_target = acquired.target.clone();
-                acquired
-                    .commit(&moved, &committed_target)
+                commit_acquired_overwrite(acquired, &moved, &committed_target, context.staging)
                     .context("artifact overwrite succeeded but old-sidecar cleanup failed")?;
             }
             Ok(moved.into_iter().map(|moved| moved.destination).collect())
@@ -9637,6 +9717,104 @@ mod tests {
             .collect()
     }
 
+    fn assert_overwrite_commit_fault_recovers(
+        checkpoint: OverwriteCommitCheckpoint,
+        expect_roll_forward: bool,
+    ) {
+        let label = match checkpoint {
+            OverwriteCommitCheckpoint::BeforeOutputSync => "overwrite-fault-output-sync",
+            OverwriteCommitCheckpoint::BeforeAnchorCreation => "overwrite-fault-anchor",
+            OverwriteCommitCheckpoint::BeforeManifestReplace => "overwrite-fault-manifest-replace",
+            OverwriteCommitCheckpoint::AfterManifestReplace => "overwrite-fault-post-manifest",
+        };
+        let final_dir = temp_test_dir(label);
+        let existing = final_dir.join("Episode.mkv");
+        fs::write(&existing, "original-video").expect("existing video should write");
+        write_bilibili_identity_nfo(&existing, "cid123");
+        let root = RootedFs::new(&final_dir).expect("output root should bind");
+        let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        let duplicate =
+            bind_test_overwrite_confirmation(&root, VideoDuplicateAction::Overwrite, &duplicate)
+                .expect("overwrite confirmation should bind");
+        let acquired =
+            acquire_and_validate_overwrite_target(&root, &duplicate, StagedPrimaryMediaKind::Video)
+                .expect("overwrite target should be acquired");
+        let staging =
+            create_video_staging_dir(&root).expect("production staging directory should create");
+        let staging_dir = staging.path().to_path_buf();
+        let staged_video = staging_dir.join("Episode.mkv");
+        fs::write(&staged_video, "replacement-video").expect("replacement should stage");
+        let mut plan = staged_move_plan(
+            &staging_dir,
+            &final_dir,
+            std::slice::from_ref(&staged_video),
+            Some(&existing),
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("overwrite move plan should build");
+        prepare_staged_publication(&root, &staging, &mut plan, Some(&acquired))
+            .expect("publication manifest should persist");
+        let moved = execute_move_plan(&root, plan, StagedPrimaryMediaKind::Video)
+            .expect("replacement should publish");
+        let committed_target = moved
+            .moved_videos
+            .first()
+            .expect("published replacement should include primary media")
+            .clone();
+        let mut injected = false;
+        let error = commit_acquired_overwrite_with_hook(
+            acquired,
+            &moved.moved,
+            &committed_target,
+            Some(&staging),
+            &mut |actual| {
+                if !injected && actual == checkpoint {
+                    injected = true;
+                    bail!("injected overwrite commit failure at {actual:?}");
+                }
+                Ok(())
+            },
+        )
+        .expect_err("injected overwrite commit failure should propagate");
+        assert!(injected, "requested overwrite checkpoint should be reached");
+        assert!(format!("{error:#}").contains("injected overwrite commit failure"));
+        drop(staging);
+        assert!(
+            staging_dir.is_dir(),
+            "uncertain publication must remain available for startup recovery"
+        );
+        drop(root);
+
+        let report = recover_pending_overwrite_transactions(&final_dir)
+            .expect("startup recovery should resolve the interrupted overwrite");
+
+        if expect_roll_forward {
+            assert_eq!(fs::read_to_string(&existing).unwrap(), "replacement-video");
+            assert!(!existing.with_extension("nfo").exists());
+            assert!(report.iter().any(|line| {
+                line.contains("Rolled forward interrupted staged video publication")
+            }));
+        } else {
+            assert_eq!(fs::read_to_string(&existing).unwrap(), "original-video");
+            assert!(existing.with_extension("nfo").is_file());
+            assert!(
+                report.iter().any(|line| {
+                    line.contains("Rolled back interrupted staged video publication")
+                })
+            );
+        }
+        assert!(!staging_dir.exists());
+        assert!(overwrite_backup_dirs(&final_dir).is_empty());
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
     fn command_config_path(spec: &CommandSpec) -> Option<PathBuf> {
         spec.args
             .iter()
@@ -10540,6 +10718,35 @@ mod tests {
             })
         );
         let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn overwrite_output_sync_failure_preserves_staging_for_rollback() {
+        assert_overwrite_commit_fault_recovers(OverwriteCommitCheckpoint::BeforeOutputSync, false);
+    }
+
+    #[test]
+    fn overwrite_anchor_failure_preserves_staging_for_rollback() {
+        assert_overwrite_commit_fault_recovers(
+            OverwriteCommitCheckpoint::BeforeAnchorCreation,
+            false,
+        );
+    }
+
+    #[test]
+    fn overwrite_manifest_replace_failure_preserves_staging_for_rollback() {
+        assert_overwrite_commit_fault_recovers(
+            OverwriteCommitCheckpoint::BeforeManifestReplace,
+            false,
+        );
+    }
+
+    #[test]
+    fn overwrite_post_manifest_failure_preserves_staging_for_roll_forward() {
+        assert_overwrite_commit_fault_recovers(
+            OverwriteCommitCheckpoint::AfterManifestReplace,
+            true,
+        );
     }
 
     #[test]

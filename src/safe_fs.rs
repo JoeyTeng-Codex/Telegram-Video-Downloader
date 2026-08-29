@@ -1207,6 +1207,18 @@ impl RootedFs {
     }
 
     fn open_relative_directory_unvalidated(&self, path: &Path, create: bool) -> Result<OwnedFd> {
+        self.open_relative_directory_unvalidated_with_sync(path, create, &mut sync_directory)
+    }
+
+    fn open_relative_directory_unvalidated_with_sync<F>(
+        &self,
+        path: &Path,
+        create: bool,
+        sync_created_parent: &mut F,
+    ) -> Result<OwnedFd>
+    where
+        F: FnMut(&OwnedFd) -> Result<()>,
+    {
         let mut current = rustix::io::dup(self.root_fd.as_ref())
             .map_err(errno_to_io)
             .context("failed to duplicate output root descriptor")?;
@@ -1229,6 +1241,12 @@ impl RootedFs {
                             });
                         }
                     }
+                    sync_created_parent(&current).with_context(|| {
+                        format!(
+                            "failed to persist newly created output directory {}",
+                            self.logical_root.join(path).display()
+                        )
+                    })?;
                     current = openat_directory(&current, name).with_context(|| {
                         format!(
                             "failed to open newly created output directory {}",
@@ -2380,6 +2398,42 @@ mod tests {
         assert!(error.to_string().contains("destination already exists"));
         assert_eq!(fs::read(root.join("staging/source")).unwrap(), b"new");
         assert_eq!(fs::read(root.join("target")).unwrap(), b"old");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nested_destination_creation_syncs_each_new_parent_before_descent() {
+        let root = temp_dir("nested-parent-sync");
+        fs::create_dir_all(&root).expect("root should create");
+        let rooted = RootedFs::new(&root).expect("root should open");
+        let mut synced_parents = Vec::new();
+
+        let opened = rooted
+            .open_relative_directory_unvalidated_with_sync(
+                Path::new("library/season-01"),
+                true,
+                &mut |parent| {
+                    synced_parents.push(identity_for_fd(parent)?);
+                    sync_directory(parent)
+                },
+            )
+            .expect("nested destination should create durably");
+
+        let library_identity = rooted
+            .entry_identity(&root.join("library"))
+            .expect("library identity should read")
+            .expect("library should exist");
+        assert_eq!(
+            synced_parents,
+            vec![rooted.root_identity(), library_identity]
+        );
+        assert_eq!(
+            identity_for_fd(&opened).expect("opened directory identity should read"),
+            rooted
+                .entry_identity(&root.join("library/season-01"))
+                .expect("season identity should read")
+                .expect("season should exist")
+        );
         let _ = fs::remove_dir_all(root);
     }
 
