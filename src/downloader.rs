@@ -33,6 +33,7 @@ static OVERWRITE_BACKUP_COUNTER: AtomicU64 = AtomicU64::new(1);
 const VIDEO_STAGING_DIR_NAME: &str = ".telegram-video-downloader-staging";
 const VIDEO_OUTPUT_LOCK_FILE_NAME: &str = ".telegram-video-downloader.lock";
 const BILIBILI_FFMPEG_CONCAT_FILE_PREFIX: &str = ".telegram-video-downloader-ffmpeg-concat";
+const BILIBILI_MUX_STAGING_DIR_PREFIX: &str = ".telegram-video-downloader-mux";
 const OVERWRITE_BACKUP_DIR_PREFIX: &str = ".telegram-video-downloader-overwrite";
 const OVERWRITE_RECOVERY_MANIFEST_NAME: &str = ".transaction.json";
 const OVERWRITE_RECOVERY_MANIFEST_TEMP_NAME: &str = ".transaction.next.json";
@@ -895,69 +896,141 @@ impl Drop for OwnedTemporaryFile {
 #[derive(Debug)]
 struct ReservedMuxOutput {
     root: RootedFs,
-    entry: BoundEntry,
+    final_entry: BoundEntry,
+    staging_dir_entry: BoundEntry,
+    staging_dir_identity: EntryIdentity,
+    staged_entry: BoundEntry,
     file: BoundFile,
     active: bool,
 }
 
 impl ReservedMuxOutput {
-    fn create(root: &RootedFs, path: &Path) -> Result<Self> {
-        let (entry, identity) = root
-            .create_new_bound_file(path, b"", 0o600)
-            .with_context(|| format!("failed to reserve Bilibili mux output {}", path.display()))?;
-        let file = match root.open_bound_file(path) {
+    fn create(root: &RootedFs, final_path: &Path) -> Result<Self> {
+        let entry_dir = final_path
+            .parent()
+            .context("Bilibili mux output has no parent")?;
+        let final_entry = root.bind_entry(final_path, false)?;
+        if root.bound_entry_identity(&final_entry)?.is_some() {
+            bail!(
+                "Bilibili mux output already exists: {}",
+                final_path.display()
+            );
+        }
+        let (staging_dir, staging_dir_entry, staging_dir_identity) =
+            create_bilibili_mux_staging_dir(root, entry_dir)?;
+        let mut staged_name = std::ffi::OsString::from("output");
+        if let Some(extension) = final_path.extension() {
+            staged_name.push(".");
+            staged_name.push(extension);
+        }
+        let staged_path = staging_dir.join(staged_name);
+        let (staged_entry, identity) = match root.create_new_bound_file(&staged_path, b"", 0o600) {
+            Ok(created) => created,
+            Err(err) => {
+                let cleanup =
+                    root.remove_bound_dir_if_identity(&staging_dir_entry, staging_dir_identity);
+                let error = err.context(format!(
+                    "failed to reserve private Bilibili mux output {}",
+                    staged_path.display()
+                ));
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(anyhow!(
+                        "{error:#}; Bilibili mux staging cleanup failed: {cleanup:#}"
+                    )),
+                };
+            }
+        };
+        let file = match root.open_bound_file(&staged_path) {
             Ok(Some(file)) if file.identity() == identity => file,
             Ok(Some(_)) => {
                 return Err(with_reserved_mux_cleanup_error(
                     root,
-                    &entry,
+                    &staging_dir_entry,
+                    staging_dir_identity,
+                    &staged_entry,
                     identity,
                     anyhow!(
                         "reserved Bilibili mux output identity changed: {}",
-                        path.display()
+                        staged_path.display()
                     ),
                 ));
             }
             Ok(None) => {
                 return Err(with_reserved_mux_cleanup_error(
                     root,
-                    &entry,
+                    &staging_dir_entry,
+                    staging_dir_identity,
+                    &staged_entry,
                     identity,
                     anyhow!(
                         "reserved Bilibili mux output disappeared: {}",
-                        path.display()
+                        staged_path.display()
                     ),
                 ));
             }
             Err(err) => {
                 return Err(with_reserved_mux_cleanup_error(
                     root,
-                    &entry,
+                    &staging_dir_entry,
+                    staging_dir_identity,
+                    &staged_entry,
                     identity,
                     err.context(format!(
                         "failed to bind reserved Bilibili mux output {}",
-                        path.display()
+                        staged_path.display()
                     )),
                 ));
             }
         };
         Ok(Self {
             root: root.clone(),
-            entry,
+            final_entry,
+            staging_dir_entry,
+            staging_dir_identity,
+            staged_entry,
             file,
             active: true,
         })
     }
 
+    fn command_path(&self) -> &Path {
+        self.staged_entry.path()
+    }
+
     fn commit(mut self) -> Result<BoundFile> {
-        self.file.validate_identity()?;
-        if self.root.bound_entry_identity(&self.entry)? != Some(self.file.identity()) {
+        self.file
+            .sync_all()
+            .context("failed to persist private Bilibili mux output")?;
+        if self.root.bound_entry_identity(&self.staged_entry)? != Some(self.file.identity()) {
             bail!(
                 "reserved Bilibili mux output identity changed: {}",
-                self.entry.path().display()
+                self.staged_entry.path().display()
             );
         }
+        self.root
+            .rename_via_bound_parents_noreplace_if_identity(
+                &self.staged_entry,
+                &self.final_entry,
+                self.file.identity(),
+            )
+            .with_context(|| {
+                format!(
+                    "failed to publish Bilibili mux output {}",
+                    self.final_entry.path().display()
+                )
+            })?;
         self.active = false;
+        if let Err(err) = self
+            .root
+            .remove_bound_dir_if_identity(&self.staging_dir_entry, self.staging_dir_identity)
+        {
+            info!(
+                path = %self.staging_dir_entry.path().display(),
+                error = %err,
+                "failed to clean empty Bilibili mux staging directory"
+            );
+        }
         Ok(self.file.clone())
     }
 }
@@ -967,12 +1040,12 @@ impl Drop for ReservedMuxOutput {
         if self.active
             && let Err(err) = self
                 .root
-                .remove_bound_file_if_identity(&self.entry, self.file.identity())
+                .remove_bound_tree_if_identity(&self.staging_dir_entry, self.staging_dir_identity)
         {
             info!(
-                path = %self.entry.path().display(),
+                path = %self.staging_dir_entry.path().display(),
                 error = %err,
-                "failed to clean reserved Bilibili mux output"
+                "failed to clean private Bilibili mux staging directory"
             );
         }
     }
@@ -980,17 +1053,58 @@ impl Drop for ReservedMuxOutput {
 
 fn with_reserved_mux_cleanup_error(
     root: &RootedFs,
-    entry: &BoundEntry,
+    staging_dir_entry: &BoundEntry,
+    staging_dir_identity: EntryIdentity,
+    staged_entry: &BoundEntry,
     identity: EntryIdentity,
     error: anyhow::Error,
 ) -> anyhow::Error {
-    match root.remove_bound_file_if_identity(entry, identity) {
-        Ok(()) => error,
-        Err(cleanup) => anyhow!(
+    let staged_cleanup = root.remove_bound_file_if_identity(staged_entry, identity);
+    let directory_cleanup = if staged_cleanup.is_ok() {
+        root.remove_bound_dir_if_identity(staging_dir_entry, staging_dir_identity)
+    } else {
+        Ok(())
+    };
+    match (staged_cleanup, directory_cleanup) {
+        (Ok(()), Ok(())) => error,
+        (Err(cleanup), _) => anyhow!(
             "{error:#}; failed to clean reserved Bilibili mux output {}: {cleanup:#}",
-            entry.path().display()
+            staged_entry.path().display()
+        ),
+        (Ok(()), Err(cleanup)) => anyhow!(
+            "{error:#}; failed to clean Bilibili mux staging directory {}: {cleanup:#}",
+            staging_dir_entry.path().display()
         ),
     }
+}
+
+fn create_bilibili_mux_staging_dir(
+    root: &RootedFs,
+    entry_dir: &Path,
+) -> Result<(PathBuf, BoundEntry, EntryIdentity)> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for _ in 0..128 {
+        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = entry_dir.join(format!(
+            "{BILIBILI_MUX_STAGING_DIR_PREFIX}-{}-{stamp:x}-{counter:x}",
+            std::process::id()
+        ));
+        let Some(identity) = root.create_dir(&path, 0o700)? else {
+            continue;
+        };
+        let entry = root.bind_entry(&path, false)?;
+        if root.bound_entry_identity(&entry)? != Some(identity) {
+            bail!(
+                "Bilibili mux staging directory identity changed: {}",
+                path.display()
+            );
+        }
+        return Ok((path, entry, identity));
+    }
+    bail!("failed to allocate a private Bilibili mux staging directory")
 }
 
 async fn mux_bilibili_report_media(
@@ -1018,9 +1132,14 @@ async fn mux_bilibili_report_media(
         };
         let output_path = unique_bilibili_mux_output_path(&entry_dir, title, "mp4", since);
         let bound_inputs = bind_bilibili_mux_inputs(root, &media_inputs)?;
-        let (spec, concat_file) =
-            bilibili_local_mux_command_spec(config, root, &media_inputs, &entry_dir, &output_path)?;
         let output_reservation = ReservedMuxOutput::create(root, &output_path)?;
+        let (spec, concat_file) = bilibili_local_mux_command_spec(
+            config,
+            root,
+            &media_inputs,
+            &entry_dir,
+            output_reservation.command_path(),
+        )?;
         let output_result = run_command(config, &spec, progress.clone()).await;
         drop(concat_file);
         let output_result = match output_result {
@@ -4735,6 +4854,28 @@ fn persist_committed_overwrite_manifest(
             committed_target.display()
         );
     }
+
+    let mut files = BTreeMap::new();
+    for (file_name, identity) in &identities {
+        let path = transaction_parent.join(file_name);
+        let file = acquired
+            .root
+            .open_bound_file(&path)?
+            .with_context(|| format!("committed overwrite file is missing: {}", path.display()))?;
+        if file.identity() != *identity {
+            bail!(
+                "committed overwrite file identity changed: {}",
+                path.display()
+            );
+        }
+        file.sync_all().with_context(|| {
+            format!(
+                "failed to persist committed overwrite file {} before publishing recovery state",
+                path.display()
+            )
+        })?;
+        files.insert(file_name.clone(), file);
+    }
     let (committed_files, anchors) =
         create_committed_output_anchors(acquired, transaction_parent, &identities)?;
     let manifest = OverwriteRecoveryManifest {
@@ -4766,22 +4907,6 @@ fn persist_committed_overwrite_manifest(
         })?;
     acquired.recovery.manifest_entry = manifest_entry;
     acquired.recovery.manifest_identity = manifest_identity;
-
-    let mut files = BTreeMap::new();
-    for (file_name, identity) in identities {
-        let path = transaction_parent.join(&file_name);
-        let file = acquired
-            .root
-            .open_bound_file(&path)?
-            .with_context(|| format!("committed overwrite file is missing: {}", path.display()))?;
-        if file.identity() != identity {
-            bail!(
-                "committed overwrite file identity changed: {}",
-                path.display()
-            );
-        }
-        files.insert(file_name, file);
-    }
     let committed = CommittedOverwriteState {
         manifest,
         files,
@@ -10688,9 +10813,16 @@ printf replacement > "$output"
 
         let output = root.join("Episode.mp4");
         assert!(format!("{error:#}").contains("reserved Bilibili mux output identity changed"));
-        assert_eq!(fs::read_to_string(output).unwrap(), "replacement");
+        assert!(!output.exists());
         assert_eq!(fs::read_to_string(video).unwrap(), "video");
         assert!(report.entries[0].mux.is_none());
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(BILIBILI_MUX_STAGING_DIR_PREFIX)
+        }));
         let _ = fs::remove_dir_all(root);
     }
 

@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Mutex, OnceLock,
@@ -30,6 +30,7 @@ static AUTH_FILE_LOCK: Mutex<()> = Mutex::new(());
 static ACTIVE_BBDOWN_CONFIG_FILES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const AUTH_MUTATION_LOCK_SUFFIX: &str = ".telegram-video-downloader.auth.lock";
+const AUTH_EPOCH_LOG_LIMIT: u64 = 64 * 1024;
 const LOGIN_URL_COOKIE_NAMES: &[&str] = &[
     "SESSDATA",
     "bili_jct",
@@ -122,7 +123,46 @@ pub enum LoginPoll {
 
 #[derive(Debug)]
 struct AuthMutationFileLock {
-    _file: File,
+    file: File,
+    path: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct AuthReplyFileLock {
+    lock: AuthMutationFileLock,
+}
+
+impl AuthReplyFileLock {
+    pub fn current_epoch(&self) -> Result<u64> {
+        self.lock.current_epoch()
+    }
+}
+
+pub struct LockedAuthMutation<'a> {
+    state_path: &'a Path,
+    credential_file: &'a Path,
+    _lock: &'a AuthMutationFileLock,
+    epoch: u64,
+}
+
+pub type AuthCleanupResult = (Result<bool>, Result<()>);
+
+impl LockedAuthMutation<'_> {
+    pub fn sync_legacy_cookie(&self, credential_profile: Option<&str>) -> Result<bool> {
+        sync_bbdown_rust_credentials_from_state_unlocked(
+            self.state_path,
+            self.credential_file,
+            credential_profile,
+        )
+    }
+
+    pub fn delete_legacy_state(&self) -> Result<bool> {
+        delete_auth_state_unlocked(self.state_path)
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
 }
 
 impl fmt::Debug for LoginPoll {
@@ -507,16 +547,128 @@ fn encode_cookie_value_for_bbdown(value: &str) -> String {
     value.replace(',', "%2C")
 }
 
+impl AuthMutationFileLock {
+    fn current_epoch(&self) -> Result<u64> {
+        validate_auth_mutation_lock_identity(&self.file, &self.path)?;
+        let (epoch, _, _) = read_auth_epoch_log(&self.file, &self.path)?;
+        validate_auth_mutation_lock_identity(&self.file, &self.path)?;
+        Ok(epoch)
+    }
+
+    fn bump_epoch(&self) -> Result<u64> {
+        validate_auth_mutation_lock_identity(&self.file, &self.path)?;
+        let (epoch, valid_len, file_len) = read_auth_epoch_log(&self.file, &self.path)?;
+        let next = epoch
+            .checked_add(1)
+            .context("BBDown auth epoch is exhausted")?;
+        let mut writer = self
+            .file
+            .try_clone()
+            .context("failed to clone BBDown auth lock for epoch update")?;
+        if file_len != valid_len {
+            writer
+                .set_len(valid_len)
+                .context("failed to discard an incomplete BBDown auth epoch record")?;
+        }
+        writer
+            .seek(SeekFrom::End(0))
+            .context("failed to seek BBDown auth epoch log")?;
+        writer
+            .write_all(format!("{next}\n").as_bytes())
+            .context("failed to append BBDown auth epoch")?;
+        writer
+            .sync_all()
+            .context("failed to persist BBDown auth epoch")?;
+        sync_auth_lock_parent(&self.path)?;
+        validate_auth_mutation_lock_identity(&self.file, &self.path)?;
+        let (persisted, _, _) = read_auth_epoch_log(&self.file, &self.path)?;
+        if persisted != next {
+            bail!("BBDown auth epoch changed while persisting it")
+        }
+        Ok(next)
+    }
+}
+
+fn read_auth_epoch_log(file: &File, path: &Path) -> Result<(u64, u64, u64)> {
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("failed to inspect BBDown auth epoch {}", path.display()))?
+        .len();
+    if file_len > AUTH_EPOCH_LOG_LIMIT {
+        bail!(
+            "BBDown auth epoch log exceeds {} bytes: {}",
+            AUTH_EPOCH_LOG_LIMIT,
+            path.display()
+        )
+    }
+    let mut reader = file
+        .try_clone()
+        .context("failed to clone BBDown auth lock for epoch read")?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("failed to seek BBDown auth epoch log")?;
+    let mut contents = Vec::with_capacity(file_len as usize);
+    reader
+        .read_to_end(&mut contents)
+        .context("failed to read BBDown auth epoch log")?;
+    let valid_len = contents
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let complete = std::str::from_utf8(&contents[..valid_len])
+        .context("BBDown auth epoch log is not UTF-8")?;
+    let mut epoch = 0_u64;
+    for line in complete.lines() {
+        let value = line
+            .parse::<u64>()
+            .context("BBDown auth epoch log contains an invalid record")?;
+        let expected = epoch
+            .checked_add(1)
+            .context("BBDown auth epoch is exhausted")?;
+        if value != expected {
+            bail!("BBDown auth epoch log is not consecutive")
+        }
+        epoch = value;
+    }
+    Ok((epoch, valid_len as u64, file_len))
+}
+
+fn sync_auth_lock_parent(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    }
+    let directory = options.open(parent).with_context(|| {
+        format!(
+            "failed to open BBDown auth lock directory {}",
+            parent.display()
+        )
+    })?;
+    directory.sync_all().with_context(|| {
+        format!(
+            "failed to sync BBDown auth lock directory {}",
+            parent.display()
+        )
+    })
+}
+
 fn with_auth_mutation_lock<T>(
     credential_file: &Path,
     protected_paths: &[&Path],
-    operation: impl FnOnce() -> Result<T>,
+    operation: impl FnOnce(&AuthMutationFileLock) -> Result<T>,
 ) -> Result<T> {
     let _guard = AUTH_FILE_LOCK
         .lock()
         .expect("auth file lock should not poison");
-    let _file_lock = acquire_auth_mutation_file_lock(credential_file, protected_paths)?;
-    operation()
+    let file_lock = acquire_auth_mutation_file_lock(credential_file, protected_paths)?;
+    operation(&file_lock)
 }
 
 fn acquire_auth_mutation_file_lock(
@@ -561,7 +713,67 @@ fn acquire_auth_mutation_file_lock(
     validate_auth_mutation_lock_is_distinct(&file, protected_paths, &lock_path)?;
     set_auth_mutation_lock_private(&file, &lock_path)?;
     validate_auth_mutation_lock_identity(&file, &lock_path)?;
-    Ok(AuthMutationFileLock { _file: file })
+    Ok(AuthMutationFileLock {
+        file,
+        path: lock_path,
+    })
+}
+
+pub fn acquire_auth_reply_file_lock(
+    state_path: &Path,
+    credential_file: &Path,
+) -> Result<AuthReplyFileLock> {
+    Ok(AuthReplyFileLock {
+        lock: acquire_auth_mutation_file_lock(credential_file, &[state_path, credential_file])?,
+    })
+}
+
+pub fn with_auth_mutation_transaction<T>(
+    state_path: &Path,
+    credential_file: &Path,
+    operation: impl for<'a> FnOnce(&LockedAuthMutation<'a>) -> Result<T>,
+) -> Result<(T, u64)> {
+    with_auth_mutation_transaction_inner(state_path, credential_file, None, operation)
+}
+
+pub fn with_auth_mutation_transaction_at_epoch<T>(
+    state_path: &Path,
+    credential_file: &Path,
+    expected_epoch: u64,
+    operation: impl for<'a> FnOnce(&LockedAuthMutation<'a>) -> Result<T>,
+) -> Result<(T, u64)> {
+    with_auth_mutation_transaction_inner(
+        state_path,
+        credential_file,
+        Some(expected_epoch),
+        operation,
+    )
+}
+
+fn with_auth_mutation_transaction_inner<T>(
+    state_path: &Path,
+    credential_file: &Path,
+    expected_epoch: Option<u64>,
+    operation: impl for<'a> FnOnce(&LockedAuthMutation<'a>) -> Result<T>,
+) -> Result<(T, u64)> {
+    with_auth_mutation_lock(credential_file, &[state_path, credential_file], |lock| {
+        if let Some(expected_epoch) = expected_epoch {
+            let current_epoch = lock.current_epoch()?;
+            if current_epoch != expected_epoch {
+                bail!(
+                    "BBDown credential state changed while login was pending (expected epoch {expected_epoch}, current epoch {current_epoch})"
+                );
+            }
+        }
+        let epoch = lock.bump_epoch()?;
+        let transaction = LockedAuthMutation {
+            state_path,
+            credential_file,
+            _lock: lock,
+            epoch,
+        };
+        operation(&transaction).map(|result| (result, epoch))
+    })
 }
 
 #[cfg(unix)]
@@ -741,9 +953,10 @@ fn save_auth_state_unlocked(path: &Path, state: &AuthState) -> Result<()> {
 }
 
 pub fn delete_auth_state(path: &Path, credential_file: &Path) -> Result<bool> {
-    with_auth_mutation_lock(credential_file, &[path, credential_file], || {
-        delete_auth_state_unlocked(path)
+    with_auth_mutation_transaction(path, credential_file, |transaction| {
+        transaction.delete_legacy_state()
     })
+    .map(|(removed, _)| removed)
 }
 
 fn delete_auth_state_unlocked(path: &Path) -> Result<bool> {
@@ -783,7 +996,21 @@ pub fn sync_bbdown_rust_credentials_from_state(
     credential_file: &Path,
     credential_profile: Option<&str>,
 ) -> Result<bool> {
-    sync_bbdown_rust_credentials_from_state_with_hook(
+    let (result, _) = sync_bbdown_rust_credentials_from_state_with_epoch_and_hook(
+        state_path,
+        credential_file,
+        credential_profile,
+        || {},
+    )?;
+    result
+}
+
+pub fn sync_bbdown_rust_credentials_from_state_with_epoch(
+    state_path: &Path,
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+) -> Result<(Result<bool>, u64)> {
+    sync_bbdown_rust_credentials_from_state_with_epoch_and_hook(
         state_path,
         credential_file,
         credential_profile,
@@ -797,24 +1024,69 @@ fn sync_bbdown_rust_credentials_from_state_with_hook(
     credential_profile: Option<&str>,
     after_legacy_read: impl FnOnce(),
 ) -> Result<bool> {
-    with_auth_mutation_lock(credential_file, &[state_path, credential_file], || {
-        let Some(state) = load_auth_state_unlocked(state_path)? else {
-            return Ok(false);
+    let (result, _) = sync_bbdown_rust_credentials_from_state_with_epoch_and_hook(
+        state_path,
+        credential_file,
+        credential_profile,
+        after_legacy_read,
+    )?;
+    result
+}
+
+fn sync_bbdown_rust_credentials_from_state_with_epoch_and_hook(
+    state_path: &Path,
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+    after_legacy_read: impl FnOnce(),
+) -> Result<(Result<bool>, u64)> {
+    with_auth_mutation_lock(credential_file, &[state_path, credential_file], |lock| {
+        let current_epoch = lock.current_epoch()?;
+        let cookie = match legacy_cookie_from_state_unlocked(state_path) {
+            Ok(Some(cookie)) => cookie,
+            Ok(None) => return Ok((Ok(false), current_epoch)),
+            Err(err) => return Ok((Err(err), current_epoch)),
         };
-        let cookie = state.cookie.trim();
-        if cookie.is_empty() {
-            return Ok(false);
-        }
         after_legacy_read();
-        update_bbdown_rust_cookie_unlocked(credential_file, credential_profile, Some(cookie), false)
+        let epoch = lock.bump_epoch()?;
+        let result = update_bbdown_rust_cookie_unlocked(
+            credential_file,
+            credential_profile,
+            Some(&cookie),
+            false,
+        );
+        Ok((result, epoch))
     })
+}
+
+fn sync_bbdown_rust_credentials_from_state_unlocked(
+    state_path: &Path,
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+) -> Result<bool> {
+    let Some(cookie) = legacy_cookie_from_state_unlocked(state_path)? else {
+        return Ok(false);
+    };
+    update_bbdown_rust_cookie_unlocked(credential_file, credential_profile, Some(&cookie), false)
+}
+
+fn legacy_cookie_from_state_unlocked(state_path: &Path) -> Result<Option<String>> {
+    let Some(state) = load_auth_state_unlocked(state_path)? else {
+        return Ok(None);
+    };
+    let cookie = state.cookie.trim();
+    if cookie.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(cookie.to_string()))
+    }
 }
 
 pub fn clear_bbdown_rust_cookie(
     credential_file: &Path,
     credential_profile: Option<&str>,
 ) -> Result<bool> {
-    with_auth_mutation_lock(credential_file, &[credential_file], || {
+    with_auth_mutation_lock(credential_file, &[credential_file], |lock| {
+        lock.bump_epoch()?;
         if !credential_file.exists() {
             return Ok(false);
         }
@@ -826,9 +1098,18 @@ pub fn clear_auth_state_and_credentials(
     state_path: &Path,
     credential_file: &Path,
     clear_credentials: impl FnOnce() -> Result<()>,
-) -> Result<(Result<bool>, Result<()>)> {
-    with_auth_mutation_lock(credential_file, &[state_path, credential_file], || {
-        let legacy_state = delete_auth_state_unlocked(state_path);
+) -> Result<AuthCleanupResult> {
+    clear_auth_state_and_credentials_with_epoch(state_path, credential_file, clear_credentials)
+        .map(|(result, _)| result)
+}
+
+pub fn clear_auth_state_and_credentials_with_epoch(
+    state_path: &Path,
+    credential_file: &Path,
+    clear_credentials: impl FnOnce() -> Result<()>,
+) -> Result<(AuthCleanupResult, u64)> {
+    with_auth_mutation_transaction(state_path, credential_file, |transaction| {
+        let legacy_state = transaction.delete_legacy_state();
         let credential_state = clear_credentials();
         Ok((legacy_state, credential_state))
     })
@@ -1804,6 +2085,110 @@ mod tests {
     fn temp_state_paths_are_unique_per_call() {
         let path = temp_state_file("temp-state-unique");
         assert_ne!(temp_state_path(&path), temp_state_path(&path));
+    }
+
+    #[test]
+    fn auth_epoch_persists_across_independent_file_locks() {
+        let state_path = temp_state_file("auth-epoch-persistence");
+        let credential_file = state_path.with_file_name("credentials.json");
+
+        let initial = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect("initial auth lock should open");
+        assert_eq!(initial.current_epoch().expect("epoch should read"), 0);
+        drop(initial);
+
+        let (_, first_epoch) =
+            with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+                .expect("first auth mutation should commit its epoch");
+        assert_eq!(first_epoch, 1);
+
+        let reopened = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect("auth lock should reopen");
+        assert_eq!(reopened.current_epoch().expect("epoch should persist"), 1);
+        drop(reopened);
+
+        let (_, second_epoch) = with_auth_mutation_transaction_at_epoch(
+            &state_path,
+            &credential_file,
+            first_epoch,
+            |_| Ok(()),
+        )
+        .expect("second auth mutation should commit its epoch");
+        assert_eq!(second_epoch, 2);
+
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn auth_epoch_rejects_a_stale_mutation_before_running_it() {
+        use std::cell::Cell;
+
+        let state_path = temp_state_file("auth-epoch-stale-mutation");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let (_, current_epoch) =
+            with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+                .expect("initial auth mutation should commit");
+        let called = Cell::new(false);
+
+        let error = with_auth_mutation_transaction_at_epoch(
+            &state_path,
+            &credential_file,
+            current_epoch - 1,
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("stale auth mutation must fail");
+
+        assert!(error.to_string().contains("credential state changed"));
+        assert!(!called.get());
+        let current = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect("auth lock should reopen");
+        assert_eq!(
+            current.current_epoch().expect("epoch should remain stable"),
+            current_epoch
+        );
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn auth_epoch_repairs_an_incomplete_trailing_record() {
+        use std::io::Write;
+
+        let state_path = temp_state_file("auth-epoch-incomplete-record");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let (_, first_epoch) =
+            with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+                .expect("initial auth mutation should commit");
+        assert_eq!(first_epoch, 1);
+        let lock_path = auth_mutation_lock_path(&credential_file);
+        let mut lock_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&lock_path)
+            .expect("auth epoch log should open");
+        lock_file
+            .write_all(b"2")
+            .expect("partial epoch record should write");
+        lock_file.sync_all().expect("partial record should persist");
+        drop(lock_file);
+
+        let (_, repaired_epoch) =
+            with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+                .expect("next auth mutation should repair the epoch log");
+
+        assert_eq!(repaired_epoch, 2);
+        assert_eq!(
+            fs::read_to_string(&lock_path).expect("auth epoch log should read"),
+            "1\n2\n"
+        );
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
     }
 
     #[cfg(unix)]

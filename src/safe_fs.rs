@@ -2,11 +2,17 @@ use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags};
+
+const REMOVE_QUARANTINE_PREFIX: &str = ".telegram-video-downloader-remove";
+static REMOVE_QUARANTINE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EntryIdentity {
@@ -88,6 +94,14 @@ impl BoundFile {
             bail!("bound file descriptor identity changed");
         }
         Ok(())
+    }
+
+    pub(crate) fn sync_all(&self) -> Result<()> {
+        self.validate_identity()?;
+        rustix::fs::fsync(self.fd.as_ref())
+            .map_err(errno_to_io)
+            .context("failed to sync bound file")?;
+        self.validate_identity()
     }
 
     pub(crate) fn read_limited(&self, limit: usize) -> Result<Vec<u8>> {
@@ -715,6 +729,22 @@ impl RootedFs {
         expected: EntryIdentity,
         flags: AtFlags,
     ) -> Result<()> {
+        self.remove_bound_entry_if_identity_with_hook(entry, expected, flags, || {})
+    }
+
+    fn remove_bound_entry_if_identity_with_hook<F>(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+        flags: AtFlags,
+        before_quarantine_move: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(),
+    {
+        // Protected property: unlink only the object identity captured by the caller. Moving the
+        // live name into a private directory atomically lets us validate that object before any
+        // unlink; a racing replacement is restored or retained, never deleted.
         self.validate_bound_parent(&entry.parent)?;
         let current = identity_at(entry.parent.fd.as_ref(), &entry.leaf)?
             .ok_or_else(|| anyhow!("owned bound path is missing: {}", entry.path.display()))?;
@@ -724,13 +754,104 @@ impl RootedFs {
                 entry.path.display()
             );
         }
-        rustix::fs::unlinkat(entry.parent.fd.as_ref(), &entry.leaf, flags)
+        let removes_directory = flags.contains(AtFlags::REMOVEDIR);
+        if removes_directory != expected.is_dir() {
+            bail!(
+                "owned bound path removal type does not match its identity: {}",
+                entry.path.display()
+            );
+        }
+
+        let (quarantine_name, quarantine_fd, quarantine_identity) =
+            create_private_remove_quarantine(&entry.parent)?;
+        let quarantine_path = entry
+            .path
+            .parent()
+            .context("owned bound path has no parent")?
+            .join(&quarantine_name);
+        let quarantined_leaf = OsStr::new("entry");
+        before_quarantine_move();
+        if let Err(err) = renameat_noreplace(
+            entry.parent.fd.as_ref(),
+            &entry.leaf,
+            &quarantine_fd,
+            quarantined_leaf,
+        ) {
+            let cleanup = remove_private_remove_quarantine(
+                &entry.parent,
+                &quarantine_name,
+                quarantine_identity,
+            );
+            return Err(with_cleanup_error(
+                err.context(format!(
+                    "failed to quarantine owned bound path {}",
+                    entry.path.display()
+                )),
+                cleanup,
+                "remove quarantine cleanup",
+            ));
+        }
+
+        sync_directory(entry.parent.fd.as_ref())?;
+        sync_directory(&quarantine_fd)?;
+        let moved = identity_at(&quarantine_fd, quarantined_leaf)?.ok_or_else(|| {
+            anyhow!(
+                "quarantined bound path disappeared; retained quarantine {}",
+                quarantine_path.display()
+            )
+        })?;
+        if moved != expected {
+            let rollback = renameat_noreplace(
+                &quarantine_fd,
+                quarantined_leaf,
+                entry.parent.fd.as_ref(),
+                &entry.leaf,
+            )
+            .and_then(|()| sync_directory(&quarantine_fd))
+            .and_then(|()| sync_directory(entry.parent.fd.as_ref()));
+            if let Err(rollback) = rollback {
+                bail!(
+                    "owned bound path changed before quarantine; retained replacement in {}: {rollback:#}",
+                    quarantine_path.display()
+                );
+            }
+            remove_private_remove_quarantine(&entry.parent, &quarantine_name, quarantine_identity)?;
+            bail!(
+                "owned bound path identity changed before removal: {}",
+                entry.path.display()
+            );
+        }
+
+        rustix::fs::unlinkat(&quarantine_fd, quarantined_leaf, flags)
             .map_err(errno_to_io)
             .with_context(|| {
-                format!("failed to remove owned bound path {}", entry.path.display())
+                format!(
+                    "failed to remove quarantined bound path; retained quarantine {}",
+                    quarantine_path.display()
+                )
             })?;
+        sync_directory(&quarantine_fd)?;
+        remove_private_remove_quarantine(&entry.parent, &quarantine_name, quarantine_identity)?;
         self.validate_bound_parent(&entry.parent)?;
-        sync_directory(entry.parent.fd.as_ref())
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_bound_file_if_identity_with_hook<F>(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+        before_quarantine_move: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(),
+    {
+        self.remove_bound_entry_if_identity_with_hook(
+            entry,
+            expected,
+            AtFlags::empty(),
+            before_quarantine_move,
+        )
     }
 
     fn validate_root(&self) -> Result<()> {
@@ -909,6 +1030,64 @@ fn openat_directory_cstr(parent: &OwnedFd, name: &CStr) -> Result<OwnedFd, std::
         Mode::empty(),
     )
     .map_err(errno_to_io)
+}
+
+fn create_private_remove_quarantine(
+    parent: &BoundParent,
+) -> Result<(OsString, OwnedFd, EntryIdentity)> {
+    for _ in 0..128 {
+        let counter = REMOVE_QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = OsString::from(format!(
+            "{REMOVE_QUARANTINE_PREFIX}-{}-{counter:016x}",
+            std::process::id()
+        ));
+        match rustix::fs::mkdirat(parent.fd.as_ref(), &name, Mode::from_raw_mode(0o700)) {
+            Ok(()) => {}
+            Err(err) if err == rustix::io::Errno::EXIST => continue,
+            Err(err) => {
+                return Err(errno_to_io(err)).context("failed to create remove quarantine");
+            }
+        }
+        let directory = match openat_directory(parent.fd.as_ref(), &name) {
+            Ok(directory) => directory,
+            Err(err) => {
+                let cleanup = rustix::fs::unlinkat(parent.fd.as_ref(), &name, AtFlags::REMOVEDIR)
+                    .map_err(errno_to_io);
+                return Err(with_cleanup_error(
+                    anyhow!(err).context("failed to open remove quarantine"),
+                    cleanup,
+                    "remove quarantine cleanup",
+                ));
+            }
+        };
+        let identity = identity_for_fd(&directory)?;
+        if !identity.is_dir()
+            || identity_at(parent.fd.as_ref(), &name)? != Some(identity)
+            || identity_for_fd(parent.fd.as_ref())? != parent.identity
+        {
+            bail!("remove quarantine identity changed while creating it");
+        }
+        sync_directory(parent.fd.as_ref())?;
+        return Ok((name, directory, identity));
+    }
+    bail!("failed to allocate a unique remove quarantine")
+}
+
+fn remove_private_remove_quarantine(
+    parent: &BoundParent,
+    name: &OsStr,
+    expected: EntryIdentity,
+) -> Result<()> {
+    if identity_for_fd(parent.fd.as_ref())? != parent.identity {
+        bail!("remove quarantine parent identity changed")
+    }
+    if identity_at(parent.fd.as_ref(), name)? != Some(expected) {
+        bail!("remove quarantine path identity changed")
+    }
+    rustix::fs::unlinkat(parent.fd.as_ref(), name, AtFlags::REMOVEDIR)
+        .map_err(errno_to_io)
+        .context("failed to remove private remove quarantine")?;
+    sync_directory(parent.fd.as_ref())
 }
 
 fn rollback_bound_rename(
@@ -1480,6 +1659,46 @@ mod tests {
         assert!(error.to_string().contains("identity changed"));
         assert!(!source_path.exists());
         assert_eq!(fs::read(destination_path).unwrap(), b"replacement");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn identity_bound_removal_never_unlinks_a_racing_replacement() {
+        let root = temp_dir("bound-remove-replacement");
+        fs::create_dir_all(&root).expect("root should create");
+        let owned_path = root.join("owned.txt");
+        let retained_path = root.join("retained-owned.txt");
+        fs::write(&owned_path, b"owned").expect("owned file should write");
+        let rooted = RootedFs::new(&root).expect("root should bind");
+        let entry = rooted
+            .bind_entry(&owned_path, false)
+            .expect("owned file should bind");
+        let expected = rooted
+            .bound_entry_identity(&entry)
+            .expect("owned identity should read")
+            .expect("owned file should exist");
+
+        let error = rooted
+            .remove_bound_file_if_identity_with_hook(&entry, expected, || {
+                fs::rename(&owned_path, &retained_path).expect("owned file should move aside");
+                fs::write(&owned_path, b"replacement").expect("replacement should write");
+            })
+            .expect_err("racing replacement must not be removed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("identity changed before removal")
+        );
+        assert_eq!(fs::read(&owned_path).unwrap(), b"replacement");
+        assert_eq!(fs::read(&retained_path).unwrap(), b"owned");
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(REMOVE_QUARANTINE_PREFIX)
+        }));
         let _ = fs::remove_dir_all(root);
     }
 }
