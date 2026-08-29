@@ -252,6 +252,10 @@ impl AppConfig {
         {
             bail!("bilibili.auth.credential_profile must not be empty when set");
         }
+        ensure_distinct_auth_paths(
+            &self.bilibili.auth.state_path,
+            &self.bilibili.auth.credential_file,
+        )?;
         if let Some(playurl_mode) = &self.bilibili.playurl_mode
             && !matches!(playurl_mode.as_str(), "web" | "tv" | "app")
         {
@@ -271,6 +275,106 @@ impl AppConfig {
             }
         }
         Ok(())
+    }
+}
+
+fn ensure_distinct_auth_paths(state_path: &Path, credential_file: &Path) -> Result<()> {
+    let normalized_state = normalize_path_for_comparison(state_path)?;
+    let normalized_credential = normalize_path_for_comparison(credential_file)?;
+    if normalized_state == normalized_credential
+        || existing_paths_share_identity(state_path, credential_file)?
+    {
+        bail!(
+            "bilibili.auth.state_path and bilibili.auth.credential_file must refer to distinct files"
+        );
+    }
+    Ok(())
+}
+
+fn normalize_path_for_comparison(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .context("failed to resolve the current directory for auth path validation")?
+            .join(path)
+    };
+    let absolute = lexical_normalize(&absolute);
+    let mut ancestor = absolute.clone();
+    let mut missing = Vec::new();
+    loop {
+        match fs::canonicalize(&ancestor) {
+            Ok(mut canonical) => {
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(lexical_normalize(&canonical));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let name = ancestor.file_name().with_context(|| {
+                    format!(
+                        "failed to find an existing ancestor for auth path {}",
+                        path.display()
+                    )
+                })?;
+                missing.push(name.to_os_string());
+                ancestor.pop();
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to resolve auth path for comparison: {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(name) => normalized.push(name),
+        }
+    }
+    normalized
+}
+
+fn existing_paths_share_identity(first: &Path, second: &Path) -> Result<bool> {
+    let first_metadata = metadata_if_present(first)?;
+    let second_metadata = metadata_if_present(second)?;
+    let (Some(first_metadata), Some(second_metadata)) = (first_metadata, second_metadata) else {
+        return Ok(false);
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(first_metadata.dev() == second_metadata.dev()
+            && first_metadata.ino() == second_metadata.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(false)
+    }
+}
+
+fn metadata_if_present(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to inspect auth path identity: {}", path.display())),
     }
 }
 
@@ -764,6 +868,68 @@ mod tests {
             config.bilibili.auth.state_path,
             PathBuf::from("/tmp/project/state/bilibili-auth.json")
         );
+    }
+
+    #[test]
+    fn rejects_relative_and_absolute_auth_path_aliases() {
+        let root = temp_test_dir("auth-relative-absolute-alias");
+        fs::create_dir_all(root.join("auth")).expect("auth dir should create");
+        let credential = root.join("auth/shared.json");
+        let config = format!(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [bilibili.auth]
+            state_path = "auth/shared.json"
+            credential_file = "{}"
+            "#,
+            credential.display()
+        );
+
+        let error = AppConfig::from_toml_str(&config, root.clone())
+            .expect_err("aliased auth paths should fail validation");
+
+        assert!(error.to_string().contains("must refer to distinct files"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_auth_paths_through_symlinked_parent_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_test_dir("auth-symlink-parent-alias");
+        let real = root.join("real");
+        fs::create_dir_all(&real).expect("real auth dir should create");
+        symlink(&real, root.join("alias")).expect("auth dir alias should create");
+
+        let error = ensure_distinct_auth_paths(
+            &real.join("credentials.json"),
+            &root.join("alias/credentials.json"),
+        )
+        .expect_err("symlinked parent aliases should fail validation");
+
+        assert!(error.to_string().contains("must refer to distinct files"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_existing_auth_paths_with_the_same_inode() {
+        let root = temp_test_dir("auth-hardlink-alias");
+        fs::create_dir_all(&root).expect("auth root should create");
+        let state = root.join("state.json");
+        let credential = root.join("credentials.json");
+        fs::write(&state, "{}").expect("auth state should write");
+        fs::hard_link(&state, &credential).expect("auth hard link should create");
+
+        let error = ensure_distinct_auth_paths(&state, &credential)
+            .expect_err("same-inode auth paths should fail validation");
+
+        assert!(error.to_string().contains("must refer to distinct files"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

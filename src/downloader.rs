@@ -25,6 +25,7 @@ use crate::bilibili_auth;
 use crate::bilibili_core;
 use crate::config::AppConfig;
 use crate::router::{BilibiliSelection, JobRequest};
+use crate::safe_fs::{EntryIdentity, RootedFs};
 
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -3867,17 +3868,27 @@ struct MoveStep {
 }
 
 #[derive(Debug)]
+struct MovedFile {
+    source: PathBuf,
+    destination: PathBuf,
+    identity: EntryIdentity,
+}
+
+#[derive(Debug)]
 struct FileBackup {
     original: PathBuf,
     backup: PathBuf,
+    identity: EntryIdentity,
 }
 
 #[derive(Debug)]
 struct AcquiredOverwrite {
+    root: RootedFs,
     target: PathBuf,
     backups: Vec<FileBackup>,
     backup_dir: PathBuf,
-    target_restored: bool,
+    backup_dir_identity: EntryIdentity,
+    target_restored_identity: Option<EntryIdentity>,
 }
 
 impl AcquiredOverwrite {
@@ -3899,12 +3910,12 @@ impl AcquiredOverwrite {
             .position(|backup| backup.original == original)
             .with_context(|| format!("overwrite backup is missing for {}", original.display()))?;
         let backup = self.backups.remove(index);
-        if let Err(err) = restore_file_backup(&backup) {
+        if let Err(err) = restore_file_backup(&self.root, &backup) {
             self.backups.insert(index, backup);
             return Err(err);
         }
         if original == self.target {
-            self.target_restored = true;
+            self.target_restored_identity = Some(backup.identity);
         }
         Ok(())
     }
@@ -3926,15 +3937,33 @@ impl AcquiredOverwrite {
     }
 
     fn restore(self) -> Result<()> {
-        if self.target_restored {
-            restore_remaining_backups(&self.backups, &self.backup_dir, &self.target)
+        if let Some(target_identity) = self.target_restored_identity {
+            restore_remaining_backups(
+                &self.root,
+                &self.backups,
+                &self.backup_dir,
+                self.backup_dir_identity,
+                &self.target,
+                target_identity,
+            )
         } else {
-            restore_backups(&self.backups, &self.backup_dir, &self.target)
+            restore_backups(
+                &self.root,
+                &self.backups,
+                &self.backup_dir,
+                self.backup_dir_identity,
+                &self.target,
+            )
         }
     }
 
     fn commit(self) -> Result<()> {
-        remove_backups(&self.backups, &self.backup_dir)
+        remove_backups(
+            &self.root,
+            &self.backups,
+            &self.backup_dir,
+            self.backup_dir_identity,
+        )
     }
 }
 
@@ -3956,75 +3985,74 @@ impl Drop for RemoveDirOnDrop {
 }
 
 fn acquire_and_validate_overwrite_target(
-    final_dir: &Path,
+    root: &RootedFs,
     duplicate: &VideoDuplicate,
     primary_media_kind: StagedPrimaryMediaKind,
 ) -> Result<AcquiredOverwrite> {
-    // Protect the semantic identity of the acquired object; timestamps are not identity evidence.
+    // Object ownership is tracked by device/inode/type; timestamps are not identity evidence.
     let target = duplicate
         .overwrite_target()
         .context("overwrite target is not an exact unique match")?
         .clone();
-    if !target.starts_with(final_dir) {
-        bail!(
-            "overwrite target is outside the configured video directory: {}",
-            target.display()
-        );
-    }
 
     let mut artifacts = existing_video_artifacts(&target)?
         .into_iter()
         .collect::<BTreeSet<_>>();
     artifacts.remove(&target);
     artifacts.extend(metadata_sidecar_paths(&target));
-    let backup_parent = target.parent().unwrap_or(final_dir);
-    let backup_dir = create_overwrite_backup_dir(backup_parent)?;
+    let backup_parent = target.parent().context("overwrite target has no parent")?;
+    let (backup_dir, backup_dir_identity) = create_overwrite_backup_dir(root, backup_parent)?;
     let mut backups = Vec::new();
 
-    if let Err(err) = acquire_overwrite_path(&target, true, &backup_dir, &mut backups) {
+    if let Err(err) = acquire_overwrite_path(root, &target, true, &backup_dir, &mut backups) {
         if backups.is_empty() {
-            let _ = fs::remove_dir(&backup_dir);
+            let _ = root.remove_dir_if_identity(&backup_dir, backup_dir_identity);
             return Err(err);
         }
         return Err(rollback_acquired_overwrite(
             err,
             AcquiredOverwrite {
+                root: root.clone(),
                 target,
                 backups,
                 backup_dir,
-                target_restored: false,
+                backup_dir_identity,
+                target_restored_identity: None,
             },
         ));
     }
     for artifact in artifacts {
-        if let Err(err) = acquire_overwrite_path(&artifact, false, &backup_dir, &mut backups) {
+        if let Err(err) = acquire_overwrite_path(root, &artifact, false, &backup_dir, &mut backups)
+        {
             return Err(rollback_acquired_overwrite(
                 err,
                 AcquiredOverwrite {
+                    root: root.clone(),
                     target,
                     backups,
                     backup_dir,
-                    target_restored: false,
+                    backup_dir_identity,
+                    target_restored_identity: None,
                 },
             ));
         }
     }
 
     let acquired = AcquiredOverwrite {
+        root: root.clone(),
         target,
         backups,
         backup_dir,
-        target_restored: false,
+        backup_dir_identity,
+        target_restored_identity: None,
     };
-    if let Err(err) =
-        validate_acquired_overwrite(final_dir, duplicate, primary_media_kind, &acquired)
-    {
+    if let Err(err) = validate_acquired_overwrite(root, duplicate, primary_media_kind, &acquired) {
         return Err(rollback_acquired_overwrite(err, acquired));
     }
     Ok(acquired)
 }
 
-fn create_overwrite_backup_dir(parent: &Path) -> Result<PathBuf> {
+fn create_overwrite_backup_dir(root: &RootedFs, parent: &Path) -> Result<(PathBuf, EntryIdentity)> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -4035,41 +4063,29 @@ fn create_overwrite_backup_dir(parent: &Path) -> Result<PathBuf> {
             "{OVERWRITE_BACKUP_DIR_PREFIX}-{}-{stamp:x}-{counter:x}",
             std::process::id()
         ));
-        match fs::create_dir(&path) {
-            Ok(()) => return Ok(path),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "failed to create overwrite backup directory {}",
-                        path.display()
-                    )
-                });
-            }
+        match root.create_dir(&path, 0o700)? {
+            Some(identity) => return Ok((path, identity)),
+            None => continue,
         }
     }
     bail!("failed to allocate a unique overwrite backup directory")
 }
 
 fn acquire_overwrite_path(
+    root: &RootedFs,
     original: &Path,
     required: bool,
     backup_dir: &Path,
     backups: &mut Vec<FileBackup>,
 ) -> Result<()> {
-    let metadata = match fs::symlink_metadata(original) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound && !required => return Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+    let identity = match root.entry_identity(original)? {
+        Some(identity) => identity,
+        None if !required => return Ok(()),
+        None => {
             bail!("overwrite target is missing: {}", original.display());
         }
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!("failed to inspect overwrite path {}", original.display())
-            });
-        }
     };
-    if !metadata.file_type().is_file() {
+    if !identity.is_file() {
         if is_identity_metadata_path(original) {
             bail!(
                 "overwrite identity metadata is unreadable: {}",
@@ -4083,50 +4099,51 @@ fn acquire_overwrite_path(
     }
 
     let backup = backup_dir.join(format!("{:04x}", backups.len()));
-    fs::rename(original, &backup).with_context(|| {
-        format!(
-            "failed to acquire overwrite path {} as {}",
-            original.display(),
-            backup.display()
-        )
-    })?;
+    root.rename_noreplace_if_identity(original, &backup, false, identity)
+        .with_context(|| {
+            format!(
+                "failed to acquire overwrite path {} as {}",
+                original.display(),
+                backup.display()
+            )
+        })?;
     backups.push(FileBackup {
         original: original.to_path_buf(),
         backup: backup.clone(),
+        identity,
     });
-    let acquired_metadata = fs::symlink_metadata(&backup).with_context(|| {
-        format!(
-            "failed to inspect acquired overwrite path {}",
-            backup.display()
-        )
-    })?;
-    if !acquired_metadata.file_type().is_file() {
-        bail!(
-            "acquired overwrite path is not a regular file: {}",
-            original.display()
-        );
-    }
+    require_entry_identity(root, &backup, identity, "acquired overwrite path")?;
     Ok(())
 }
 
 fn validate_acquired_overwrite(
-    final_dir: &Path,
+    root: &RootedFs,
     duplicate: &VideoDuplicate,
     primary_media_kind: StagedPrimaryMediaKind,
     acquired: &AcquiredOverwrite,
 ) -> Result<()> {
+    require_entry_identity(
+        root,
+        &acquired.backup_dir,
+        acquired.backup_dir_identity,
+        "overwrite backup directory",
+    )?;
     let target_backup = acquired
         .backup_for(acquired.target())
         .context("acquired overwrite target backup is missing")?;
-    let metadata = fs::symlink_metadata(target_backup).with_context(|| {
-        format!(
-            "failed to inspect acquired overwrite target {}",
-            target_backup.display()
-        )
-    })?;
-    if !metadata.file_type().is_file()
-        || !is_primary_media_file(acquired.target(), primary_media_kind)
-    {
+    let target_identity = acquired
+        .backups
+        .iter()
+        .find(|backup| backup.backup == target_backup)
+        .map(|backup| backup.identity)
+        .context("acquired overwrite target identity is missing")?;
+    require_entry_identity(
+        root,
+        target_backup,
+        target_identity,
+        "acquired overwrite target",
+    )?;
+    if !is_primary_media_file(acquired.target(), primary_media_kind) {
         bail!(
             "acquired overwrite target is not a regular primary media file: {}",
             acquired.target().display()
@@ -4144,7 +4161,7 @@ fn validate_acquired_overwrite(
                 content_path,
                 IdentityIndexReadPolicy::Strict,
             )?;
-        } else if path_entry_exists(&logical_path)? {
+        } else if root.entry_exists(&logical_path)? {
             bail!(
                 "overwrite identity metadata changed during acquisition: {}",
                 logical_path.display()
@@ -4166,14 +4183,14 @@ fn validate_acquired_overwrite(
         ),
     }
 
-    if path_entry_exists(acquired.target())? {
+    if root.entry_exists(acquired.target())? {
         bail!(
             "overwrite target path was recreated during acquisition: {}",
             acquired.target().display()
         );
     }
     let live_index = build_video_identity_index_in_dir(
-        final_dir,
+        root.root_path(),
         primary_media_kind,
         IdentityIndexReadPolicy::Strict,
     )
@@ -4187,15 +4204,13 @@ fn validate_acquired_overwrite(
             live_targets.len() + 1
         );
     }
+    require_entry_identity(
+        root,
+        &acquired.backup_dir,
+        acquired.backup_dir_identity,
+        "overwrite backup directory after validation",
+    )?;
     Ok(())
-}
-
-fn path_entry_exists(path: &Path) -> Result<bool> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err).with_context(|| format!("failed to inspect {}", path.display())),
-    }
 }
 
 fn is_identity_metadata_path(path: &Path) -> bool {
@@ -4223,6 +4238,7 @@ fn move_staged_video_files(
     duplicate: &VideoDuplicate,
     primary_media_kind: StagedPrimaryMediaKind,
 ) -> Result<Vec<PathBuf>> {
+    let root = RootedFs::new(final_dir)?;
     let staged_media_count = staged_files
         .iter()
         .filter(|path| is_primary_media_file(path, primary_media_kind))
@@ -4232,7 +4248,7 @@ fn move_staged_video_files(
             bail!("overwrite requires exactly one staged primary media file");
         }
         Some(acquire_and_validate_overwrite_target(
-            final_dir,
+            &root,
             duplicate,
             primary_media_kind,
         )?)
@@ -4242,6 +4258,7 @@ fn move_staged_video_files(
     let overwrite_target = acquisition.as_ref().map(AcquiredOverwrite::target);
 
     let move_result = move_staged_video_files_inner(
+        &root,
         staging_dir,
         final_dir,
         staged_files,
@@ -4265,6 +4282,7 @@ fn move_staged_video_files(
 }
 
 fn move_staged_video_files_inner(
+    root: &RootedFs,
     staging_dir: &Path,
     final_dir: &Path,
     staged_files: &[PathBuf],
@@ -4278,7 +4296,7 @@ fn move_staged_video_files_inner(
         overwrite_target,
         primary_media_kind,
     )?;
-    execute_move_plan(plan, primary_media_kind)
+    execute_move_plan(root, plan, primary_media_kind)
 }
 
 fn move_staged_artifact_files(
@@ -4289,9 +4307,10 @@ fn move_staged_artifact_files(
     duplicate: &VideoDuplicate,
     primary_media_kind: StagedPrimaryMediaKind,
 ) -> Result<Vec<PathBuf>> {
+    let root = RootedFs::new(final_dir)?;
     let mut acquisition = if matches!(action, VideoDuplicateAction::Overwrite) {
         Some(acquire_and_validate_overwrite_target(
-            final_dir,
+            &root,
             duplicate,
             primary_media_kind,
         )?)
@@ -4310,27 +4329,23 @@ fn move_staged_artifact_files(
             });
         }
     };
-    let moved_pairs = plan
+    let replaced_destinations = plan
         .iter()
-        .map(|step| (step.source.clone(), step.destination.clone()))
-        .collect::<Vec<_>>();
-    let replaced_destinations = moved_pairs
-        .iter()
-        .map(|(_, destination)| destination.clone())
+        .map(|step| step.destination.clone())
         .collect::<BTreeSet<_>>();
-    let move_result = execute_artifact_move_plan(plan);
+    let move_result = execute_artifact_move_plan(&root, plan);
     match move_result {
-        Ok(moved_files) => {
+        Ok(moved) => {
             if let Some(mut acquired) = acquisition.take() {
                 if let Err(err) = acquired.restore_unreplaced(&replaced_destinations) {
-                    rollback_moves(&moved_pairs);
+                    let err = with_move_rollback_error(&root, err, &moved);
                     return Err(rollback_acquired_overwrite(err, acquired));
                 }
                 acquired
                     .commit()
                     .context("artifact overwrite succeeded but old-sidecar cleanup failed")?;
             }
-            Ok(moved_files)
+            Ok(moved.into_iter().map(|moved| moved.destination).collect())
         }
         Err(err) => Err(match acquisition {
             Some(acquired) => rollback_acquired_overwrite(err, acquired),
@@ -4381,6 +4396,14 @@ fn artifact_overwrite_destination(source: &Path, target_video: &Path) -> Option<
     let extension = source.extension()?.to_str()?;
     let source_stem = source.file_stem()?.to_str()?;
     let target_stem = target_video.file_stem()?.to_str()?;
+    if let Some(suffix) = source
+        .file_name()?
+        .to_str()?
+        .strip_prefix(target_stem)
+        .filter(|suffix| suffix.starts_with('.'))
+    {
+        return sidecar_destination_for_target_video(target_video, suffix);
+    }
     let suffix = source_stem
         .find('.')
         .map(|index| &source_stem[index..])
@@ -4393,39 +4416,26 @@ fn artifact_overwrite_destination(source: &Path, target_video: &Path) -> Option<
     )
 }
 
-fn execute_artifact_move_plan(plan: Vec<MoveStep>) -> Result<Vec<PathBuf>> {
+fn execute_artifact_move_plan(root: &RootedFs, plan: Vec<MoveStep>) -> Result<Vec<MovedFile>> {
     let mut moved = Vec::new();
     for step in plan {
-        if step.destination.exists() {
-            rollback_moves(&moved);
-            bail!(
-                "destination already exists while moving staged artifact: {}",
-                step.destination.display()
-            );
-        }
-        if let Some(parent) = step.destination.parent()
-            && !parent.as_os_str().is_empty()
-            && let Err(err) = fs::create_dir_all(parent)
-        {
-            rollback_moves(&moved);
-            return Err(err).with_context(|| format!("failed to create {}", parent.display()));
-        }
-        if let Err(err) = fs::rename(&step.source, &step.destination) {
-            rollback_moves(&moved);
-            return Err(err).with_context(|| {
-                format!(
+        match root.rename_noreplace(&step.source, &step.destination, true) {
+            Ok(identity) => moved.push(MovedFile {
+                source: step.source,
+                destination: step.destination,
+                identity,
+            }),
+            Err(err) => {
+                let err = err.context(format!(
                     "failed to move {} to {}",
                     step.source.display(),
                     step.destination.display()
-                )
-            });
+                ));
+                return Err(with_move_rollback_error(root, err, &moved));
+            }
         }
-        moved.push((step.source, step.destination));
     }
-    Ok(moved
-        .into_iter()
-        .map(|(_, destination)| destination)
-        .collect())
+    Ok(moved)
 }
 
 fn staged_move_plan(
@@ -4670,40 +4680,33 @@ fn unique_primary_media_path_avoiding(candidate: PathBuf, reserved: &BTreeSet<Pa
 }
 
 fn execute_move_plan(
+    root: &RootedFs,
     plan: Vec<MoveStep>,
     primary_media_kind: StagedPrimaryMediaKind,
 ) -> Result<Vec<PathBuf>> {
     let mut moved = Vec::new();
     let mut moved_videos = Vec::new();
     for step in plan {
-        if step.destination.exists() {
-            rollback_moves(&moved);
-            bail!(
-                "destination already exists while moving staged file: {}",
-                step.destination.display()
-            );
-        }
-        if let Some(parent) = step.destination.parent()
-            && !parent.as_os_str().is_empty()
-            && let Err(err) = fs::create_dir_all(parent)
-        {
-            rollback_moves(&moved);
-            return Err(err).with_context(|| format!("failed to create {}", parent.display()));
-        }
-        if let Err(err) = fs::rename(&step.source, &step.destination) {
-            rollback_moves(&moved);
-            return Err(err).with_context(|| {
-                format!(
+        match root.rename_noreplace(&step.source, &step.destination, true) {
+            Ok(identity) => {
+                if is_primary_media_file(&step.destination, primary_media_kind) {
+                    moved_videos.push(step.destination.clone());
+                }
+                moved.push(MovedFile {
+                    source: step.source,
+                    destination: step.destination,
+                    identity,
+                });
+            }
+            Err(err) => {
+                let err = err.context(format!(
                     "failed to move {} to {}",
                     step.source.display(),
                     step.destination.display()
-                )
-            });
+                ));
+                return Err(with_move_rollback_error(root, err, &moved));
+            }
         }
-        if is_primary_media_file(&step.destination, primary_media_kind) {
-            moved_videos.push(step.destination.clone());
-        }
-        moved.push((step.source, step.destination));
     }
     Ok(moved_videos)
 }
@@ -4772,41 +4775,87 @@ fn is_known_video_sidecar(path: &Path) -> bool {
         })
 }
 
-fn rollback_moves(moved: &[(PathBuf, PathBuf)]) {
-    for (source, destination) in moved.iter().rev() {
-        if destination.exists() && !source.exists() {
-            let _ = fs::rename(destination, source);
+fn rollback_moves(root: &RootedFs, moved: &[MovedFile]) -> Result<()> {
+    let mut failures = Vec::new();
+    for moved in moved.iter().rev() {
+        if let Err(err) = root.rename_noreplace_if_identity(
+            &moved.destination,
+            &moved.source,
+            false,
+            moved.identity,
+        ) {
+            failures.push(format!(
+                "failed to roll back {} to {}: {err:#}",
+                moved.destination.display(),
+                moved.source.display()
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", failures.join("; "))
+    }
+}
+
+fn with_move_rollback_error(
+    root: &RootedFs,
+    error: anyhow::Error,
+    moved: &[MovedFile],
+) -> anyhow::Error {
+    match rollback_moves(root, moved) {
+        Ok(()) => error,
+        Err(rollback_error) => {
+            anyhow!("{error:#}; staged-file rollback failed: {rollback_error:#}")
         }
     }
 }
 
-fn restore_file_backup(backup: &FileBackup) -> Result<()> {
-    if !path_entry_exists(&backup.backup)? {
-        bail!("overwrite backup is missing: {}", backup.backup.display());
+fn require_entry_identity(
+    root: &RootedFs,
+    path: &Path,
+    expected: EntryIdentity,
+    label: &str,
+) -> Result<()> {
+    match root.entry_identity(path)? {
+        Some(current) if current == expected => Ok(()),
+        Some(_) => bail!("{label} identity changed: {}", path.display()),
+        None => bail!("{label} is missing: {}", path.display()),
     }
-    if path_entry_exists(&backup.original)? {
+}
+
+fn restore_file_backup(root: &RootedFs, backup: &FileBackup) -> Result<()> {
+    require_entry_identity(root, &backup.backup, backup.identity, "overwrite backup")?;
+    if root.entry_exists(&backup.original)? {
         bail!(
             "restore destination is occupied; retained backup {} for {}",
             backup.backup.display(),
             backup.original.display()
         );
     }
-    fs::rename(&backup.backup, &backup.original).with_context(|| {
-        format!(
-            "failed to restore overwrite backup {} to {}",
-            backup.backup.display(),
-            backup.original.display()
-        )
-    })
+    root.rename_noreplace_if_identity(&backup.backup, &backup.original, false, backup.identity)
+        .with_context(|| {
+            format!(
+                "failed to restore overwrite backup {} to {}",
+                backup.backup.display(),
+                backup.original.display()
+            )
+        })
 }
 
-fn restore_backups(backups: &[FileBackup], backup_dir: &Path, target: &Path) -> Result<()> {
+fn restore_backups(
+    root: &RootedFs,
+    backups: &[FileBackup],
+    backup_dir: &Path,
+    backup_dir_identity: EntryIdentity,
+    target: &Path,
+) -> Result<()> {
     let mut failures = Vec::new();
     let target_backup = backups
         .iter()
         .find(|backup| backup.original == target)
         .context("overwrite target backup is missing during restore")?;
-    if let Err(err) = restore_file_backup(target_backup) {
+    if let Err(err) = restore_file_backup(root, target_backup) {
         bail!("{err:#}");
     }
     for backup in backups
@@ -4814,19 +4863,17 @@ fn restore_backups(backups: &[FileBackup], backup_dir: &Path, target: &Path) -> 
         .rev()
         .filter(|backup| backup.original != target)
     {
-        if let Err(err) = restore_file_backup(backup) {
+        if let Err(err) = restore_file_backup(root, backup) {
             failures.push(format!("{err:#}"));
         }
     }
-    if failures.is_empty() {
-        match fs::remove_dir(backup_dir) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => failures.push(format!(
-                "failed to remove overwrite backup directory {}: {err}",
-                backup_dir.display()
-            )),
-        }
+    if failures.is_empty()
+        && let Err(err) = root.remove_dir_if_identity(backup_dir, backup_dir_identity)
+    {
+        failures.push(format!(
+            "failed to remove overwrite backup directory {}: {err}",
+            backup_dir.display()
+        ));
     }
     if failures.is_empty() {
         Ok(())
@@ -4836,38 +4883,33 @@ fn restore_backups(backups: &[FileBackup], backup_dir: &Path, target: &Path) -> 
 }
 
 fn restore_remaining_backups(
+    root: &RootedFs,
     backups: &[FileBackup],
     backup_dir: &Path,
+    backup_dir_identity: EntryIdentity,
     restored_target: &Path,
+    restored_target_identity: EntryIdentity,
 ) -> Result<()> {
-    let target_metadata = fs::symlink_metadata(restored_target).with_context(|| {
-        format!(
-            "failed to inspect restored overwrite target {}",
-            restored_target.display()
-        )
-    })?;
-    if !target_metadata.file_type().is_file() {
-        bail!(
-            "restored overwrite target is no longer a regular file: {}",
-            restored_target.display()
-        );
-    }
+    require_entry_identity(
+        root,
+        restored_target,
+        restored_target_identity,
+        "restored overwrite target",
+    )?;
 
     let mut failures = Vec::new();
     for backup in backups.iter().rev() {
-        if let Err(err) = restore_file_backup(backup) {
+        if let Err(err) = restore_file_backup(root, backup) {
             failures.push(format!("{err:#}"));
         }
     }
-    if failures.is_empty() {
-        match fs::remove_dir(backup_dir) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => failures.push(format!(
-                "failed to remove overwrite backup directory {}: {err}",
-                backup_dir.display()
-            )),
-        }
+    if failures.is_empty()
+        && let Err(err) = root.remove_dir_if_identity(backup_dir, backup_dir_identity)
+    {
+        failures.push(format!(
+            "failed to remove overwrite backup directory {}: {err}",
+            backup_dir.display()
+        ));
     }
     if failures.is_empty() {
         Ok(())
@@ -4876,7 +4918,12 @@ fn restore_remaining_backups(
     }
 }
 
-fn remove_backups(backups: &[FileBackup], backup_dir: &Path) -> Result<()> {
+fn remove_backups(
+    root: &RootedFs,
+    backups: &[FileBackup],
+    backup_dir: &Path,
+    backup_dir_identity: EntryIdentity,
+) -> Result<()> {
     let mut failures = Vec::new();
     for backup in backups {
         if backup.backup.parent() != Some(backup_dir) {
@@ -4886,24 +4933,20 @@ fn remove_backups(backups: &[FileBackup], backup_dir: &Path) -> Result<()> {
             ));
             continue;
         }
-        match fs::remove_file(&backup.backup) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => failures.push(format!(
+        if let Err(err) = root.remove_file_if_identity(&backup.backup, backup.identity) {
+            failures.push(format!(
                 "failed to remove overwrite backup {}: {err}",
                 backup.backup.display()
-            )),
+            ));
         }
     }
-    if failures.is_empty() {
-        match fs::remove_dir(backup_dir) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => failures.push(format!(
-                "failed to remove overwrite backup directory {}: {err}",
-                backup_dir.display()
-            )),
-        }
+    if failures.is_empty()
+        && let Err(err) = root.remove_dir_if_identity(backup_dir, backup_dir_identity)
+    {
+        failures.push(format!(
+            "failed to remove overwrite backup directory {}: {err}",
+            backup_dir.display()
+        ));
     }
     if failures.is_empty() {
         Ok(())
@@ -6412,6 +6455,42 @@ mod tests {
     }
 
     #[test]
+    fn artifact_only_overwrite_preserves_a_dotted_video_stem() {
+        let final_dir = temp_test_dir("artifact-only-overwrite-dotted-stem");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        let existing = final_dir.join("Show.S01E01.mkv");
+        let xml = final_dir.join("Show.S01E01.xml");
+        fs::write(&existing, "video").expect("existing video should write");
+        write_bilibili_identity_nfo(&existing, "cid123");
+        fs::write(&xml, "old-xml").expect("old xml should write");
+        fs::write(staging_dir.join("Show.S01E01.xml"), "new-xml").expect("new xml should write");
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+
+        let moved = move_staged_artifact_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::Overwrite,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("dotted sidecar should overwrite in place");
+
+        assert_eq!(moved, vec![xml.clone()]);
+        assert_eq!(fs::read_to_string(&xml).unwrap(), "new-xml");
+        assert!(!final_dir.join("Show.S01E01.S01E01.xml").exists());
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
     fn artifact_only_overwrite_revalidation_rejects_changed_identity() {
         let final_dir = temp_test_dir("artifact-only-overwrite-revalidation");
         let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
@@ -7569,12 +7648,10 @@ mod tests {
             existing_videos: vec![existing.clone()],
         };
 
-        let acquired = acquire_and_validate_overwrite_target(
-            &final_dir,
-            &duplicate,
-            StagedPrimaryMediaKind::Video,
-        )
-        .expect("overwrite target should be acquired");
+        let root = RootedFs::new(&final_dir).expect("output root should open");
+        let acquired =
+            acquire_and_validate_overwrite_target(&root, &duplicate, StagedPrimaryMediaKind::Video)
+                .expect("overwrite target should be acquired");
         let backup_dir = acquired.backup_dir.clone();
         let backup_paths = acquired
             .backups

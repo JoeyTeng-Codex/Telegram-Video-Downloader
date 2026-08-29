@@ -3,6 +3,7 @@ mod bilibili_core;
 mod config;
 mod downloader;
 mod router;
+mod safe_fs;
 mod telegram;
 
 use std::collections::HashMap;
@@ -522,22 +523,27 @@ async fn run_bbdown_qr_login(
 ) -> Result<CredentialSource> {
     let client = bilibili_core::anonymous_client(config)?;
     let ticket = match mode {
-        BilibiliAuthLoginMode::Web => client.create_web_qr_login().await?,
-        BilibiliAuthLoginMode::Tv => client.create_tv_qr_login().await?,
+        BilibiliAuthLoginMode::Web => {
+            await_bbdown_login_active(auth_generation, client.create_web_qr_login()).await??
+        }
+        BilibiliAuthLoginMode::Tv => {
+            await_bbdown_login_active(auth_generation, client.create_tv_qr_login()).await??
+        }
         BilibiliAuthLoginMode::AccessKey => bail!("access-key login is not a QR polling command"),
     };
     let output = ticket.output();
-    ensure_bbdown_login_active(auth_generation)?;
-    send_bbdown_auth_ticket(
-        telegram,
-        chat_id,
-        mode,
-        &output.url,
-        &output.qr_payload,
-        config.bilibili.auth.login_timeout_seconds,
+    await_bbdown_login_active(
+        auth_generation,
+        send_bbdown_auth_ticket(
+            telegram,
+            chat_id,
+            mode,
+            &output.url,
+            &output.qr_payload,
+            config.bilibili.auth.login_timeout_seconds,
+        ),
     )
-    .await?;
-    ensure_bbdown_login_active(auth_generation)?;
+    .await??;
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(
             config.bilibili.auth.login_timeout_seconds,
@@ -567,12 +573,16 @@ async fn run_bbdown_qr_login(
                     }
                     QrLoginState::WaitingForConfirm => {
                         if last_waiting_state != Some("waiting_for_confirm") {
-                            send_or_log(
-                                telegram,
-                                chat_id,
-                                "BBDown QR scanned; confirm the login in the Bilibili app.".to_string(),
+                            await_bbdown_login_active(
+                                auth_generation,
+                                send_or_log(
+                                    telegram,
+                                    chat_id,
+                                    "BBDown QR scanned; confirm the login in the Bilibili app."
+                                        .to_string(),
+                                ),
                             )
-                            .await;
+                            .await?;
                         }
                         last_waiting_state = Some("waiting_for_confirm");
                     }
@@ -593,7 +603,7 @@ async fn run_bbdown_qr_login(
             .checked_duration_since(now)
             .map_or(Duration::ZERO, |remaining| remaining.min(interval));
         if !sleep_duration.is_zero() {
-            sleep(sleep_duration).await;
+            await_bbdown_login_active(auth_generation, sleep(sleep_duration)).await?;
         }
     }
 }
@@ -608,7 +618,9 @@ async fn start_bbdown_access_key_login(
     let ticket = bilibili_core::create_access_key_ticket()?;
     let output = ticket.output();
     {
-        let mut logins = pending_bilibili_access_key_logins().lock().await;
+        let mut logins =
+            await_bbdown_login_active(auth_generation, pending_bilibili_access_key_logins().lock())
+                .await?;
         prune_expired_pending_bilibili_access_key_logins(&mut logins, Instant::now());
         ensure_bbdown_login_active(auth_generation)?;
         logins.insert(
@@ -621,27 +633,33 @@ async fn start_bbdown_access_key_login(
             },
         );
     }
-    if let Err(err) = send_bbdown_auth_ticket(
-        telegram,
-        chat_id,
-        BilibiliAuthLoginMode::AccessKey,
-        &output.url,
-        &output.qr_payload,
-        config.bilibili.auth.login_timeout_seconds,
+    let delivery = await_bbdown_login_active(
+        auth_generation,
+        send_bbdown_auth_ticket(
+            telegram,
+            chat_id,
+            BilibiliAuthLoginMode::AccessKey,
+            &output.url,
+            &output.qr_payload,
+            config.bilibili.auth.login_timeout_seconds,
+        ),
     )
     .await
-    {
+    .and_then(|result| result);
+    if let Err(err) = delivery {
         clear_pending_bilibili_access_key_login(chat_id, auth_generation).await;
         return Err(err);
     }
-    ensure_bbdown_login_active(auth_generation)?;
-    send_or_log(
-        telegram,
-        chat_id,
-        "After authorizing, send the callback URL or balh-login-credentials message to this private chat. Use /bbdown logout to cancel."
-            .to_string(),
+    await_bbdown_login_active(
+        auth_generation,
+        send_or_log(
+            telegram,
+            chat_id,
+            "After authorizing, send the callback URL or balh-login-credentials message to this private chat. Use /bbdown logout to cancel."
+                .to_string(),
+        ),
     )
-    .await;
+    .await?;
     Ok(())
 }
 
@@ -2615,6 +2633,58 @@ mod tests {
 
         let err = result.expect_err("stale generation should cancel immediately");
         assert!(err.to_string().contains("canceled"));
+    }
+
+    #[tokio::test]
+    async fn login_cancel_interrupts_a_pending_request() {
+        let _guard = TEST_AUTH_GENERATION_LOCK.lock().await;
+        let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            await_bbdown_login_active(generation, async move {
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            })
+            .await
+        });
+        started_rx.await.expect("request should start");
+
+        BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
+        bbdown_login_cancel_notify().notify_waiters();
+        let result = tokio_timeout(Duration::from_secs(1), task)
+            .await
+            .expect("pending request should cancel promptly")
+            .expect("request task should join");
+        BILIBILI_AUTH_GENERATION.store(generation, Ordering::SeqCst);
+
+        let error = result.expect_err("pending request should be canceled");
+        assert!(error.to_string().contains("canceled"));
+    }
+
+    #[tokio::test]
+    async fn login_cancel_interrupts_a_poll_sleep() {
+        let _guard = TEST_AUTH_GENERATION_LOCK.lock().await;
+        let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            await_bbdown_login_active(generation, async move {
+                let _ = started_tx.send(());
+                sleep(Duration::from_secs(60)).await;
+            })
+            .await
+        });
+        started_rx.await.expect("poll sleep should start");
+
+        BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
+        bbdown_login_cancel_notify().notify_waiters();
+        let result = tokio_timeout(Duration::from_secs(1), task)
+            .await
+            .expect("poll sleep should cancel promptly")
+            .expect("sleep task should join");
+        BILIBILI_AUTH_GENERATION.store(generation, Ordering::SeqCst);
+
+        let error = result.expect_err("poll sleep should be canceled");
+        assert!(error.to_string().contains("canceled"));
     }
 
     fn temp_main_test_dir(label: &str) -> PathBuf {

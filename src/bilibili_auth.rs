@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Cursor;
@@ -12,6 +12,7 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
+use bbdown_core::{CredentialProfileSelection, CredentialStore};
 use image::{DynamicImage, ImageFormat, Luma};
 use qrcode::QrCode;
 use reqwest::Client;
@@ -25,8 +26,6 @@ const QRCODE_GENERATE_URL: &str =
     "https://passport.bilibili.com/x/passport-login/web/qrcode/generate";
 const QRCODE_POLL_URL: &str = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll";
 const NAV_URL: &str = "https://api.bilibili.com/x/web-interface/nav";
-const BBDOWN_RUST_CREDENTIAL_VERSION: u32 = 1;
-const BBDOWN_RUST_DEFAULT_PROFILE: &str = "default";
 static AUTH_FILE_LOCK: Mutex<()> = Mutex::new(());
 static ACTIVE_BBDOWN_CONFIG_FILES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -48,47 +47,6 @@ pub struct AuthState {
     pub mid: u64,
     pub uname: String,
     pub stored_at_unix: u64,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-struct BbdownRustCredentials {
-    pub cookie: Option<String>,
-    pub access_key: Option<String>,
-    #[serde(default)]
-    pub tv_access_key: Option<String>,
-}
-
-impl BbdownRustCredentials {
-    fn is_empty(&self) -> bool {
-        self.cookie.as_deref().unwrap_or_default().is_empty()
-            && self.access_key.as_deref().unwrap_or_default().is_empty()
-            && self.tv_access_key.as_deref().unwrap_or_default().is_empty()
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct BbdownRustCredentialProfiles {
-    #[serde(default = "bbdown_rust_credential_version")]
-    pub version: u32,
-    #[serde(default = "bbdown_rust_default_profile")]
-    pub default_profile: String,
-    #[serde(default)]
-    pub profiles: BTreeMap<String, BbdownRustCredentials>,
-}
-
-impl Default for BbdownRustCredentialProfiles {
-    fn default() -> Self {
-        Self {
-            version: BBDOWN_RUST_CREDENTIAL_VERSION,
-            default_profile: BBDOWN_RUST_DEFAULT_PROFILE.to_string(),
-            profiles: BTreeMap::new(),
-        }
-    }
-}
-
-enum BbdownRustCredentialDocument {
-    Flat(BbdownRustCredentials),
-    Profiles(BbdownRustCredentialProfiles),
 }
 
 impl fmt::Debug for AuthState {
@@ -665,11 +623,7 @@ pub fn sync_bbdown_rust_credentials_from_state(
     if cookie.is_empty() {
         return Ok(false);
     }
-    if bbdown_rust_cookie_is_present_unlocked(credential_file, credential_profile)? {
-        return Ok(false);
-    }
-    update_bbdown_rust_cookie_unlocked(credential_file, credential_profile, Some(cookie))?;
-    Ok(true)
+    update_bbdown_rust_cookie_unlocked(credential_file, credential_profile, Some(cookie), false)
 }
 
 pub fn clear_bbdown_rust_cookie(
@@ -682,152 +636,51 @@ pub fn clear_bbdown_rust_cookie(
     if !credential_file.exists() {
         return Ok(false);
     }
-    update_bbdown_rust_cookie_unlocked(credential_file, credential_profile, None)?;
-    Ok(true)
+    update_bbdown_rust_cookie_unlocked(credential_file, credential_profile, None, true)
 }
 
 fn update_bbdown_rust_cookie_unlocked(
     credential_file: &Path,
     credential_profile: Option<&str>,
     cookie: Option<&str>,
-) -> Result<()> {
-    let document = load_bbdown_rust_credential_document(credential_file)?;
-    let document = match (document, credential_profile) {
-        (Some(BbdownRustCredentialDocument::Flat(mut credentials)), None) => {
-            credentials.cookie = cookie.map(str::to_string);
-            if credentials.is_empty() {
-                remove_file_if_exists(credential_file)?;
-                return Ok(());
-            }
-            BbdownRustCredentialDocument::Flat(credentials)
-        }
-        (document, profile) => {
-            let mut profiles = match document {
-                Some(BbdownRustCredentialDocument::Profiles(profiles)) => profiles,
-                Some(BbdownRustCredentialDocument::Flat(credentials)) => {
-                    let mut profiles = BbdownRustCredentialProfiles::default();
-                    if !credentials.is_empty() {
-                        profiles
-                            .profiles
-                            .insert(BBDOWN_RUST_DEFAULT_PROFILE.to_string(), credentials);
-                    }
-                    profiles
-                }
-                None => BbdownRustCredentialProfiles::default(),
-            };
-            let profile = profile
-                .map(str::trim)
-                .filter(|profile| !profile.is_empty())
-                .unwrap_or(profiles.default_profile.as_str())
-                .to_string();
-            let mut credentials = profiles.profiles.remove(&profile).unwrap_or_default();
-            credentials.cookie = cookie.map(str::to_string);
-            if !credentials.is_empty() {
-                profiles.profiles.insert(profile, credentials);
-            }
-            if profiles.profiles.is_empty() {
-                remove_file_if_exists(credential_file)?;
-                return Ok(());
-            }
-            BbdownRustCredentialDocument::Profiles(profiles)
-        }
-    };
-    write_bbdown_rust_credential_document(credential_file, &document)
-}
-
-fn bbdown_rust_cookie_is_present_unlocked(
-    credential_file: &Path,
-    credential_profile: Option<&str>,
+    overwrite_existing: bool,
 ) -> Result<bool> {
-    let Some(document) = load_bbdown_rust_credential_document(credential_file)? else {
-        return Ok(false);
-    };
-    let target_profile = credential_profile
+    let selection = bbdown_rust_profile_selection(credential_profile)?;
+    let store = CredentialStore::new(credential_file.to_path_buf());
+    let changed = std::cell::Cell::new(false);
+    store
+        .update_selected_profile(&selection, |mut credentials| {
+            let current_cookie = credentials.cookie.as_deref().unwrap_or_default().trim();
+            if cookie.is_some() && !current_cookie.is_empty() && !overwrite_existing {
+                return Ok(credentials);
+            }
+            let next_cookie = cookie.map(str::to_string);
+            if credentials.cookie != next_cookie {
+                credentials.cookie = next_cookie;
+                changed.set(true);
+            }
+            Ok(credentials)
+        })
+        .with_context(|| {
+            format!(
+                "failed to update BBDown-rust credentials {}",
+                credential_file.display()
+            )
+        })?;
+    Ok(changed.get())
+}
+
+fn bbdown_rust_profile_selection(
+    credential_profile: Option<&str>,
+) -> Result<CredentialProfileSelection> {
+    match credential_profile
         .map(str::trim)
-        .filter(|profile| !profile.is_empty());
-    let credentials = match document {
-        BbdownRustCredentialDocument::Flat(credentials) => match target_profile {
-            Some(profile) if profile != BBDOWN_RUST_DEFAULT_PROFILE => return Ok(false),
-            _ => credentials,
-        },
-        BbdownRustCredentialDocument::Profiles(profiles) => {
-            let profile = target_profile.unwrap_or(profiles.default_profile.as_str());
-            profiles.profiles.get(profile).cloned().unwrap_or_default()
-        }
-    };
-    Ok(!credentials.cookie.unwrap_or_default().trim().is_empty())
-}
-
-fn load_bbdown_rust_credential_document(
-    path: &Path,
-) -> Result<Option<BbdownRustCredentialDocument>> {
-    let raw = match fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!("failed to read BBDown-rust credentials {}", path.display())
-            });
-        }
-    };
-    if raw.trim().is_empty() {
-        return Ok(None);
+        .filter(|profile| !profile.is_empty())
+    {
+        Some(profile) => CredentialProfileSelection::named(profile)
+            .context("invalid BBDown-rust credential profile"),
+        None => Ok(CredentialProfileSelection::default_profile()),
     }
-    let value: serde_json::Value = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse BBDown-rust credentials {}", path.display()))?;
-    if is_bbdown_rust_profile_document(&value) {
-        let profiles =
-            serde_json::from_value::<BbdownRustCredentialProfiles>(value).with_context(|| {
-                format!(
-                    "failed to parse BBDown-rust credential profiles {}",
-                    path.display()
-                )
-            })?;
-        if profiles.version != BBDOWN_RUST_CREDENTIAL_VERSION {
-            bail!(
-                "unsupported BBDown-rust credential profile version {} in {}",
-                profiles.version,
-                path.display()
-            );
-        }
-        Ok(Some(BbdownRustCredentialDocument::Profiles(profiles)))
-    } else {
-        let credentials =
-            serde_json::from_value::<BbdownRustCredentials>(value).with_context(|| {
-                format!(
-                    "failed to parse BBDown-rust flat credentials {}",
-                    path.display()
-                )
-            })?;
-        Ok(Some(BbdownRustCredentialDocument::Flat(credentials)))
-    }
-}
-
-fn write_bbdown_rust_credential_document(
-    path: &Path,
-    document: &BbdownRustCredentialDocument,
-) -> Result<()> {
-    let content = match document {
-        BbdownRustCredentialDocument::Flat(credentials) => serde_json::to_vec_pretty(credentials),
-        BbdownRustCredentialDocument::Profiles(profiles) => serde_json::to_vec_pretty(profiles),
-    }
-    .context("failed to encode BBDown-rust credentials")?;
-    write_private_bytes(path, &content, "BBDown-rust credentials")
-}
-
-fn is_bbdown_rust_profile_document(value: &serde_json::Value) -> bool {
-    !(value.get("cookie").is_some()
-        || value.get("access_key").is_some()
-        || value.get("tv_access_key").is_some())
-        && (value.get("profiles").is_some() || value.get("default_profile").is_some())
-}
-
-fn bbdown_rust_credential_version() -> u32 {
-    BBDOWN_RUST_CREDENTIAL_VERSION
-}
-
-fn bbdown_rust_default_profile() -> String {
-    BBDOWN_RUST_DEFAULT_PROFILE.to_string()
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1480,6 +1333,63 @@ mod tests {
         assert_eq!(value["profiles"]["default"]["cookie"], "default-cookie");
         assert_eq!(value["profiles"]["intl"]["cookie"], "fresh-cookie");
         assert_eq!(value["profiles"]["intl"]["access_key"], "intl-access");
+
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn credential_migration_does_not_overwrite_a_concurrent_core_update() {
+        use std::sync::mpsc::sync_channel;
+        use std::thread;
+
+        use bbdown_core::Credentials;
+
+        let path = temp_state_file("bbdown-rust-concurrent-migration");
+        let credential_file = path.with_file_name("credentials.json");
+        save_auth_state(&path, &test_state()).expect("state should save");
+        let store = CredentialStore::new(credential_file.clone());
+        store
+            .save(&Credentials::default().with_access_key("old-access"))
+            .expect("initial credentials should save");
+
+        let (locked_tx, locked_rx) = sync_channel(0);
+        let (release_tx, release_rx) = sync_channel(0);
+        let writer_path = credential_file.clone();
+        let writer = thread::spawn(move || {
+            CredentialStore::new(writer_path)
+                .update_selected_profile(
+                    &CredentialProfileSelection::default_profile(),
+                    |mut credentials| {
+                        locked_tx.send(()).expect("lock signal should send");
+                        release_rx.recv().expect("release signal should arrive");
+                        credentials.access_key = Some("fresh-access".to_string());
+                        Ok(credentials)
+                    },
+                )
+                .expect("concurrent credential update should save");
+        });
+        locked_rx.recv().expect("writer should acquire the lock");
+
+        let blocked = sync_bbdown_rust_credentials_from_state(&path, &credential_file, None);
+        release_tx.send(()).expect("writer should release");
+        writer.join().expect("writer thread should finish");
+
+        let error = blocked.expect_err("migration must not race a core credential update");
+        assert!(format!("{error:#}").contains("locked by another update"));
+        assert!(
+            sync_bbdown_rust_credentials_from_state(&path, &credential_file, None)
+                .expect("migration retry should succeed")
+        );
+        let stored = CredentialStore::new(credential_file)
+            .load()
+            .expect("stored credentials should load");
+        assert_eq!(
+            stored.cookie.as_deref(),
+            Some("SESSDATA=secret; bili_jct=csrf")
+        );
+        assert_eq!(stored.access_key.as_deref(), Some("fresh-access"));
 
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);

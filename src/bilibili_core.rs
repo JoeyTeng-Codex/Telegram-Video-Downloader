@@ -42,10 +42,12 @@ impl CredentialRuntime {
     }
 
     pub fn save_merged(&self, credentials: Credentials) -> Result<CredentialSource> {
-        let mut stored = self.load()?;
-        merge_credentials(&mut stored, credentials);
-        self.store
-            .save_selected_profile(&self.selection, &stored)
+        let stored = self
+            .store
+            .update_selected_profile(&self.selection, |mut stored| {
+                merge_credentials(&mut stored, credentials);
+                Ok(stored)
+            })
             .context("failed to save BBDown credentials")?;
         Ok(stored.redacted_summary())
     }
