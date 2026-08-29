@@ -1008,6 +1008,12 @@ impl ReservedMuxOutput {
                 self.staged_entry.path().display()
             );
         }
+        if self.file.byte_len()? == 0 {
+            bail!(
+                "Bilibili mux command did not write the reserved output: {}",
+                self.staged_entry.path().display()
+            );
+        }
         self.root
             .rename_via_bound_parents_noreplace_if_identity(
                 &self.staged_entry,
@@ -2880,7 +2886,11 @@ async fn video_output_lock(
             format!("{job_label}: cross-process output slot acquired"),
         );
     }
-    for recovery in recover_pending_overwrite_transactions_locked(&root, video_dir)? {
+    let mut recoveries = root.reconcile_remove_quarantines()?;
+    recoveries.extend(recover_pending_overwrite_transactions_locked(
+        &root, video_dir,
+    )?);
+    for recovery in recoveries {
         warn_recovered_overwrite(&recovery);
         send_progress(progress, format!("{job_label}: {recovery}"));
     }
@@ -6282,7 +6292,11 @@ pub fn recover_pending_overwrite_transactions(video_dir: &Path) -> Result<Vec<St
     recovery_lock
         .lock_exclusive()
         .context("failed to serialize overwrite recovery with active downloads")?;
-    recover_pending_overwrite_transactions_locked(&root, video_dir)
+    let mut recovered = root.reconcile_remove_quarantines()?;
+    recovered.extend(recover_pending_overwrite_transactions_locked(
+        &root, video_dir,
+    )?);
+    Ok(recovered)
 }
 
 fn recover_pending_overwrite_transactions_locked(
@@ -10814,6 +10828,46 @@ printf replacement > "$output"
         let output = root.join("Episode.mp4");
         assert!(format!("{error:#}").contains("reserved Bilibili mux output identity changed"));
         assert!(!output.exists());
+        assert_eq!(fs::read_to_string(video).unwrap(), "video");
+        assert!(report.entries[0].mux.is_none());
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(BILIBILI_MUX_STAGING_DIR_PREFIX)
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bilibili_mux_rejects_an_untouched_reserved_output() {
+        let root = temp_test_dir("bilibili-local-mux-output-empty");
+        let video = root.join("video.m4s");
+        let fake_ffmpeg = root.join("fake-ffmpeg.sh");
+        fs::write(&video, "video").expect("raw video should write");
+        fs::write(&fake_ffmpeg, "#!/bin/sh\nexit 0\n").expect("fake ffmpeg should write");
+        fs::set_permissions(&fake_ffmpeg, fs::Permissions::from_mode(0o700))
+            .expect("fake ffmpeg should become executable");
+
+        let mut config = test_config();
+        config.tools.ffmpeg = fake_ffmpeg;
+        config.bot.command_timeout_seconds = 5;
+        config.bot.command_idle_timeout_seconds = 5;
+        let mut report = parse_bilibili_download_report(
+            r#"{"title":"Episode","output_dir":".","entries":[{"index":1,"title":"Episode","files":[{"kind":"video","path":"video.m4s"}]}]}"#,
+        )
+        .expect("download report should parse");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+
+        let error =
+            mux_bilibili_report_media(&config, &rooted, &root, &mut report, UNIX_EPOCH, None)
+                .await
+                .expect_err("untouched reserved output must reject the mux result");
+
+        assert!(format!("{error:#}").contains("did not write the reserved output"));
+        assert!(!root.join("Episode.mp4").exists());
         assert_eq!(fs::read_to_string(video).unwrap(), "video");
         assert!(report.entries[0].mux.is_none());
         assert!(fs::read_dir(&root).unwrap().all(|entry| {

@@ -31,6 +31,9 @@ static ACTIVE_BBDOWN_CONFIG_FILES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock:
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const AUTH_MUTATION_LOCK_SUFFIX: &str = ".telegram-video-downloader.auth.lock";
 const AUTH_EPOCH_LOG_LIMIT: u64 = 64 * 1024;
+const AUTH_EPOCH_SLOT_SIZE: usize = 64;
+const AUTH_EPOCH_SLOT_COUNT: usize = 2;
+const AUTH_EPOCH_SLOT_MAGIC: &[u8; 8] = b"TVDAUTH1";
 const LOGIN_URL_COOKIE_NAMES: &[&str] = &[
     "SESSDATA",
     "bili_jct",
@@ -550,38 +553,21 @@ fn encode_cookie_value_for_bbdown(value: &str) -> String {
 impl AuthMutationFileLock {
     fn current_epoch(&self) -> Result<u64> {
         validate_auth_mutation_lock_identity(&self.file, &self.path)?;
-        let (epoch, _, _) = read_auth_epoch_log(&self.file, &self.path)?;
+        let epoch = read_auth_epoch(&self.file, &self.path)?;
         validate_auth_mutation_lock_identity(&self.file, &self.path)?;
         Ok(epoch)
     }
 
     fn bump_epoch(&self) -> Result<u64> {
         validate_auth_mutation_lock_identity(&self.file, &self.path)?;
-        let (epoch, valid_len, file_len) = read_auth_epoch_log(&self.file, &self.path)?;
+        let epoch = read_auth_epoch(&self.file, &self.path)?;
         let next = epoch
             .checked_add(1)
             .context("BBDown auth epoch is exhausted")?;
-        let mut writer = self
-            .file
-            .try_clone()
-            .context("failed to clone BBDown auth lock for epoch update")?;
-        if file_len != valid_len {
-            writer
-                .set_len(valid_len)
-                .context("failed to discard an incomplete BBDown auth epoch record")?;
-        }
-        writer
-            .seek(SeekFrom::End(0))
-            .context("failed to seek BBDown auth epoch log")?;
-        writer
-            .write_all(format!("{next}\n").as_bytes())
-            .context("failed to append BBDown auth epoch")?;
-        writer
-            .sync_all()
-            .context("failed to persist BBDown auth epoch")?;
+        write_auth_epoch_slot(&self.file, next)?;
         sync_auth_lock_parent(&self.path)?;
         validate_auth_mutation_lock_identity(&self.file, &self.path)?;
-        let (persisted, _, _) = read_auth_epoch_log(&self.file, &self.path)?;
+        let persisted = read_auth_epoch(&self.file, &self.path)?;
         if persisted != next {
             bail!("BBDown auth epoch changed while persisting it")
         }
@@ -589,26 +575,128 @@ impl AuthMutationFileLock {
     }
 }
 
+fn read_auth_epoch(file: &File, path: &Path) -> Result<u64> {
+    let slots = read_auth_epoch_slots(file)?;
+    match slots.as_slice() {
+        [] => read_auth_epoch_log(file, path).map(|(epoch, _, _)| epoch),
+        [epoch] => Ok(*epoch),
+        [first, second] => {
+            if first.abs_diff(*second) > 1 {
+                bail!("BBDown auth epoch slots disagree")
+            }
+            Ok((*first).max(*second))
+        }
+        _ => unreachable!("the epoch slot count is fixed"),
+    }
+}
+
+fn read_auth_epoch_slots(file: &File) -> Result<Vec<u64>> {
+    let file_len = file
+        .metadata()
+        .context("failed to inspect BBDown auth epoch slots")?
+        .len();
+    let mut epochs = Vec::new();
+    for index in 0..AUTH_EPOCH_SLOT_COUNT {
+        let offset = auth_epoch_slot_offset(index);
+        if file_len <= offset {
+            continue;
+        }
+        let mut reader = file
+            .try_clone()
+            .context("failed to clone BBDown auth lock for slot read")?;
+        reader
+            .seek(SeekFrom::Start(offset))
+            .context("failed to seek BBDown auth epoch slot")?;
+        let mut slot = [0_u8; AUTH_EPOCH_SLOT_SIZE];
+        let mut read = 0;
+        while read < slot.len() {
+            let count = reader
+                .read(&mut slot[read..])
+                .context("failed to read BBDown auth epoch slot")?;
+            if count == 0 {
+                break;
+            }
+            read += count;
+        }
+        if read == slot.len()
+            && let Some(epoch) = decode_auth_epoch_slot(&slot)
+        {
+            epochs.push(epoch);
+        }
+    }
+    epochs.sort_unstable();
+    epochs.dedup();
+    Ok(epochs)
+}
+
+fn write_auth_epoch_slot(file: &File, epoch: u64) -> Result<()> {
+    let index = (epoch as usize) % AUTH_EPOCH_SLOT_COUNT;
+    let mut writer = file
+        .try_clone()
+        .context("failed to clone BBDown auth lock for epoch update")?;
+    writer
+        .seek(SeekFrom::Start(auth_epoch_slot_offset(index)))
+        .context("failed to seek BBDown auth epoch slot")?;
+    writer
+        .write_all(&encode_auth_epoch_slot(epoch))
+        .context("failed to write BBDown auth epoch slot")?;
+    writer
+        .sync_all()
+        .context("failed to persist BBDown auth epoch slot")
+}
+
+fn auth_epoch_slot_offset(index: usize) -> u64 {
+    AUTH_EPOCH_LOG_LIMIT + (index * AUTH_EPOCH_SLOT_SIZE) as u64
+}
+
+fn encode_auth_epoch_slot(epoch: u64) -> [u8; AUTH_EPOCH_SLOT_SIZE] {
+    let mut half = [0_u8; AUTH_EPOCH_SLOT_SIZE / 2];
+    half[..8].copy_from_slice(AUTH_EPOCH_SLOT_MAGIC);
+    half[8..16].copy_from_slice(&epoch.to_le_bytes());
+    half[16..24].copy_from_slice(&(!epoch).to_le_bytes());
+    let checksum = auth_epoch_slot_checksum(&half[..24]);
+    half[24..32].copy_from_slice(&checksum.to_le_bytes());
+    let mut slot = [0_u8; AUTH_EPOCH_SLOT_SIZE];
+    slot[..half.len()].copy_from_slice(&half);
+    slot[half.len()..].copy_from_slice(&half);
+    slot
+}
+
+fn decode_auth_epoch_slot(slot: &[u8; AUTH_EPOCH_SLOT_SIZE]) -> Option<u64> {
+    let (first, second) = slot.split_at(AUTH_EPOCH_SLOT_SIZE / 2);
+    if first != second || &first[..8] != AUTH_EPOCH_SLOT_MAGIC {
+        return None;
+    }
+    let epoch = u64::from_le_bytes(first[8..16].try_into().ok()?);
+    let inverse = u64::from_le_bytes(first[16..24].try_into().ok()?);
+    let checksum = u64::from_le_bytes(first[24..32].try_into().ok()?);
+    if inverse != !epoch || checksum != auth_epoch_slot_checksum(&first[..24]) {
+        return None;
+    }
+    Some(epoch)
+}
+
+fn auth_epoch_slot_checksum(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
 fn read_auth_epoch_log(file: &File, path: &Path) -> Result<(u64, u64, u64)> {
     let file_len = file
         .metadata()
         .with_context(|| format!("failed to inspect BBDown auth epoch {}", path.display()))?
         .len();
-    if file_len > AUTH_EPOCH_LOG_LIMIT {
-        bail!(
-            "BBDown auth epoch log exceeds {} bytes: {}",
-            AUTH_EPOCH_LOG_LIMIT,
-            path.display()
-        )
-    }
+    let legacy_len = file_len.min(AUTH_EPOCH_LOG_LIMIT);
     let mut reader = file
         .try_clone()
         .context("failed to clone BBDown auth lock for epoch read")?;
     reader
         .seek(SeekFrom::Start(0))
         .context("failed to seek BBDown auth epoch log")?;
-    let mut contents = Vec::with_capacity(file_len as usize);
+    let mut contents = Vec::with_capacity(legacy_len as usize);
     reader
+        .take(legacy_len)
         .read_to_end(&mut contents)
         .context("failed to read BBDown auth epoch log")?;
     let valid_len = contents
@@ -1046,6 +1134,18 @@ fn sync_bbdown_rust_credentials_from_state_with_epoch_and_hook(
             Ok(None) => return Ok((Ok(false), current_epoch)),
             Err(err) => return Ok((Err(err), current_epoch)),
         };
+        let update_needed = match bbdown_rust_cookie_update_needed_unlocked(
+            credential_file,
+            credential_profile,
+            Some(&cookie),
+            false,
+        ) {
+            Ok(update_needed) => update_needed,
+            Err(err) => return Ok((Err(err), current_epoch)),
+        };
+        if !update_needed {
+            return Ok((Ok(false), current_epoch));
+        }
         after_legacy_read();
         let epoch = lock.bump_epoch()?;
         let result = update_bbdown_rust_cookie_unlocked(
@@ -1056,6 +1156,22 @@ fn sync_bbdown_rust_credentials_from_state_with_epoch_and_hook(
         );
         Ok((result, epoch))
     })
+}
+
+fn bbdown_rust_cookie_update_needed_unlocked(
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+    cookie: Option<&str>,
+    overwrite_existing: bool,
+) -> Result<bool> {
+    let selection = bbdown_rust_profile_selection(credential_profile)?;
+    let credentials =
+        CredentialStore::new(credential_file.to_path_buf()).load_selected_profile(&selection)?;
+    let current_cookie = credentials.cookie.as_deref().unwrap_or_default().trim();
+    if cookie.is_some() && !current_cookie.is_empty() && !overwrite_existing {
+        return Ok(false);
+    }
+    Ok(credentials.cookie.as_deref() != cookie)
 }
 
 fn sync_bbdown_rust_credentials_from_state_unlocked(
@@ -2157,35 +2273,91 @@ mod tests {
     }
 
     #[test]
-    fn auth_epoch_repairs_an_incomplete_trailing_record() {
-        use std::io::Write;
-
+    fn auth_epoch_migrates_an_incomplete_legacy_log_to_fixed_slots() {
         let state_path = temp_state_file("auth-epoch-incomplete-record");
         let credential_file = state_path.with_file_name("credentials.json");
-        let (_, first_epoch) =
-            with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
-                .expect("initial auth mutation should commit");
-        assert_eq!(first_epoch, 1);
         let lock_path = auth_mutation_lock_path(&credential_file);
-        let mut lock_file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&lock_path)
-            .expect("auth epoch log should open");
-        lock_file
-            .write_all(b"2")
-            .expect("partial epoch record should write");
-        lock_file.sync_all().expect("partial record should persist");
-        drop(lock_file);
+        fs::create_dir_all(lock_path.parent().expect("lock path should have a parent"))
+            .expect("lock parent should create");
+        fs::write(&lock_path, b"1\n2").expect("legacy epoch log should write");
 
         let (_, repaired_epoch) =
             with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
-                .expect("next auth mutation should repair the epoch log");
+                .expect("next auth mutation should migrate the epoch log");
 
         assert_eq!(repaired_epoch, 2);
-        assert_eq!(
-            fs::read_to_string(&lock_path).expect("auth epoch log should read"),
-            "1\n2\n"
+        let reopened = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect("auth lock should reopen");
+        assert_eq!(reopened.current_epoch().expect("epoch should persist"), 2);
+        assert!(
+            fs::metadata(&lock_path)
+                .expect("auth epoch file should exist")
+                .len()
+                <= AUTH_EPOCH_LOG_LIMIT + (AUTH_EPOCH_SLOT_SIZE * AUTH_EPOCH_SLOT_COUNT) as u64
         );
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn auth_epoch_near_legacy_limit_migrates_without_growing_again() {
+        let state_path = temp_state_file("auth-epoch-near-limit");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let lock_path = auth_mutation_lock_path(&credential_file);
+        fs::create_dir_all(lock_path.parent().expect("lock path should have a parent"))
+            .expect("lock parent should create");
+        let mut legacy = String::new();
+        let mut epoch = 0_u64;
+        loop {
+            let next = epoch + 1;
+            let record = format!("{next}\n");
+            if legacy.len() + record.len() > AUTH_EPOCH_LOG_LIMIT as usize {
+                break;
+            }
+            legacy.push_str(&record);
+            epoch = next;
+        }
+        fs::write(&lock_path, legacy).expect("near-limit legacy epoch log should write");
+
+        let (_, migrated_epoch) =
+            with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+                .expect("near-limit legacy epoch should migrate");
+        assert_eq!(migrated_epoch, epoch + 1);
+        for expected in (migrated_epoch + 1)..=(migrated_epoch + 4) {
+            let (_, observed) =
+                with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+                    .expect("fixed epoch slot should continue advancing");
+            assert_eq!(observed, expected);
+        }
+        assert_eq!(
+            fs::metadata(&lock_path)
+                .expect("auth epoch file should exist")
+                .len(),
+            AUTH_EPOCH_LOG_LIMIT + (AUTH_EPOCH_SLOT_SIZE * AUTH_EPOCH_SLOT_COUNT) as u64
+        );
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn no_op_legacy_sync_keeps_the_auth_epoch_stable() {
+        let state_path = temp_state_file("auth-epoch-no-op-sync");
+        let credential_file = state_path.with_file_name("credentials.json");
+        save_auth_state(&state_path, &test_state()).expect("state should save");
+        fs::write(&credential_file, r#"{"cookie":"fresh-cookie"}"#)
+            .expect("credential file should write");
+
+        let (sync_result, observed_epoch) =
+            sync_bbdown_rust_credentials_from_state_with_epoch(&state_path, &credential_file, None)
+                .expect("no-op credential sync should succeed");
+
+        assert!(!sync_result.expect("sync result should be available"));
+        assert_eq!(observed_epoch, 0);
+        let reopened = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect("auth lock should open");
+        assert_eq!(reopened.current_epoch().expect("epoch should read"), 0);
         if let Some(parent) = state_path.parent() {
             let _ = fs::remove_dir_all(parent);
         }

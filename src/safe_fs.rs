@@ -10,8 +10,12 @@ use std::sync::{
 use anyhow::{Context, Result, anyhow, bail};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags};
+use serde::{Deserialize, Serialize};
 
 const REMOVE_QUARANTINE_PREFIX: &str = ".telegram-video-downloader-remove";
+const REMOVE_QUARANTINE_MANIFEST_NAME: &str = "manifest.json";
+const REMOVE_QUARANTINE_MANIFEST_VERSION: u32 = 1;
+const REMOVE_QUARANTINE_MANIFEST_LIMIT: usize = 1024;
 static REMOVE_QUARANTINE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +71,26 @@ pub(crate) struct BoundFile {
     identity: EntryIdentity,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoveQuarantineManifest {
+    version: u32,
+    quarantine_name: String,
+    parent_device: u64,
+    parent_inode: u64,
+    entry_device: u64,
+    entry_inode: u64,
+    entry_is_directory: bool,
+}
+
+#[derive(Debug)]
+struct PrivateRemoveQuarantine {
+    name: OsString,
+    directory: OwnedFd,
+    identity: EntryIdentity,
+    manifest_identity: EntryIdentity,
+}
+
 impl std::fmt::Debug for BoundFile {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -102,6 +126,17 @@ impl BoundFile {
             .map_err(errno_to_io)
             .context("failed to sync bound file")?;
         self.validate_identity()
+    }
+
+    pub(crate) fn byte_len(&self) -> Result<u64> {
+        self.validate_identity()?;
+        let stat = rustix::fs::fstat(self.fd.as_ref())
+            .map_err(errno_to_io)
+            .context("failed to inspect bound file length")?;
+        if identity_from_stat(&stat) != self.identity {
+            bail!("bound file descriptor identity changed");
+        }
+        u64::try_from(stat.st_size).context("bound file has a negative length")
     }
 
     pub(crate) fn read_limited(&self, limit: usize) -> Result<Vec<u8>> {
@@ -177,6 +212,19 @@ impl RootedFs {
 
     pub(crate) fn validate_configured_root(&self) -> Result<()> {
         self.validate_root()
+    }
+
+    pub(crate) fn reconcile_remove_quarantines(&self) -> Result<Vec<String>> {
+        self.validate_root()?;
+        let mut reports = Vec::new();
+        reconcile_remove_quarantines_in_directory(
+            self.root_fd.as_ref(),
+            self.root_identity,
+            &self.logical_root,
+            &mut reports,
+        )?;
+        self.validate_root()?;
+        Ok(reports)
     }
 
     pub(crate) fn bind_entry(&self, path: &Path, create_parent: bool) -> Result<BoundEntry> {
@@ -729,9 +777,10 @@ impl RootedFs {
         expected: EntryIdentity,
         flags: AtFlags,
     ) -> Result<()> {
-        self.remove_bound_entry_if_identity_with_hook(entry, expected, flags, || {})
+        self.remove_bound_entry_if_identity_with_hooks(entry, expected, flags, || {}, || Ok(()))
     }
 
+    #[cfg(test)]
     fn remove_bound_entry_if_identity_with_hook<F>(
         &self,
         entry: &BoundEntry,
@@ -741,6 +790,27 @@ impl RootedFs {
     ) -> Result<()>
     where
         F: FnOnce(),
+    {
+        self.remove_bound_entry_if_identity_with_hooks(
+            entry,
+            expected,
+            flags,
+            before_quarantine_move,
+            || Ok(()),
+        )
+    }
+
+    fn remove_bound_entry_if_identity_with_hooks<F, G>(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+        flags: AtFlags,
+        before_quarantine_move: F,
+        after_quarantine_move: G,
+    ) -> Result<()>
+    where
+        F: FnOnce(),
+        G: FnOnce() -> Result<()>,
     {
         // Protected property: unlink only the object identity captured by the caller. Moving the
         // live name into a private directory atomically lets us validate that object before any
@@ -761,27 +831,28 @@ impl RootedFs {
                 entry.path.display()
             );
         }
+        if !expected.is_file() && !expected.is_dir() {
+            bail!(
+                "owned bound path removal supports only regular files and directories: {}",
+                entry.path.display()
+            );
+        }
 
-        let (quarantine_name, quarantine_fd, quarantine_identity) =
-            create_private_remove_quarantine(&entry.parent)?;
+        let quarantine = create_private_remove_quarantine(&entry.parent, expected)?;
         let quarantine_path = entry
             .path
             .parent()
             .context("owned bound path has no parent")?
-            .join(&quarantine_name);
+            .join(&quarantine.name);
         let quarantined_leaf = OsStr::new("entry");
         before_quarantine_move();
         if let Err(err) = renameat_noreplace(
             entry.parent.fd.as_ref(),
             &entry.leaf,
-            &quarantine_fd,
+            &quarantine.directory,
             quarantined_leaf,
         ) {
-            let cleanup = remove_private_remove_quarantine(
-                &entry.parent,
-                &quarantine_name,
-                quarantine_identity,
-            );
+            let cleanup = remove_private_remove_quarantine(&entry.parent, &quarantine);
             return Err(with_cleanup_error(
                 err.context(format!(
                     "failed to quarantine owned bound path {}",
@@ -793,8 +864,8 @@ impl RootedFs {
         }
 
         sync_directory(entry.parent.fd.as_ref())?;
-        sync_directory(&quarantine_fd)?;
-        let moved = identity_at(&quarantine_fd, quarantined_leaf)?.ok_or_else(|| {
+        sync_directory(&quarantine.directory)?;
+        let moved = identity_at(&quarantine.directory, quarantined_leaf)?.ok_or_else(|| {
             anyhow!(
                 "quarantined bound path disappeared; retained quarantine {}",
                 quarantine_path.display()
@@ -802,12 +873,12 @@ impl RootedFs {
         })?;
         if moved != expected {
             let rollback = renameat_noreplace(
-                &quarantine_fd,
+                &quarantine.directory,
                 quarantined_leaf,
                 entry.parent.fd.as_ref(),
                 &entry.leaf,
             )
-            .and_then(|()| sync_directory(&quarantine_fd))
+            .and_then(|()| sync_directory(&quarantine.directory))
             .and_then(|()| sync_directory(entry.parent.fd.as_ref()));
             if let Err(rollback) = rollback {
                 bail!(
@@ -815,14 +886,21 @@ impl RootedFs {
                     quarantine_path.display()
                 );
             }
-            remove_private_remove_quarantine(&entry.parent, &quarantine_name, quarantine_identity)?;
+            remove_private_remove_quarantine(&entry.parent, &quarantine)?;
             bail!(
                 "owned bound path identity changed before removal: {}",
                 entry.path.display()
             );
         }
 
-        rustix::fs::unlinkat(&quarantine_fd, quarantined_leaf, flags)
+        after_quarantine_move().with_context(|| {
+            format!(
+                "interrupted after quarantining owned bound path; retained quarantine {}",
+                quarantine_path.display()
+            )
+        })?;
+
+        rustix::fs::unlinkat(&quarantine.directory, quarantined_leaf, flags)
             .map_err(errno_to_io)
             .with_context(|| {
                 format!(
@@ -830,8 +908,8 @@ impl RootedFs {
                     quarantine_path.display()
                 )
             })?;
-        sync_directory(&quarantine_fd)?;
-        remove_private_remove_quarantine(&entry.parent, &quarantine_name, quarantine_identity)?;
+        sync_directory(&quarantine.directory)?;
+        remove_private_remove_quarantine(&entry.parent, &quarantine)?;
         self.validate_bound_parent(&entry.parent)?;
         Ok(())
     }
@@ -851,6 +929,25 @@ impl RootedFs {
             expected,
             AtFlags::empty(),
             before_quarantine_move,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_bound_file_if_identity_with_post_quarantine_hook<F>(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+        after_quarantine_move: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        self.remove_bound_entry_if_identity_with_hooks(
+            entry,
+            expected,
+            AtFlags::empty(),
+            || {},
+            after_quarantine_move,
         )
     }
 
@@ -1032,9 +1129,246 @@ fn openat_directory_cstr(parent: &OwnedFd, name: &CStr) -> Result<OwnedFd, std::
     .map_err(errno_to_io)
 }
 
+fn reconcile_remove_quarantines_in_directory(
+    directory: &OwnedFd,
+    expected_directory: EntryIdentity,
+    display_path: &Path,
+    reports: &mut Vec<String>,
+) -> Result<()> {
+    if identity_for_fd(directory)? != expected_directory {
+        bail!(
+            "remove quarantine scan directory identity changed: {}",
+            display_path.display()
+        );
+    }
+    let entries = rustix::fs::Dir::read_from(directory)
+        .map_err(errno_to_io)
+        .with_context(|| {
+            format!(
+                "failed to scan for interrupted removals in {}",
+                display_path.display()
+            )
+        })?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name().to_owned())
+                .map_err(errno_to_io)
+        })
+        .collect::<std::result::Result<Vec<CString>, std::io::Error>>()
+        .with_context(|| {
+            format!(
+                "failed to read interrupted-removal entry in {}",
+                display_path.display()
+            )
+        })?;
+
+    for name in entries {
+        if matches!(name.as_bytes(), b"." | b"..") {
+            continue;
+        }
+        let path = display_path.join(name.to_string_lossy().as_ref());
+        let Some(identity) = identity_at_cstr(directory, &name)? else {
+            reports.push(format!(
+                "Skipped disappearing entry during interrupted-removal scan: {}",
+                path.display()
+            ));
+            continue;
+        };
+        if name
+            .as_bytes()
+            .starts_with(REMOVE_QUARANTINE_PREFIX.as_bytes())
+        {
+            match reconcile_private_remove_quarantine(
+                directory,
+                expected_directory,
+                &name,
+                &path,
+                identity,
+            ) {
+                Ok(()) => reports.push(format!(
+                    "Recovered interrupted bound-path removal: {}",
+                    path.display()
+                )),
+                Err(err) => reports.push(format!(
+                    "Retained unresolved interrupted-removal quarantine {}: {err:#}",
+                    path.display()
+                )),
+            }
+            continue;
+        }
+        if !identity.is_dir() {
+            continue;
+        }
+        let child = match openat_directory_cstr(directory, &name) {
+            Ok(child) => child,
+            Err(err) => {
+                reports.push(format!(
+                    "Skipped unreadable directory during interrupted-removal scan {}: {err}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        if identity_for_fd(&child)? != identity {
+            reports.push(format!(
+                "Skipped replaced directory during interrupted-removal scan: {}",
+                path.display()
+            ));
+            continue;
+        }
+        if let Err(err) =
+            reconcile_remove_quarantines_in_directory(&child, identity, &path, reports)
+        {
+            reports.push(format!(
+                "Skipped directory during interrupted-removal scan {}: {err:#}",
+                path.display()
+            ));
+        }
+    }
+    if identity_for_fd(directory)? != expected_directory {
+        bail!(
+            "remove quarantine scan directory identity changed: {}",
+            display_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn reconcile_private_remove_quarantine(
+    parent: &OwnedFd,
+    expected_parent: EntryIdentity,
+    name: &CStr,
+    display_path: &Path,
+    expected_quarantine: EntryIdentity,
+) -> Result<()> {
+    if !expected_quarantine.is_dir() {
+        bail!("interrupted-removal quarantine is not a directory");
+    }
+    if identity_for_fd(parent)? != expected_parent {
+        bail!("interrupted-removal quarantine parent identity changed");
+    }
+    let directory = openat_directory_cstr(parent, name)
+        .with_context(|| format!("failed to open quarantine {}", display_path.display()))?;
+    if identity_for_fd(&directory)? != expected_quarantine
+        || identity_at_cstr(parent, name)? != Some(expected_quarantine)
+    {
+        bail!("interrupted-removal quarantine identity changed");
+    }
+    let directory_stat = rustix::fs::fstat(&directory)
+        .map_err(errno_to_io)
+        .context("failed to inspect interrupted-removal quarantine")?;
+    if directory_stat.st_mode & 0o777 != 0o700 {
+        bail!("interrupted-removal quarantine permissions are not private");
+    }
+
+    let entries = rustix::fs::Dir::read_from(&directory)
+        .map_err(errno_to_io)
+        .context("failed to list interrupted-removal quarantine")?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name().to_owned())
+                .map_err(errno_to_io)
+        })
+        .collect::<std::result::Result<Vec<CString>, std::io::Error>>()
+        .context("failed to read interrupted-removal quarantine entry")?;
+    for entry in &entries {
+        if matches!(entry.as_bytes(), b"." | b".." | b"entry" | b"manifest.json") {
+            continue;
+        }
+        bail!(
+            "interrupted-removal quarantine contains an unexpected entry: {}",
+            entry.to_string_lossy()
+        );
+    }
+
+    let manifest_fd = rustix::fs::openat(
+        &directory,
+        REMOVE_QUARANTINE_MANIFEST_NAME,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(errno_to_io)
+    .context("failed to open interrupted-removal manifest")?;
+    let manifest_identity = identity_for_fd(&manifest_fd)?;
+    if !manifest_identity.is_file()
+        || identity_at(&directory, OsStr::new(REMOVE_QUARANTINE_MANIFEST_NAME))?
+            != Some(manifest_identity)
+    {
+        bail!("interrupted-removal manifest identity changed");
+    }
+    let manifest_stat = rustix::fs::fstat(&manifest_fd)
+        .map_err(errno_to_io)
+        .context("failed to inspect interrupted-removal manifest")?;
+    if manifest_stat.st_mode & 0o777 != 0o600 {
+        bail!("interrupted-removal manifest permissions are not private");
+    }
+    let mut reader = File::from(manifest_fd).take((REMOVE_QUARANTINE_MANIFEST_LIMIT + 1) as u64);
+    let mut contents = Vec::new();
+    reader
+        .read_to_end(&mut contents)
+        .context("failed to read interrupted-removal manifest")?;
+    if contents.len() > REMOVE_QUARANTINE_MANIFEST_LIMIT {
+        bail!("interrupted-removal manifest exceeds its size limit");
+    }
+    let manifest: RemoveQuarantineManifest = serde_json::from_slice(&contents)
+        .context("failed to parse interrupted-removal manifest")?;
+    if manifest.version != REMOVE_QUARANTINE_MANIFEST_VERSION
+        || manifest.quarantine_name != name.to_string_lossy()
+        || manifest.parent_device != expected_parent.device
+        || manifest.parent_inode != expected_parent.inode
+    {
+        bail!("interrupted-removal manifest does not describe this quarantine");
+    }
+    let expected_entry = EntryIdentity {
+        device: manifest.entry_device,
+        inode: manifest.entry_inode,
+        file_type: if manifest.entry_is_directory {
+            FileType::Directory
+        } else {
+            FileType::RegularFile
+        },
+    };
+    if let Some(current) = identity_at(&directory, OsStr::new("entry"))? {
+        if current != expected_entry {
+            bail!("interrupted-removal entry identity does not match its manifest");
+        }
+        let flags = if expected_entry.is_dir() {
+            AtFlags::REMOVEDIR
+        } else {
+            AtFlags::empty()
+        };
+        rustix::fs::unlinkat(&directory, "entry", flags)
+            .map_err(errno_to_io)
+            .context("failed to complete interrupted bound-path removal")?;
+        sync_directory(&directory)?;
+    }
+
+    if identity_at(&directory, OsStr::new(REMOVE_QUARANTINE_MANIFEST_NAME))?
+        != Some(manifest_identity)
+    {
+        bail!("interrupted-removal manifest changed before cleanup");
+    }
+    rustix::fs::unlinkat(
+        &directory,
+        REMOVE_QUARANTINE_MANIFEST_NAME,
+        AtFlags::empty(),
+    )
+    .map_err(errno_to_io)
+    .context("failed to remove interrupted-removal manifest")?;
+    sync_directory(&directory)?;
+    if identity_at_cstr(parent, name)? != Some(expected_quarantine) {
+        bail!("interrupted-removal quarantine changed before cleanup");
+    }
+    rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR)
+        .map_err(errno_to_io)
+        .context("failed to remove reconciled interrupted-removal quarantine")?;
+    sync_directory(parent)
+}
+
 fn create_private_remove_quarantine(
     parent: &BoundParent,
-) -> Result<(OsString, OwnedFd, EntryIdentity)> {
+    expected: EntryIdentity,
+) -> Result<PrivateRemoveQuarantine> {
     for _ in 0..128 {
         let counter = REMOVE_QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let name = OsString::from(format!(
@@ -1067,13 +1401,121 @@ fn create_private_remove_quarantine(
         {
             bail!("remove quarantine identity changed while creating it");
         }
+
+        let manifest = RemoveQuarantineManifest {
+            version: REMOVE_QUARANTINE_MANIFEST_VERSION,
+            quarantine_name: name.to_string_lossy().into_owned(),
+            parent_device: parent.identity.device,
+            parent_inode: parent.identity.inode,
+            entry_device: expected.device,
+            entry_inode: expected.inode,
+            entry_is_directory: expected.is_dir(),
+        };
+        let manifest_identity = match write_remove_quarantine_manifest(&directory, &manifest) {
+            Ok(identity) => identity,
+            Err(err) => {
+                let cleanup =
+                    cleanup_private_remove_quarantine_creation(parent, &name, &directory, identity);
+                return Err(with_cleanup_error(
+                    err,
+                    cleanup,
+                    "remove quarantine creation cleanup",
+                ));
+            }
+        };
+        sync_directory(&directory)?;
         sync_directory(parent.fd.as_ref())?;
-        return Ok((name, directory, identity));
+        return Ok(PrivateRemoveQuarantine {
+            name,
+            directory,
+            identity,
+            manifest_identity,
+        });
     }
     bail!("failed to allocate a unique remove quarantine")
 }
 
+fn write_remove_quarantine_manifest(
+    directory: &OwnedFd,
+    manifest: &RemoveQuarantineManifest,
+) -> Result<EntryIdentity> {
+    let contents =
+        serde_json::to_vec(manifest).context("failed to encode remove quarantine manifest")?;
+    if contents.len() > REMOVE_QUARANTINE_MANIFEST_LIMIT {
+        bail!("remove quarantine manifest exceeds its size limit");
+    }
+    let fd = rustix::fs::openat(
+        directory,
+        REMOVE_QUARANTINE_MANIFEST_NAME,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(errno_to_io)
+    .context("failed to create remove quarantine manifest")?;
+    let identity = identity_for_fd(&fd)?;
+    if !identity.is_file() {
+        bail!("remove quarantine manifest is not a regular file");
+    }
+    let mut file = File::from(fd);
+    file.write_all(&contents)
+        .context("failed to write remove quarantine manifest")?;
+    file.sync_all()
+        .context("failed to persist remove quarantine manifest")?;
+    if identity_at(directory, OsStr::new(REMOVE_QUARANTINE_MANIFEST_NAME))? != Some(identity) {
+        bail!("remove quarantine manifest identity changed while creating it");
+    }
+    Ok(identity)
+}
+
+fn cleanup_private_remove_quarantine_creation(
+    parent: &BoundParent,
+    name: &OsStr,
+    directory: &OwnedFd,
+    expected: EntryIdentity,
+) -> Result<()> {
+    if let Some(identity) = identity_at(directory, OsStr::new(REMOVE_QUARANTINE_MANIFEST_NAME))? {
+        if !identity.is_file() {
+            bail!("remove quarantine creation left a non-file manifest");
+        }
+        rustix::fs::unlinkat(directory, REMOVE_QUARANTINE_MANIFEST_NAME, AtFlags::empty())
+            .map_err(errno_to_io)
+            .context("failed to clean remove quarantine manifest")?;
+        sync_directory(directory)?;
+    }
+    remove_empty_private_remove_quarantine(parent, name, expected)
+}
+
 fn remove_private_remove_quarantine(
+    parent: &BoundParent,
+    quarantine: &PrivateRemoveQuarantine,
+) -> Result<()> {
+    if identity_for_fd(parent.fd.as_ref())? != parent.identity {
+        bail!("remove quarantine parent identity changed")
+    }
+    if identity_for_fd(&quarantine.directory)? != quarantine.identity
+        || identity_at(parent.fd.as_ref(), &quarantine.name)? != Some(quarantine.identity)
+    {
+        bail!("remove quarantine path identity changed")
+    }
+    if identity_at(
+        &quarantine.directory,
+        OsStr::new(REMOVE_QUARANTINE_MANIFEST_NAME),
+    )? != Some(quarantine.manifest_identity)
+    {
+        bail!("remove quarantine manifest identity changed")
+    }
+    rustix::fs::unlinkat(
+        &quarantine.directory,
+        REMOVE_QUARANTINE_MANIFEST_NAME,
+        AtFlags::empty(),
+    )
+    .map_err(errno_to_io)
+    .context("failed to remove private remove quarantine manifest")?;
+    sync_directory(&quarantine.directory)?;
+    remove_empty_private_remove_quarantine(parent, &quarantine.name, quarantine.identity)
+}
+
+fn remove_empty_private_remove_quarantine(
     parent: &BoundParent,
     name: &OsStr,
     expected: EntryIdentity,
@@ -1699,6 +2141,81 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(REMOVE_QUARANTINE_PREFIX)
         }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interrupted_identity_bound_removal_is_reconciled_from_its_manifest() {
+        let root = temp_dir("bound-remove-recovery");
+        let backup = root.join("backup");
+        fs::create_dir_all(&backup).expect("backup directory should create");
+        let owned_path = backup.join("owned.txt");
+        fs::write(&owned_path, b"owned").expect("owned file should write");
+        let rooted = RootedFs::new(&root).expect("root should bind");
+        let entry = rooted
+            .bind_entry(&owned_path, false)
+            .expect("owned file should bind");
+        let expected = rooted
+            .bound_entry_identity(&entry)
+            .expect("owned identity should read")
+            .expect("owned file should exist");
+
+        let error = rooted
+            .remove_bound_file_if_identity_with_post_quarantine_hook(&entry, expected, || {
+                bail!("simulated process interruption")
+            })
+            .expect_err("simulated interruption should retain the quarantine");
+
+        assert!(error.to_string().contains("retained quarantine"));
+        assert!(!owned_path.exists());
+        assert!(fs::read_dir(&backup).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(REMOVE_QUARANTINE_PREFIX)
+        }));
+
+        let reports = rooted
+            .reconcile_remove_quarantines()
+            .expect("interrupted removal should reconcile");
+
+        assert!(
+            reports
+                .iter()
+                .any(|report| report.contains("Recovered interrupted bound-path removal"))
+        );
+        assert!(!owned_path.exists());
+        assert!(fs::read_dir(&backup).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(REMOVE_QUARANTINE_PREFIX)
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unowned_remove_quarantine_name_is_retained() {
+        let root = temp_dir("bound-remove-unowned-quarantine");
+        fs::create_dir_all(&root).expect("root should create");
+        let quarantine = root.join(format!("{REMOVE_QUARANTINE_PREFIX}-forged"));
+        fs::create_dir(&quarantine).expect("unowned quarantine should create");
+        fs::write(quarantine.join("entry"), b"user-owned")
+            .expect("unowned quarantine entry should write");
+        let rooted = RootedFs::new(&root).expect("root should bind");
+
+        let reports = rooted
+            .reconcile_remove_quarantines()
+            .expect("unowned quarantine should be reported");
+
+        assert!(
+            reports
+                .iter()
+                .any(|report| report.contains("Retained unresolved"))
+        );
+        assert_eq!(fs::read(quarantine.join("entry")).unwrap(), b"user-owned");
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -777,6 +777,7 @@ async fn complete_bbdown_access_key_login(
         }
         Err(err) => {
             let retryable = release_pending_bilibili_access_key_login(
+                &config,
                 chat_id,
                 pending.auth_generation,
                 pending.ticket_id,
@@ -785,7 +786,7 @@ async fn complete_bbdown_access_key_login(
             let retry_hint = if retryable {
                 "; send a corrected callback to retry"
             } else {
-                ""
+                "; start a new /bbdown login access-key flow to retry"
             };
             let message = format!(
                 "BBDown access-key login failed{retry_hint}:\n{}",
@@ -1170,10 +1171,12 @@ fn claim_pending_bilibili_access_key_login(
 }
 
 async fn release_pending_bilibili_access_key_login(
+    config: &AppConfig,
     chat_id: i64,
     auth_generation: u64,
     ticket_id: u64,
 ) -> bool {
+    let current_auth_epoch = current_bbdown_auth_epoch(config).await.ok();
     let mut logins = pending_bilibili_access_key_logins().lock().await;
     let current_auth_generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
     release_claimed_bilibili_access_key_login(
@@ -1182,6 +1185,7 @@ async fn release_pending_bilibili_access_key_login(
         auth_generation,
         ticket_id,
         current_auth_generation,
+        current_auth_epoch,
         Instant::now(),
     )
 }
@@ -1192,6 +1196,7 @@ fn release_claimed_bilibili_access_key_login(
     auth_generation: u64,
     ticket_id: u64,
     current_auth_generation: u64,
+    current_auth_epoch: Option<u64>,
     now: Instant,
 ) -> bool {
     prune_expired_pending_bilibili_access_key_logins(logins, now);
@@ -1202,6 +1207,10 @@ fn release_claimed_bilibili_access_key_login(
         return false;
     };
     if login.auth_generation != auth_generation || login.ticket_id != ticket_id {
+        return false;
+    }
+    if current_auth_epoch != Some(login.auth_epoch) {
+        logins.remove(&chat_id);
         return false;
     }
     if now.duration_since(login.created_at) > BILIBILI_ACCESS_KEY_LOGIN_TTL {
@@ -2621,6 +2630,7 @@ mod tests {
             auth_generation,
             ticket_id,
             auth_generation,
+            Some(3),
             created_at,
         ));
         let second = match claim_pending_bilibili_access_key_login(&mut logins, chat_id, created_at)
@@ -2658,6 +2668,7 @@ mod tests {
             auth_generation,
             ticket_id,
             auth_generation + 1,
+            Some(3),
             now,
         ));
 
@@ -2696,9 +2707,40 @@ mod tests {
             auth_generation,
             old_ticket_id,
             auth_generation,
+            Some(3),
             now,
         ));
         assert_eq!(logins[&chat_id].ticket_id, new_ticket_id);
+    }
+
+    #[test]
+    fn failed_access_key_callback_discards_a_stale_epoch_ticket() {
+        let chat_id = 123;
+        let auth_generation = 42;
+        let now = Instant::now();
+        let mut logins = HashMap::from([(
+            chat_id,
+            PendingBilibiliAccessKeyLogin {
+                auth_generation,
+                auth_epoch: 3,
+                ticket_id: 7,
+                ticket: bilibili_core::create_access_key_ticket()
+                    .expect("access-key ticket should be created"),
+                created_at: now,
+                in_progress: true,
+            },
+        )]);
+
+        assert!(!release_claimed_bilibili_access_key_login(
+            &mut logins,
+            chat_id,
+            auth_generation,
+            7,
+            auth_generation,
+            Some(4),
+            now,
+        ));
+        assert!(!logins.contains_key(&chat_id));
     }
 
     #[test]
