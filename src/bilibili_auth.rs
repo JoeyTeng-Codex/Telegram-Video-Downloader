@@ -17,7 +17,7 @@ use image::{DynamicImage, ImageFormat, Luma};
 use qrcode::QrCode;
 use reqwest::Client;
 use reqwest::header::{COOKIE, HeaderMap, SET_COOKIE, USER_AGENT};
-use rustix::fs::FlockOperation;
+use rustix::fs::{CWD, FlockOperation, RenameFlags};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -34,6 +34,7 @@ const AUTH_EPOCH_LOG_LIMIT: u64 = 64 * 1024;
 const AUTH_EPOCH_SLOT_SIZE: usize = 64;
 const AUTH_EPOCH_SLOT_COUNT: usize = 2;
 const AUTH_EPOCH_SLOT_MAGIC: &[u8; 8] = b"TVDAUTH1";
+const AUTH_LOCK_HEADER: &[u8] = b"telegram-video-downloader-auth-lock-v1\n";
 const LOGIN_URL_COOKIE_NAMES: &[&str] = &[
     "SESSDATA",
     "bili_jct",
@@ -699,12 +700,18 @@ fn read_auth_epoch_log(file: &File, path: &Path) -> Result<(u64, u64, u64)> {
         .take(legacy_len)
         .read_to_end(&mut contents)
         .context("failed to read BBDown auth epoch log")?;
-    let valid_len = contents
+    let body_offset = if contents.starts_with(AUTH_LOCK_HEADER) {
+        AUTH_LOCK_HEADER.len()
+    } else {
+        0
+    };
+    let body = &contents[body_offset..];
+    let valid_len = body
         .iter()
         .rposition(|byte| *byte == b'\n')
         .map_or(0, |index| index + 1);
-    let complete = std::str::from_utf8(&contents[..valid_len])
-        .context("BBDown auth epoch log is not UTF-8")?;
+    let complete =
+        std::str::from_utf8(&body[..valid_len]).context("BBDown auth epoch log is not UTF-8")?;
     let mut epoch = 0_u64;
     for line in complete.lines() {
         let value = line
@@ -718,7 +725,87 @@ fn read_auth_epoch_log(file: &File, path: &Path) -> Result<(u64, u64, u64)> {
         }
         epoch = value;
     }
-    Ok((epoch, valid_len as u64, file_len))
+    Ok((epoch, (body_offset + valid_len) as u64, file_len))
+}
+
+fn validate_existing_auth_lock_format(file: &File, path: &Path) -> Result<()> {
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("failed to inspect BBDown auth lock {}", path.display()))?
+        .len();
+    let maximum_len = AUTH_EPOCH_LOG_LIMIT + (AUTH_EPOCH_SLOT_SIZE * AUTH_EPOCH_SLOT_COUNT) as u64;
+    if file_len > maximum_len {
+        bail!(
+            "BBDown auth lock exceeds its format limit: {}",
+            path.display()
+        );
+    }
+
+    let prefix_len = file_len.min(AUTH_EPOCH_LOG_LIMIT);
+    let mut reader = file
+        .try_clone()
+        .context("failed to clone BBDown auth lock for format validation")?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("failed to seek BBDown auth lock for format validation")?;
+    let mut prefix = Vec::with_capacity(prefix_len as usize);
+    reader
+        .take(prefix_len)
+        .read_to_end(&mut prefix)
+        .context("failed to read BBDown auth lock for format validation")?;
+
+    if let Some(body) = prefix.strip_prefix(AUTH_LOCK_HEADER) {
+        if body.iter().any(|byte| *byte != 0) {
+            bail!("BBDown auth lock has invalid current-format padding");
+        }
+        read_auth_epoch(file, path)?;
+        return Ok(());
+    }
+
+    let slots = read_auth_epoch_slots(file)?;
+    let (legacy_epoch, valid_len, _) = read_auth_epoch_log(file, path)?;
+    let tail = &prefix[usize::try_from(valid_len).context("invalid auth lock length")?..];
+    let digit_len = tail
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(tail.len());
+    if tail[..digit_len].iter().any(|byte| !byte.is_ascii_digit())
+        || tail[digit_len..].iter().any(|byte| *byte != 0)
+    {
+        bail!("BBDown auth lock is not a recognized legacy epoch log");
+    }
+    if digit_len > 0 {
+        let partial = std::str::from_utf8(&tail[..digit_len])
+            .context("BBDown auth lock legacy tail is not UTF-8")?;
+        let expected = legacy_epoch
+            .checked_add(1)
+            .context("BBDown auth epoch is exhausted")?
+            .to_string();
+        if !expected.starts_with(partial) {
+            bail!("BBDown auth lock has an invalid partial legacy record");
+        }
+    }
+    if legacy_epoch == 0 && slots.is_empty() {
+        bail!("BBDown auth lock is not an initialized downloader lock");
+    }
+    read_auth_epoch(file, path)?;
+    Ok(())
+}
+
+fn initialize_auth_lock(file: &File, path: &Path) -> Result<()> {
+    let mut writer = file
+        .try_clone()
+        .context("failed to clone new BBDown auth lock")?;
+    writer
+        .seek(SeekFrom::Start(0))
+        .context("failed to seek new BBDown auth lock")?;
+    writer
+        .write_all(AUTH_LOCK_HEADER)
+        .context("failed to initialize BBDown auth lock")?;
+    writer
+        .sync_all()
+        .context("failed to persist new BBDown auth lock")?;
+    sync_auth_lock_parent(path)
 }
 
 fn sync_auth_lock_parent(path: &Path) -> Result<()> {
@@ -782,8 +869,54 @@ fn acquire_auth_mutation_file_lock(
         })?;
     }
 
+    let file = open_or_create_auth_mutation_lock(&lock_path)?;
+    rustix::fs::flock(&file, FlockOperation::LockExclusive)
+        .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
+        .with_context(|| format!("failed to lock BBDown auth state {}", lock_path.display()))?;
+    validate_auth_mutation_lock_identity(&file, &lock_path)?;
+    validate_auth_mutation_lock_is_distinct(&file, protected_paths, &lock_path)?;
+    validate_existing_auth_lock_format(&file, &lock_path)?;
+    set_auth_mutation_lock_private(&file, &lock_path)?;
+    validate_auth_mutation_lock_identity(&file, &lock_path)?;
+    Ok(AuthMutationFileLock {
+        file,
+        path: lock_path,
+    })
+}
+
+fn open_or_create_auth_mutation_lock(path: &Path) -> Result<File> {
+    for _ in 0..3 {
+        if let Some(file) = create_initialized_auth_lock(path)? {
+            return Ok(file);
+        }
+
+        let mut existing = OpenOptions::new();
+        existing.read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            existing.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        match existing.open(path) {
+            Ok(file) => return Ok(file),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to open BBDown auth lock {}", path.display())
+                });
+            }
+        }
+    }
+    bail!(
+        "BBDown auth lock kept changing while opening: {}",
+        path.display()
+    )
+}
+
+fn create_initialized_auth_lock(path: &Path) -> Result<Option<File>> {
+    let temp_path = temp_state_path(path);
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
+    options.read(true).write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -791,20 +924,68 @@ fn acquire_auth_mutation_file_lock(
             .mode(0o600)
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     }
-    let file = options
-        .open(&lock_path)
-        .with_context(|| format!("failed to open BBDown auth lock {}", lock_path.display()))?;
-    rustix::fs::flock(&file, FlockOperation::LockExclusive)
-        .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
-        .with_context(|| format!("failed to lock BBDown auth state {}", lock_path.display()))?;
-    validate_auth_mutation_lock_identity(&file, &lock_path)?;
-    validate_auth_mutation_lock_is_distinct(&file, protected_paths, &lock_path)?;
-    set_auth_mutation_lock_private(&file, &lock_path)?;
-    validate_auth_mutation_lock_identity(&file, &lock_path)?;
-    Ok(AuthMutationFileLock {
-        file,
-        path: lock_path,
-    })
+    let file = options.open(&temp_path).with_context(|| {
+        format!(
+            "failed to create temporary BBDown auth lock {}",
+            temp_path.display()
+        )
+    })?;
+    if let Err(err) = initialize_auth_lock(&file, &temp_path) {
+        let cleanup = fs::remove_file(&temp_path);
+        return match cleanup {
+            Ok(()) => Err(err),
+            Err(cleanup) => Err(err.context(format!(
+                "failed to remove temporary BBDown auth lock: {cleanup}"
+            ))),
+        };
+    }
+
+    match install_auth_lock_noreplace(&temp_path, path) {
+        Ok(true) => {
+            sync_auth_lock_parent(path)?;
+            Ok(Some(file))
+        }
+        Ok(false) => {
+            fs::remove_file(&temp_path).with_context(|| {
+                format!(
+                    "failed to remove unused temporary BBDown auth lock {}",
+                    temp_path.display()
+                )
+            })?;
+            Ok(None)
+        }
+        Err(err) => {
+            let cleanup = fs::remove_file(&temp_path);
+            match cleanup {
+                Ok(()) => Err(err),
+                Err(cleanup) => Err(err.context(format!(
+                    "failed to remove temporary BBDown auth lock: {cleanup}"
+                ))),
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "linux"))]
+fn install_auth_lock_noreplace(source: &Path, destination: &Path) -> Result<bool> {
+    match rustix::fs::renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(true),
+        Err(err) if err == rustix::io::Errno::EXIST => Ok(false),
+        Err(err) => Err(std::io::Error::from_raw_os_error(err.raw_os_error()))
+            .context("failed to atomically install BBDown auth lock"),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+fn install_auth_lock_noreplace(source: &Path, destination: &Path) -> Result<bool> {
+    match fs::hard_link(source, destination) {
+        Ok(()) => {
+            fs::remove_file(source).context("failed to unlink temporary BBDown auth lock")?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(err).context("failed to install BBDown auth lock without replacement"),
+    }
 }
 
 pub fn acquire_auth_reply_file_lock(
@@ -917,9 +1098,11 @@ fn validate_auth_mutation_lock_identity(file: &File, path: &Path) -> Result<()> 
         || !linked.file_type().is_file()
         || opened.dev() != linked.dev()
         || opened.ino() != linked.ino()
+        || opened.uid() != unsafe { libc::geteuid() }
+        || linked.uid() != unsafe { libc::geteuid() }
     {
         bail!(
-            "BBDown auth lock path changed while locking: {}",
+            "BBDown auth lock path or ownership changed while locking: {}",
             path.display()
         );
     }
@@ -2212,6 +2395,12 @@ mod tests {
             .expect("initial auth lock should open");
         assert_eq!(initial.current_epoch().expect("epoch should read"), 0);
         drop(initial);
+        let lock_path = auth_mutation_lock_path(&credential_file);
+        assert!(
+            fs::read(&lock_path)
+                .expect("initialized auth lock should read")
+                .starts_with(AUTH_LOCK_HEADER)
+        );
 
         let (_, first_epoch) =
             with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
@@ -2358,6 +2547,34 @@ mod tests {
         let reopened = acquire_auth_reply_file_lock(&state_path, &credential_file)
             .expect("auth lock should open");
         assert_eq!(reopened.current_epoch().expect("epoch should read"), 0);
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_mutation_lock_rejects_unknown_regular_file_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_path = temp_state_file("auth-lock-unknown-regular");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let lock_path = auth_mutation_lock_path(&credential_file);
+        fs::create_dir_all(lock_path.parent().expect("lock path should have a parent"))
+            .expect("lock parent should create");
+        fs::write(&lock_path, b"unrelated user data").expect("unrelated file should write");
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644))
+            .expect("unrelated permissions should set");
+
+        let error = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect_err("unknown regular file must not be adopted as an auth lock");
+
+        assert!(format!("{error:#}").contains("not a recognized legacy epoch log"));
+        assert_eq!(fs::read(&lock_path).unwrap(), b"unrelated user data");
+        assert_eq!(
+            fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
         if let Some(parent) = state_path.parent() {
             let _ = fs::remove_dir_all(parent);
         }

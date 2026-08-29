@@ -1548,8 +1548,9 @@ fn reconcile_private_remove_tombstone(
 }
 
 fn is_remove_quarantine_tombstone_name(name: &CStr) -> bool {
-    name.to_bytes()
-        .ends_with(REMOVE_QUARANTINE_TOMBSTONE_SUFFIX.as_bytes())
+    let bytes = name.to_bytes();
+    bytes.starts_with(REMOVE_QUARANTINE_PREFIX.as_bytes())
+        && bytes.ends_with(REMOVE_QUARANTINE_TOMBSTONE_SUFFIX.as_bytes())
 }
 
 fn remove_quarantine_tombstone_name(name: &CStr) -> CString {
@@ -2709,6 +2710,25 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(REMOVE_QUARANTINE_PREFIX)
         }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ordinary_cleanup_json_file_does_not_poison_recovery() {
+        let root = temp_dir("ordinary-cleanup-json");
+        let library = root.join("library");
+        fs::create_dir_all(&library).expect("library should create");
+        let ordinary = library.join("movie.cleanup.json");
+        fs::write(&ordinary, b"ordinary metadata").expect("ordinary file should write");
+        let rooted = RootedFs::new(&root).expect("root should bind");
+
+        let report = rooted
+            .reconcile_remove_quarantines_with_status()
+            .expect("ordinary cleanup JSON should be ignored");
+
+        assert!(!report.unresolved);
+        assert!(report.messages.is_empty());
+        assert_eq!(fs::read(&ordinary).unwrap(), b"ordinary metadata");
         let _ = fs::remove_dir_all(root);
     }
 

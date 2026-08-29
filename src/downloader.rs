@@ -34,8 +34,14 @@ static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static OVERWRITE_BACKUP_COUNTER: AtomicU64 = AtomicU64::new(1);
 const VIDEO_STAGING_DIR_NAME: &str = ".telegram-video-downloader-staging";
+const VIDEO_STAGING_INITIALIZING_DIR_PREFIX: &str = ".initializing-job-";
+const VIDEO_STAGING_OWNER_FILE_NAME: &str = ".owner.json";
+const VIDEO_STAGING_OWNER_VERSION: u32 = 1;
+const VIDEO_STAGING_OWNER_LIMIT: usize = 1024;
 const VIDEO_OUTPUT_LOCK_FILE_NAME: &str = ".telegram-video-downloader.lock";
 const VIDEO_CONTROL_DIR_NAME: &str = ".telegram-video-downloader-control";
+const VIDEO_CONTROL_INITIALIZING_DIR_PREFIX: &str =
+    ".telegram-video-downloader-control.initializing";
 const VIDEO_CONTROL_OWNER_FILE_NAME: &str = "owner.json";
 const VIDEO_CONTROL_OWNER_VERSION: u32 = 1;
 const VIDEO_CONTROL_OWNER_LIMIT: usize = 1024;
@@ -3234,6 +3240,9 @@ async fn run_staged_video_job(
         saved_location,
         details,
     };
+    staging
+        .finish()
+        .context("failed to durably finalize the staged video job")?;
     guard.mark_operation_clean();
     Ok(report)
 }
@@ -3861,6 +3870,16 @@ struct VideoControlOwner {
     control_inode: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VideoStagingOwner {
+    version: u32,
+    root_device: u64,
+    root_inode: u64,
+    staging_device: u64,
+    staging_inode: u64,
+}
+
 #[derive(Debug)]
 struct VideoControlDirectory {
     path: PathBuf,
@@ -3961,31 +3980,97 @@ fn video_output_lock_file(root: &RootedFs) -> Result<BoundFile> {
 
 fn video_control_directory(root: &RootedFs) -> Result<VideoControlDirectory> {
     let path = root.logical_root_path().join(VIDEO_CONTROL_DIR_NAME);
-    let created = root.create_dir(&path, 0o700)?;
-    let entry = root.bind_entry(&path, false)?;
-    let identity = match (created, root.bound_entry_identity(&entry)?) {
-        (Some(created), Some(current)) if created == current => current,
-        (Some(_), _) => bail!("video control directory identity changed while creating it"),
-        (None, Some(current)) if current.is_dir() => current,
-        (None, Some(_)) => bail!("video control path is not a directory: {}", path.display()),
-        (None, None) => bail!("video control directory disappeared: {}", path.display()),
-    };
-    root.validate_private_bound_directory(&entry, identity, 0o700)?;
+    if root.entry_identity(&path)?.is_none() {
+        install_video_control_directory(root, &path)?;
+    }
+    validate_video_control_directory(root, &path)
+}
 
-    let owner_path = path.join(VIDEO_CONTROL_OWNER_FILE_NAME);
-    let expected = VideoControlOwner {
+fn install_video_control_directory(root: &RootedFs, path: &Path) -> Result<()> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for _ in 0..1000 {
+        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = root.logical_root_path().join(format!(
+            "{VIDEO_CONTROL_INITIALIZING_DIR_PREFIX}-{}-{nanos}-{counter}",
+            std::process::id()
+        ));
+        let Some(identity) = root.create_dir(&candidate, 0o700)? else {
+            continue;
+        };
+        let entry = root.bind_entry(&candidate, false)?;
+        if root.bound_entry_identity(&entry)? != Some(identity) {
+            let _ = root.remove_bound_tree_if_identity(&entry, identity);
+            bail!(
+                "video control initialization directory identity changed: {}",
+                candidate.display()
+            );
+        }
+        root.validate_private_bound_directory(&entry, identity, 0o700)?;
+        let owner = video_control_owner(root, identity);
+        let contents = serde_json::to_vec(&owner)
+            .context("failed to encode video control ownership record")?;
+        if let Err(err) = root
+            .create_new_bound_file(
+                &candidate.join(VIDEO_CONTROL_OWNER_FILE_NAME),
+                &contents,
+                0o600,
+            )
+            .context("failed to create video control ownership record")
+        {
+            let cleanup = root.remove_bound_tree_if_identity(&entry, identity);
+            return match cleanup {
+                Ok(()) => Err(err),
+                Err(cleanup) => Err(err.context(format!(
+                    "failed to clean video control initialization directory: {cleanup:#}"
+                ))),
+            };
+        }
+
+        let destination = root.bind_entry(path, false)?;
+        if root.bound_entry_identity(&destination)?.is_some() {
+            root.remove_bound_tree_if_identity(&entry, identity)?;
+            return Ok(());
+        }
+        if let Err(err) =
+            root.rename_via_bound_parents_noreplace_if_identity(&entry, &destination, identity)
+        {
+            let cleanup = root.remove_bound_tree_if_identity(&entry, identity);
+            return match cleanup {
+                Ok(()) => Err(err.context("failed to install video control directory")),
+                Err(cleanup) => Err(err.context(format!(
+                    "failed to install video control directory; cleanup also failed: {cleanup:#}"
+                ))),
+            };
+        }
+        return Ok(());
+    }
+    bail!("failed to allocate a video control initialization directory")
+}
+
+fn video_control_owner(root: &RootedFs, identity: EntryIdentity) -> VideoControlOwner {
+    VideoControlOwner {
         version: VIDEO_CONTROL_OWNER_VERSION,
         root_device: root.root_identity().device(),
         root_inode: root.root_identity().inode(),
         control_device: identity.device(),
         control_inode: identity.inode(),
-    };
-    if created.is_some() {
-        let contents = serde_json::to_vec(&expected)
-            .context("failed to encode video control ownership record")?;
-        root.create_new_bound_file(&owner_path, &contents, 0o600)
-            .context("failed to create video control ownership record")?;
     }
+}
+
+fn validate_video_control_directory(root: &RootedFs, path: &Path) -> Result<VideoControlDirectory> {
+    let entry = root.bind_entry(path, false)?;
+    let identity = match root.bound_entry_identity(&entry)? {
+        Some(current) if current.is_dir() => current,
+        Some(_) => bail!("video control path is not a directory: {}", path.display()),
+        None => bail!("video control directory disappeared: {}", path.display()),
+    };
+    root.validate_private_bound_directory(&entry, identity, 0o700)?;
+
+    let owner_path = path.join(VIDEO_CONTROL_OWNER_FILE_NAME);
+    let expected = video_control_owner(root, identity);
     let owner = root.open_bound_file(&owner_path)?.with_context(|| {
         format!(
             "video control directory is not app-owned; missing {}",
@@ -4009,7 +4094,7 @@ fn video_control_directory(root: &RootedFs) -> Result<VideoControlDirectory> {
     }
     root.validate_private_bound_directory(&entry, identity, 0o700)?;
     Ok(VideoControlDirectory {
-        path,
+        path: path.to_path_buf(),
         entry,
         identity,
     })
@@ -4150,12 +4235,15 @@ async fn video_output_lock(
     let mut unresolved_recovery = false;
     if recovery_state_existed && !video_recovery_state_is_clean(&recovery_state_file)? {
         let quarantine_recovery = root.reconcile_remove_quarantines_with_status()?;
+        let staging_recovery = recover_pending_video_staging_directories_locked(&root)?;
         let mux_recovery = recover_pending_bilibili_mux_transactions_locked(&root, video_dir)?;
         let overwrite_recovery = recover_pending_overwrite_transactions_locked(&root, video_dir)?;
         unresolved_recovery = quarantine_recovery.unresolved
+            || staging_recovery.unresolved
             || mux_recovery.unresolved
             || overwrite_recovery.unresolved;
         recoveries.extend(quarantine_recovery.messages);
+        recoveries.extend(staging_recovery.messages);
         recoveries.extend(mux_recovery.messages);
         recoveries.extend(overwrite_recovery.messages);
     }
@@ -5848,21 +5936,70 @@ fn create_video_staging_dir(root: &RootedFs) -> Result<BoundStagingDir> {
         .unwrap_or_default()
         .as_nanos();
     for index in 0..1000 {
-        let candidate = parent.join(format!("job-{}-{nanos}-{index}", std::process::id()));
-        match root.create_dir(&candidate, 0o700)? {
+        let token = format!("{}-{nanos}-{index}", std::process::id());
+        let initializing = parent.join(format!("{VIDEO_STAGING_INITIALIZING_DIR_PREFIX}{token}"));
+        let candidate = parent.join(format!("job-{token}"));
+        match root.create_dir(&initializing, 0o700)? {
             Some(identity) => {
-                let entry = root.bind_entry(&candidate, false)?;
+                let entry = root.bind_entry(&initializing, false)?;
                 if root.bound_entry_identity(&entry)? != Some(identity) {
                     let _ = root.remove_bound_dir_if_identity(&entry, identity);
                     bail!(
                         "staging directory identity changed while binding: {}",
-                        candidate.display()
+                        initializing.display()
                     );
                 }
+                root.validate_private_bound_directory(&entry, identity, 0o700)?;
+                let owner = VideoStagingOwner {
+                    version: VIDEO_STAGING_OWNER_VERSION,
+                    root_device: root.root_identity().device(),
+                    root_inode: root.root_identity().inode(),
+                    staging_device: identity.device(),
+                    staging_inode: identity.inode(),
+                };
+                let owner_contents = serde_json::to_vec(&owner)
+                    .context("failed to encode video staging ownership record")?;
+                if let Err(err) = root
+                    .create_new_bound_file(
+                        &initializing.join(VIDEO_STAGING_OWNER_FILE_NAME),
+                        &owner_contents,
+                        0o600,
+                    )
+                    .context("failed to create video staging ownership record")
+                {
+                    let cleanup = root.remove_bound_tree_durably_if_identity(&entry, identity);
+                    return match cleanup {
+                        Ok(()) => Err(err),
+                        Err(cleanup) => Err(err.context(format!(
+                            "failed to clean video staging directory: {cleanup:#}"
+                        ))),
+                    };
+                }
+                validate_video_staging_directory(root, &initializing, identity)?;
+                let destination = root.bind_entry(&candidate, false)?;
+                if root.bound_entry_identity(&destination)?.is_some() {
+                    root.remove_bound_tree_if_identity(&entry, identity)?;
+                    continue;
+                }
+                if let Err(err) = root.rename_via_bound_parents_noreplace_if_identity(
+                    &entry,
+                    &destination,
+                    identity,
+                ) {
+                    let cleanup = root.remove_bound_tree_if_identity(&entry, identity);
+                    return match cleanup {
+                        Ok(()) => Err(err.context("failed to install video staging directory")),
+                        Err(cleanup) => Err(err.context(format!(
+                            "failed to install video staging directory; cleanup also failed: {cleanup:#}"
+                        ))),
+                    };
+                }
+                let entry = validate_video_staging_directory(root, &candidate, identity)?;
                 return Ok(BoundStagingDir {
                     root: root.clone(),
                     entry,
                     identity,
+                    removed: false,
                 });
             }
             None => continue,
@@ -5892,6 +6029,110 @@ fn copy_bbdown_config_for_staging(final_dir: &Path, staging_dir: &Path) -> Resul
 
 fn is_staging_support_file(staging_dir: &Path, path: &Path) -> bool {
     path == staging_dir.join("BBDown.config")
+        || path == staging_dir.join(VIDEO_STAGING_OWNER_FILE_NAME)
+}
+
+fn validate_video_staging_directory(
+    root: &RootedFs,
+    path: &Path,
+    expected_identity: EntryIdentity,
+) -> Result<BoundEntry> {
+    let entry = root.bind_entry(path, false)?;
+    if root.bound_entry_identity(&entry)? != Some(expected_identity) || !expected_identity.is_dir()
+    {
+        bail!(
+            "video staging directory identity changed: {}",
+            path.display()
+        );
+    }
+    root.validate_private_bound_directory(&entry, expected_identity, 0o700)?;
+    let owner_path = path.join(VIDEO_STAGING_OWNER_FILE_NAME);
+    let owner = root.open_bound_file(&owner_path)?.with_context(|| {
+        format!(
+            "video staging directory is not app-owned; missing {}",
+            owner_path.display()
+        )
+    })?;
+    owner.validate_private_single_link(0o600)?;
+    let actual: VideoStagingOwner =
+        serde_json::from_slice(&owner.read_limited(VIDEO_STAGING_OWNER_LIMIT)?)
+            .context("failed to parse video staging ownership record")?;
+    if actual.version != VIDEO_STAGING_OWNER_VERSION
+        || actual.root_device != root.root_identity().device()
+        || actual.root_inode != root.root_identity().inode()
+        || actual.staging_device != expected_identity.device()
+        || actual.staging_inode != expected_identity.inode()
+    {
+        bail!("video staging ownership record does not match the bound output root");
+    }
+    if root.entry_identity(&owner_path)? != Some(owner.identity()) {
+        bail!("video staging ownership record identity changed after validation");
+    }
+    root.validate_private_bound_directory(&entry, expected_identity, 0o700)?;
+    Ok(entry)
+}
+
+#[derive(Debug, Default)]
+struct VideoStagingRecoveryReport {
+    messages: Vec<String>,
+    unresolved: bool,
+}
+
+fn recover_pending_video_staging_directories_locked(
+    root: &RootedFs,
+) -> Result<VideoStagingRecoveryReport> {
+    let parent_path = root.logical_root_path().join(VIDEO_STAGING_DIR_NAME);
+    let Some(parent_identity) = root.entry_identity(&parent_path)? else {
+        return Ok(VideoStagingRecoveryReport::default());
+    };
+    if !parent_identity.is_dir() {
+        bail!(
+            "video staging root is not a directory: {}",
+            parent_path.display()
+        );
+    }
+    let parent_entry = root.bind_entry(&parent_path, false)?;
+    let mut report = VideoStagingRecoveryReport::default();
+    for (name, identity) in root.list_bound_directory(&parent_entry, parent_identity)? {
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("job-") && !name.starts_with(VIDEO_STAGING_INITIALIZING_DIR_PREFIX) {
+            continue;
+        }
+        let path = parent_path.join(name);
+        if !identity.is_dir() {
+            report.unresolved = true;
+            report.messages.push(format!(
+                "Retained unresolved staged video job {}: path is not a directory",
+                path.display()
+            ));
+            continue;
+        }
+        match validate_video_staging_directory(root, &path, identity) {
+            Ok(entry) => match root.remove_bound_tree_durably_if_identity(&entry, identity) {
+                Ok(()) => report.messages.push(format!(
+                    "Discarded interrupted staged video job: {}",
+                    path.display()
+                )),
+                Err(err) => {
+                    report.unresolved = true;
+                    report.messages.push(format!(
+                        "Retained unresolved staged video job {}: {err:#}",
+                        path.display()
+                    ));
+                }
+            },
+            Err(err) => {
+                report.unresolved = true;
+                report.messages.push(format!(
+                    "Retained unowned staged video job {}: {err:#}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(report)
 }
 
 fn collect_regular_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -6075,6 +6316,7 @@ struct BoundStagingDir {
     root: RootedFs,
     entry: BoundEntry,
     identity: EntryIdentity,
+    removed: bool,
 }
 
 impl BoundStagingDir {
@@ -6084,12 +6326,22 @@ impl BoundStagingDir {
 
     fn validate_for_path_access(&self) -> Result<()> {
         self.root.validate_configured_root()?;
-        require_bound_entry_identity(&self.root, &self.entry, self.identity, "staging directory")
+        validate_video_staging_directory(&self.root, self.path(), self.identity).map(|_| ())
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.root
+            .remove_bound_tree_durably_if_identity(&self.entry, self.identity)?;
+        self.removed = true;
+        Ok(())
     }
 }
 
 impl Drop for BoundStagingDir {
     fn drop(&mut self) {
+        if self.removed {
+            return;
+        }
         if let Err(err) = self
             .root
             .remove_bound_tree_if_identity(&self.entry, self.identity)
@@ -12135,10 +12387,12 @@ mod tests {
     #[test]
     fn startup_recovery_discards_interrupted_bilibili_mux_staging() {
         let root = temp_test_dir("bilibili-mux-staging-recovery");
-        let raw = root.join("video.m4s");
-        let output = root.join("Episode.mp4");
-        fs::write(&raw, "raw-video").expect("raw input should write");
         let rooted = RootedFs::new(&root).expect("output root should bind");
+        let staging = create_video_staging_dir(&rooted).expect("production staging should create");
+        let staging_path = staging.path().to_path_buf();
+        let raw = staging_path.join("video.m4s");
+        let output = staging_path.join("Episode.mp4");
+        fs::write(&raw, "raw-video").expect("raw input should write");
         let inputs = vec![BilibiliMediaInput {
             kind: "video".to_string(),
             path: raw.clone(),
@@ -12151,14 +12405,33 @@ mod tests {
         fs::write(reservation.command_path(), "partial-mux")
             .expect("partial mux output should write");
         std::mem::forget(reservation);
+        std::mem::forget(staging);
 
-        let report = recover_pending_bilibili_mux_transactions_locked(&rooted, &root)
-            .expect("interrupted mux staging should recover");
+        let report = recover_pending_video_staging_directories_locked(&rooted)
+            .expect("interrupted production staging should recover");
 
         assert!(!report.unresolved);
-        assert!(raw.is_file());
+        assert!(!raw.exists());
         assert!(!output.exists());
         assert!(!transaction.exists());
+        assert!(!staging_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_recovery_retains_unowned_staging_job() {
+        let root = temp_test_dir("unowned-staging-recovery");
+        let staging = root.join(VIDEO_STAGING_DIR_NAME).join("job-user-owned");
+        fs::create_dir_all(&staging).expect("unowned staging directory should create");
+        let sentinel = staging.join("user.txt");
+        fs::write(&sentinel, "user-owned").expect("sentinel should write");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+
+        let report = recover_pending_video_staging_directories_locked(&rooted)
+            .expect("unowned staging scan should complete");
+
+        assert!(report.unresolved);
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "user-owned");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -12233,12 +12506,16 @@ mod tests {
     }
 
     #[test]
-    fn staging_support_files_only_include_managed_config() {
+    fn staging_support_files_include_managed_config_and_owner() {
         let staging_dir = PathBuf::from("/tmp/staging");
 
         assert!(is_staging_support_file(
             &staging_dir,
             &staging_dir.join("BBDown.config")
+        ));
+        assert!(is_staging_support_file(
+            &staging_dir,
+            &staging_dir.join(VIDEO_STAGING_OWNER_FILE_NAME)
         ));
         assert!(!is_staging_support_file(
             &staging_dir,
@@ -13467,6 +13744,26 @@ mv video.original video.m4s || exit 46
             )
             .unwrap(),
             [VIDEO_RECOVERY_STATE_DIRTY]
+        );
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn interrupted_control_initialization_does_not_block_startup() {
+        let video_dir = temp_test_dir("interrupted-video-control-initialization");
+        let stale = video_dir.join(format!("{VIDEO_CONTROL_INITIALIZING_DIR_PREFIX}-stale"));
+        fs::create_dir(&stale).expect("stale initialization directory should create");
+        fs::write(stale.join("partial"), "interrupted").expect("partial owner should write");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+
+        let control = video_control_directory(&root)
+            .expect("a new complete control directory should install atomically");
+
+        assert_eq!(control.path, video_dir.join(VIDEO_CONTROL_DIR_NAME));
+        assert!(control.path.join(VIDEO_CONTROL_OWNER_FILE_NAME).is_file());
+        assert_eq!(
+            fs::read_to_string(stale.join("partial")).unwrap(),
+            "interrupted"
         );
         let _ = fs::remove_dir_all(video_dir);
     }
