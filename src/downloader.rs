@@ -1745,6 +1745,18 @@ async fn run_staged_video_job(
         );
     }
 
+    let preserved_existing_for_multiple_media =
+        matches!(action, VideoDuplicateAction::Overwrite) && staged_media.len() > 1;
+    if preserved_existing_for_multiple_media {
+        send_progress(
+            progress.as_ref(),
+            format!(
+                "staging: download produced {} media files; preserving the existing file and keeping all new outputs",
+                staged_media.len()
+            ),
+        );
+    }
+
     let moved_files = if staged_media.is_empty() && artifact_only {
         move_staged_artifact_files(
             &staging_dir,
@@ -1775,8 +1787,15 @@ async fn run_staged_video_job(
     } else {
         join_paths(&moved_files)
     };
+    let overwrite_fallback_detail = if preserved_existing_for_multiple_media {
+        "Overwrite fallback: the download produced multiple media files, so the existing file was preserved and all new outputs were kept alongside it."
+            .to_string()
+    } else {
+        String::new()
+    };
     let details = nonempty_join(vec![
         remove_staging_detail_lines(&report.details, &staging_dir),
+        overwrite_fallback_detail,
         format!("Moved: {}", join_paths(&moved_files)),
     ]);
     Ok(JobReport {
@@ -3621,21 +3640,32 @@ fn trailing_delimited_identity(stem: &str, open: char, close: char) -> Option<&s
 }
 
 fn metadata_sidecar_identities(path: &Path, content: &str) -> Result<Vec<VideoIdentity>> {
-    if path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".info.json"))
-    {
-        let metadata = serde_json::from_str::<serde_json::Value>(content)
-            .context("failed to parse info JSON")?;
-        return Ok(info_json_identities(&metadata));
+    match identity_metadata_kind(path) {
+        Some(IdentityMetadataKind::InfoJson) => {
+            let metadata = serde_json::from_str::<serde_json::Value>(content)
+                .context("failed to parse info JSON")?;
+            Ok(info_json_identities(&metadata))
+        }
+        Some(IdentityMetadataKind::Nfo) => Ok(nfo_identities(content)),
+        None => Ok(Vec::new()),
     }
+}
 
-    if path.extension().and_then(|extension| extension.to_str()) == Some("nfo") {
-        return Ok(nfo_identities(content));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityMetadataKind {
+    Nfo,
+    InfoJson,
+}
+
+fn identity_metadata_kind(path: &Path) -> Option<IdentityMetadataKind> {
+    let name = path.file_name()?.to_str()?;
+    if name.to_ascii_lowercase().ends_with(".info.json") {
+        return Some(IdentityMetadataKind::InfoJson);
     }
-
-    Ok(Vec::new())
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("nfo"))
+        .then_some(IdentityMetadataKind::Nfo)
 }
 
 fn info_json_identities(metadata: &serde_json::Value) -> Vec<VideoIdentity> {
@@ -4229,7 +4259,17 @@ fn validate_acquired_overwrite(
 
     let mut acquired_index = VideoIdentityIndex::default();
     index_video_filename_identities(&mut acquired_index, acquired.target());
-    for logical_path in metadata_sidecar_paths(acquired.target()) {
+    let mut identity_metadata_paths = metadata_sidecar_paths(acquired.target())
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    identity_metadata_paths.extend(
+        acquired
+            .backups
+            .iter()
+            .map(|backup| backup.original.clone())
+            .filter(|path| is_identity_metadata_path(path)),
+    );
+    for logical_path in identity_metadata_paths {
         if let Some(content_path) = acquired.backup_for(&logical_path) {
             index_metadata_sidecar(
                 &mut acquired_index,
@@ -4238,7 +4278,8 @@ fn validate_acquired_overwrite(
                 content_path,
                 IdentityIndexReadPolicy::Strict,
             )?;
-        } else if root.entry_exists(&logical_path)? {
+        }
+        if root.entry_exists(&logical_path)? {
             bail!(
                 "overwrite identity metadata changed during acquisition: {}",
                 logical_path.display()
@@ -4291,11 +4332,7 @@ fn validate_acquired_overwrite(
 }
 
 fn is_identity_metadata_path(path: &Path) -> bool {
-    path.extension().and_then(|extension| extension.to_str()) == Some("nfo")
-        || path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".info.json"))
+    identity_metadata_kind(path).is_some()
 }
 
 fn rollback_acquired_overwrite(error: anyhow::Error, acquired: AcquiredOverwrite) -> anyhow::Error {
@@ -4320,10 +4357,16 @@ fn move_staged_video_files(
         .iter()
         .filter(|path| is_primary_media_file(path, primary_media_kind))
         .count();
-    let acquisition = if matches!(action, VideoDuplicateAction::Overwrite) {
-        if staged_media_count != 1 {
-            bail!("overwrite requires exactly one staged primary media file");
-        }
+    if matches!(action, VideoDuplicateAction::Overwrite) && staged_media_count == 0 {
+        bail!("overwrite requires a staged primary media file");
+    }
+    let effective_action =
+        if matches!(action, VideoDuplicateAction::Overwrite) && staged_media_count > 1 {
+            VideoDuplicateAction::KeepBoth
+        } else {
+            action
+        };
+    let acquisition = if matches!(effective_action, VideoDuplicateAction::Overwrite) {
         Some(acquire_and_validate_overwrite_target(
             &root,
             duplicate,
@@ -7649,6 +7692,137 @@ mod tests {
             fs::read_to_string(staged).expect("staged file should remain after rejection"),
             "new-video"
         );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn overwrite_falls_back_to_keep_both_for_multiple_primary_files() {
+        let final_dir = temp_test_dir("overwrite-multiple-primary-files");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        let existing = final_dir.join("Episode [cid123].flv");
+        fs::write(&existing, "old-video").expect("existing video should write");
+        let first_staged = staging_dir.join("Episode [cid123].flv");
+        let second_staged = staging_dir.join("Episode [cid123].part2.flv");
+        fs::write(&first_staged, "new-first").expect("first staged video should write");
+        fs::write(&second_staged, "new-second").expect("second staged video should write");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+
+        let moved = move_staged_video_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::Overwrite,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("multiple completed outputs should be kept alongside the existing video");
+
+        let kept_first = final_dir.join("Episode [cid123] (2).flv");
+        let kept_second = final_dir.join("Episode [cid123].part2.flv");
+        assert_eq!(
+            moved.into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([kept_first.clone(), kept_second.clone()])
+        );
+        assert_eq!(fs::read_to_string(existing).unwrap(), "old-video");
+        assert_eq!(fs::read_to_string(kept_first).unwrap(), "new-first");
+        assert_eq!(fs::read_to_string(kept_second).unwrap(), "new-second");
+        assert!(overwrite_backup_dirs(&final_dir).is_empty());
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn overwrite_revalidates_mixed_case_identity_sidecars() {
+        let final_dir = temp_test_dir("overwrite-mixed-case-identity-sidecars");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        let existing = final_dir.join("Episode.mkv");
+        fs::write(&existing, "old-video").expect("existing video should write");
+        let old_nfo = existing.with_extension("NFO");
+        fs::write(
+            &old_nfo,
+            "<movie><uniqueid type=\"bilibili-cid\">cid123</uniqueid></movie>",
+        )
+        .expect("mixed-case identity NFO should write");
+        let staged = staging_dir.join("Episode.mkv");
+        fs::write(&staged, "new-video").expect("staged video should write");
+        fs::write(staged.with_extension("nfo"), "new-nfo").expect("staged NFO should write");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+
+        let moved = move_staged_video_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::Overwrite,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("mixed-case identity metadata should survive overwrite revalidation");
+
+        assert_eq!(moved, vec![existing.clone()]);
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "new-video");
+        assert_eq!(
+            fs::read_to_string(existing.with_extension("nfo")).unwrap(),
+            "new-nfo"
+        );
+        assert!(overwrite_backup_dirs(&final_dir).is_empty());
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn overwrite_revalidates_mixed_case_info_json_sidecars() {
+        let final_dir = temp_test_dir("overwrite-mixed-case-info-json");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        let existing = final_dir.join("Episode.mkv");
+        fs::write(&existing, "old-video").expect("existing video should write");
+        let old_info_json = existing.with_extension("INFO.JSON");
+        fs::write(&old_info_json, r#"{"id":"cid123","extractor":"bilibili"}"#)
+            .expect("mixed-case identity info JSON should write");
+        let staged = staging_dir.join("Episode.mkv");
+        fs::write(&staged, "new-video").expect("staged video should write");
+        fs::write(staged.with_extension("info.json"), r#"{"id":"cid123"}"#)
+            .expect("staged info JSON should write");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+
+        let moved = move_staged_video_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::Overwrite,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("mixed-case info JSON should survive overwrite revalidation");
+
+        assert_eq!(moved, vec![existing.clone()]);
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "new-video");
+        assert_eq!(
+            fs::read_to_string(existing.with_extension("info.json")).unwrap(),
+            r#"{"id":"cid123"}"#
+        );
+        assert!(overwrite_backup_dirs(&final_dir).is_empty());
         let _ = fs::remove_dir_all(final_dir);
     }
 

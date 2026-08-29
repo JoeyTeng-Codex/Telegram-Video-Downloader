@@ -287,14 +287,17 @@ fn ensure_distinct_auth_paths(state_path: &Path, credential_file: &Path) -> Resu
     let aliases_cleanup_file = cleanup_files.iter().try_fold(false, |aliased, path| {
         Ok::<_, anyhow::Error>(
             aliased
-                || normalize_path_for_comparison(path)? == normalized_credential
+                || auth_paths_equal(
+                    &normalize_path_for_comparison(path)?,
+                    &normalized_credential,
+                )
                 || existing_paths_share_identity(path, credential_file)?,
         )
     })?;
-    let inside_cleanup_dir = normalized_credential.starts_with(&normalized_cleanup_dir);
+    let inside_cleanup_dir = auth_path_starts_with(&normalized_credential, &normalized_cleanup_dir);
     let aliases_cleanup_dir_entry =
         existing_file_alias_in_directory(credential_file, &cleanup_dir)?;
-    if normalized_state == normalized_credential
+    if auth_paths_equal(&normalized_state, &normalized_credential)
         || aliases_cleanup_file
         || inside_cleanup_dir
         || aliases_cleanup_dir_entry
@@ -404,6 +407,41 @@ fn lexical_normalize(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+fn auth_paths_equal(first: &Path, second: &Path) -> bool {
+    let mut first = first.components();
+    let mut second = second.components();
+    loop {
+        match (first.next(), second.next()) {
+            (Some(first), Some(second)) if auth_path_components_equal(first, second) => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+fn auth_path_starts_with(path: &Path, prefix: &Path) -> bool {
+    let mut path = path.components();
+    prefix.components().all(|prefix_component| {
+        path.next()
+            .is_some_and(|component| auth_path_components_equal(component, prefix_component))
+    })
+}
+
+fn auth_path_components_equal(
+    first: std::path::Component<'_>,
+    second: std::path::Component<'_>,
+) -> bool {
+    if first == second {
+        return true;
+    }
+
+    // Case-only separation is unsafe when the same config is used on a case-insensitive volume.
+    match (first.as_os_str().to_str(), second.as_os_str().to_str()) {
+        (Some(first), Some(second)) => first.to_lowercase() == second.to_lowercase(),
+        _ => false,
+    }
 }
 
 fn existing_paths_share_identity(first: &Path, second: &Path) -> Result<bool> {
@@ -949,6 +987,22 @@ mod tests {
             .expect_err("aliased auth paths should fail validation");
 
         assert!(error.to_string().contains("must refer to distinct files"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_case_only_missing_auth_path_aliases() {
+        let root = temp_test_dir("auth-case-only-alias");
+        fs::create_dir_all(&root).expect("auth root should create");
+        let state = root.join("Auth.json");
+        let credential = root.join("auth.json");
+
+        let error = ensure_distinct_auth_paths(&state, &credential)
+            .expect_err("case-only auth paths should fail validation");
+
+        assert!(error.to_string().contains("must refer to distinct files"));
+        assert!(!state.exists());
+        assert!(!credential.exists());
         let _ = fs::remove_dir_all(root);
     }
 
