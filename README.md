@@ -40,7 +40,7 @@ cp config.example.toml config.toml
 
 覆盖按钮生成时会以 `O_NOFOLLOW` 打开并持有现有媒体文件，直到任务完成，避免确认后删除并复用 inode 的同路径文件继承覆盖授权。旧媒体备份保留原文件名，事务目录包含已落盘并同步的两阶段恢复 manifest；完整视频覆盖会先提交主媒体，再提交 sidecar，最后把每个已提交文件的设备号和 inode 持久化后才清理旧备份。bot 每次启动都会扫描这些受控事务：`acquired` 事务只在目标路径仍为空时回滚，路径被占用时保留全部对象供人工处理；`committed` 事务只有在当前文件仍与 manifest 身份一致时才完成清理。视频目录里的持久锁文件会跨 bot、`--replay-message` 和启动恢复进程串行化输出事务。无法识别的旧版备份目录、结构异常的事务和无关的不可读子目录会分别保留或跳过并写入日志，不会误删文件或阻止其他事务恢复。
 
-Bilibili 下载和登录不需要本机 `bbdown` 可执行文件；项目直接依赖 `BBDown-rust` 的 `bbdown-core` crate。bot 会关闭 crate 内置 mux，再通过配置的 `tools.ffmpeg` 执行受统一超时和进程管理约束的 mux，同时负责 NFO、staging 和重复文件处理。mux 前会绑定每个原始流文件，成功后再绑定输出文件；只有输出和待删除输入仍保持同一文件身份时才清理原始流。FLV concat mux 使用每次任务独占的隐藏临时清单，不会覆盖或清理下载目录里同名的用户文件。
+Bilibili 下载和登录不需要本机 `bbdown` 可执行文件；项目直接依赖 `BBDown-rust` 的 `bbdown-core` crate。bot 会关闭 crate 内置 mux，再通过配置的 `tools.ffmpeg` 执行受统一超时和进程管理约束的 mux，同时负责 NFO、staging 和重复文件处理。mux 前会绑定每个原始流文件，并独占创建和绑定空输出文件；ffmpeg 成功后必须仍是同一输出对象，且只有输出和待删除输入保持各自文件身份时才清理原始流。FLV concat mux 使用每次任务独占的隐藏临时清单，不会覆盖或清理下载目录里同名的用户文件。
 
 区域受限或 intl 番剧可以配置 `playurl_mode`、`restricted_area`、`restricted_area_proxies`、`restricted_api_proxies`。为兼容旧配置，`bilibili.extra_args` 和 `bilibili.global_args` 里的已知 BBDown-rust 全局项也会被 direct API 读取：endpoint base、`--playurl-mode`、`--restricted-area`、restricted proxy 和 `--request-timeout-seconds`。单值参数按 `extra_args`、`global_args`、结构化字段的顺序覆盖；restricted proxy 参数保持累加。`bilibili.plan_args` 不再用于主路径；`bilibili.download_args` 仅保留 `--only audio|video|subtitle|danmaku|cover` 这类下载模式迁移。
 

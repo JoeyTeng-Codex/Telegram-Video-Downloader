@@ -422,21 +422,6 @@ impl RootedFs {
         self.remove_bound_entry_if_identity(entry, expected, AtFlags::empty())
     }
 
-    pub(crate) fn remove_file_if_exists(&self, path: &Path) -> Result<bool> {
-        let entry = self.bind_entry(path, false)?;
-        let Some(identity) = self.bound_entry_identity(&entry)? else {
-            return Ok(false);
-        };
-        if !identity.is_file() {
-            bail!(
-                "bound cleanup path is not a regular file: {}",
-                path.display()
-            );
-        }
-        self.remove_bound_file_if_identity(&entry, identity)?;
-        Ok(true)
-    }
-
     pub(crate) fn remove_bound_dir_if_identity(
         &self,
         entry: &BoundEntry,

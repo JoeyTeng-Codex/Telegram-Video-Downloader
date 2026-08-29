@@ -18,7 +18,6 @@ use qrcode::QrCode;
 use reqwest::Client;
 use reqwest::header::{COOKIE, HeaderMap, SET_COOKIE, USER_AGENT};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 use url::Url;
 
 const USER_AGENT_VALUE: &str = "Mozilla/5.0";
@@ -606,17 +605,7 @@ pub fn sync_bbdown_rust_credentials_from_state(
     let _guard = AUTH_FILE_LOCK
         .lock()
         .expect("auth file lock should not poison");
-    let Some(state) = (match load_auth_state_unlocked(state_path) {
-        Ok(state) => state,
-        Err(err) => {
-            warn!(
-                error = %err,
-                path = %state_path.display(),
-                "failed to read legacy Bilibili auth state for BBDown-rust credential migration"
-            );
-            return Ok(false);
-        }
-    }) else {
+    let Some(state) = load_auth_state_unlocked(state_path)? else {
         return Ok(false);
     };
     let cookie = state.cookie.trim();
@@ -1242,7 +1231,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_ignores_malformed_legacy_auth_state() {
+    fn sync_rejects_malformed_legacy_auth_state() {
         let path = temp_state_file("bbdown-rust-malformed-legacy-sync");
         let credential_file = path.with_file_name("credentials.json");
         if let Some(parent) = path.parent() {
@@ -1252,10 +1241,9 @@ mod tests {
         fs::write(&credential_file, r#"{"access_key":"access"}"#)
             .expect("credential file should write");
 
-        assert!(
-            !sync_bbdown_rust_credentials_from_state(&path, &credential_file, None)
-                .expect("malformed legacy state should not block credential sync")
-        );
+        let error = sync_bbdown_rust_credentials_from_state(&path, &credential_file, None)
+            .expect_err("malformed legacy state must block credential migration");
+        assert!(format!("{error:#}").contains("failed to parse Bilibili auth state"));
         let value: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(&credential_file).expect("credential file should read"),
         )
