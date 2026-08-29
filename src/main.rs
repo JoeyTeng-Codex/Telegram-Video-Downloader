@@ -20,14 +20,15 @@ use bbdown_core::{
     AccessKeyLoginTicket, CredentialHealthReport, CredentialHealthScope, CredentialHealthStatus,
     CredentialKind, CredentialSource, QrLoginKind, QrLoginState,
 };
-use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
-use tokio::time::{Instant, sleep, timeout as tokio_timeout};
+use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout as tokio_timeout};
 use tracing::{error, info, warn};
 
 use crate::config::AppConfig;
 use crate::downloader::{
-    JobProgress, VideoDuplicate, VideoDuplicateAction, find_video_duplicate_with_probe, run_job,
-    run_job_with_duplicate_action, run_video_job_staged_keep_both,
+    JobProgress, JobProgressReceiver, VideoDuplicate, VideoDuplicateAction,
+    find_video_duplicate_with_probe, job_progress_channel, run_job, run_job_with_duplicate_action,
+    run_video_job_staged_keep_both,
 };
 use crate::router::{
     BilibiliAuthCommand, BilibiliAuthLoginMode, BilibiliSelection, JobRequest, RouteResult,
@@ -49,6 +50,7 @@ static PENDING_BILIBILI_ACCESS_KEY_LOGINS: OnceLock<
 > = OnceLock::new();
 static DUPLICATE_CALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
 static BILIBILI_SELECTION_CALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
+static BILIBILI_ACCESS_KEY_TICKET_COUNTER: AtomicU64 = AtomicU64::new(1);
 const DUPLICATE_DECISION_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_PENDING_DUPLICATE_JOBS: usize = 256;
 const BILIBILI_SELECTION_DECISION_TTL: Duration = Duration::from_secs(30 * 60);
@@ -75,6 +77,7 @@ struct PendingBilibiliSelectionJob {
 #[derive(Debug, Clone)]
 struct PendingBilibiliAccessKeyLogin {
     auth_generation: u64,
+    ticket_id: u64,
     ticket: AccessKeyLoginTicket,
     created_at: Instant,
     in_progress: bool,
@@ -227,10 +230,12 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
                     continue;
                 }
                 println!("Started replay job #{job_id}: {}", job.label());
-                let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<JobProgress>();
+                let (progress_tx, mut progress_rx) = job_progress_channel();
                 let progress_handle = tokio::spawn(async move {
-                    while let Some(progress) = progress_rx.recv().await {
-                        println!("Progress replay job #{job_id}: {}", progress.message);
+                    while progress_rx.changed().await.is_ok() {
+                        if let Some(progress) = progress_rx.borrow_and_update().clone() {
+                            println!("Progress replay job #{job_id}: {}", progress.message);
+                        }
                     }
                 });
                 let result = match job {
@@ -616,6 +621,7 @@ async fn start_bbdown_access_key_login(
 ) -> Result<()> {
     ensure_bbdown_login_active(auth_generation)?;
     let ticket = bilibili_core::create_access_key_ticket()?;
+    let ticket_id = BILIBILI_ACCESS_KEY_TICKET_COUNTER.fetch_add(1, Ordering::Relaxed);
     let output = ticket.output();
     {
         let mut logins =
@@ -627,6 +633,7 @@ async fn start_bbdown_access_key_login(
             chat_id,
             PendingBilibiliAccessKeyLogin {
                 auth_generation,
+                ticket_id,
                 ticket,
                 created_at: Instant::now(),
                 in_progress: false,
@@ -647,7 +654,7 @@ async fn start_bbdown_access_key_login(
     .await
     .and_then(|result| result);
     if let Err(err) = delivery {
-        clear_pending_bilibili_access_key_login(chat_id, auth_generation).await;
+        clear_pending_bilibili_access_key_login(chat_id, auth_generation, ticket_id).await;
         return Err(err);
     }
     await_bbdown_login_active(
@@ -707,15 +714,24 @@ async fn complete_bbdown_access_key_login(
     let result = complete_bbdown_access_key_login_inner(&config, &pending, &input).await;
     let message = match result {
         Ok(summary) => {
-            clear_pending_bilibili_access_key_login(chat_id, pending.auth_generation).await;
+            clear_pending_bilibili_access_key_login(
+                chat_id,
+                pending.auth_generation,
+                pending.ticket_id,
+            )
+            .await;
             format!(
                 "BBDown access-key login saved.\n{}",
                 format_bbdown_credential_summary(&summary)
             )
         }
         Err(err) => {
-            let retryable =
-                release_pending_bilibili_access_key_login(chat_id, pending.auth_generation).await;
+            let retryable = release_pending_bilibili_access_key_login(
+                chat_id,
+                pending.auth_generation,
+                pending.ticket_id,
+            )
+            .await;
             let retry_hint = if retryable {
                 "; send a corrected callback to retry"
             } else {
@@ -992,13 +1008,18 @@ fn claim_pending_bilibili_access_key_login(
     PendingBilibiliAccessKeyLoginClaim::Claimed(login.clone())
 }
 
-async fn release_pending_bilibili_access_key_login(chat_id: i64, auth_generation: u64) -> bool {
+async fn release_pending_bilibili_access_key_login(
+    chat_id: i64,
+    auth_generation: u64,
+    ticket_id: u64,
+) -> bool {
     let mut logins = pending_bilibili_access_key_logins().lock().await;
     let current_auth_generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
     release_claimed_bilibili_access_key_login(
         &mut logins,
         chat_id,
         auth_generation,
+        ticket_id,
         current_auth_generation,
         Instant::now(),
     )
@@ -1008,6 +1029,7 @@ fn release_claimed_bilibili_access_key_login(
     logins: &mut HashMap<i64, PendingBilibiliAccessKeyLogin>,
     chat_id: i64,
     auth_generation: u64,
+    ticket_id: u64,
     current_auth_generation: u64,
     now: Instant,
 ) -> bool {
@@ -1015,22 +1037,45 @@ fn release_claimed_bilibili_access_key_login(
     if current_auth_generation != auth_generation {
         return false;
     }
-    if let Some(login) = logins.get_mut(&chat_id)
-        && login.auth_generation == auth_generation
-    {
-        login.in_progress = false;
-        return true;
+    let Some(login) = logins.get(&chat_id) else {
+        return false;
+    };
+    if login.auth_generation != auth_generation || login.ticket_id != ticket_id {
+        return false;
     }
-    false
+    if now.duration_since(login.created_at) > BILIBILI_ACCESS_KEY_LOGIN_TTL {
+        logins.remove(&chat_id);
+        return false;
+    }
+    logins
+        .get_mut(&chat_id)
+        .expect("ticket was checked above")
+        .in_progress = false;
+    true
 }
 
-async fn clear_pending_bilibili_access_key_login(chat_id: i64, auth_generation: u64) {
+async fn clear_pending_bilibili_access_key_login(
+    chat_id: i64,
+    auth_generation: u64,
+    ticket_id: u64,
+) {
     let mut logins = pending_bilibili_access_key_logins().lock().await;
-    if logins
-        .get(&chat_id)
-        .is_some_and(|login| login.auth_generation == auth_generation)
-    {
+    clear_claimed_bilibili_access_key_login(&mut logins, chat_id, auth_generation, ticket_id);
+}
+
+fn clear_claimed_bilibili_access_key_login(
+    logins: &mut HashMap<i64, PendingBilibiliAccessKeyLogin>,
+    chat_id: i64,
+    auth_generation: u64,
+    ticket_id: u64,
+) -> bool {
+    if logins.get(&chat_id).is_some_and(|login| {
+        login.auth_generation == auth_generation && login.ticket_id == ticket_id
+    }) {
         logins.remove(&chat_id);
+        true
+    } else {
+        false
     }
 }
 
@@ -1044,7 +1089,9 @@ fn prune_expired_pending_bilibili_access_key_logins(
     logins: &mut HashMap<i64, PendingBilibiliAccessKeyLogin>,
     now: Instant,
 ) {
-    logins.retain(|_, login| now.duration_since(login.created_at) <= BILIBILI_ACCESS_KEY_LOGIN_TTL);
+    logins.retain(|_, login| {
+        login.in_progress || now.duration_since(login.created_at) <= BILIBILI_ACCESS_KEY_LOGIN_TTL
+    });
 }
 
 async fn run_bbdown_status(telegram: TelegramClient, config: Arc<AppConfig>, chat_id: i64) {
@@ -1844,7 +1891,7 @@ async fn run_queued_job(
     )
     .await;
 
-    let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+    let (progress_tx, progress_rx) = job_progress_channel();
     let progress_task = tokio::spawn(forward_progress(
         telegram.clone(),
         chat_id,
@@ -1852,6 +1899,7 @@ async fn run_queued_job(
         job.label(),
         status_message_id,
         progress_rx,
+        Duration::from_secs(config.bot.progress_update_seconds),
     ));
     let result = match run_mode {
         JobRunMode::Duplicate(duplicate_run) => {
@@ -1906,34 +1954,69 @@ async fn forward_progress(
     job_id: u64,
     job_label: &'static str,
     status_message_id: Option<i64>,
-    mut progress_rx: mpsc::UnboundedReceiver<JobProgress>,
+    mut progress_rx: JobProgressReceiver,
+    update_interval: Duration,
 ) {
     let mut delivery = ProgressDelivery::from_message_id(status_message_id);
-    while let Some(progress) = progress_rx.recv().await {
-        let message = job_status_message(job_id, job_label, "Running", Some(&progress.message));
-        match delivery {
-            ProgressDelivery::Edit(message_id) => {
-                if edit_or_log(&telegram, chat_id, message_id, message).await {
-                    continue;
+    let mut ticker = interval(update_interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    ticker.tick().await;
+    let mut pending = None;
+    loop {
+        tokio::select! {
+            changed = progress_rx.changed() => {
+                if changed.is_err() {
+                    break;
                 }
-                delivery = delivery.after_edit_result(false);
-                send_or_log(
-                    &telegram,
-                    chat_id,
-                    progress_fallback_message(job_id, &progress.message),
-                )
-                .await;
+                pending = progress_rx.borrow_and_update().clone();
             }
-            ProgressDelivery::Send => {
-                send_or_log(
+            _ = ticker.tick(), if pending.is_some() => {
+                let progress = pending.take().expect("guarded by is_some");
+                delivery = deliver_progress(
                     &telegram,
                     chat_id,
-                    progress_fallback_message(job_id, &progress.message),
-                )
-                .await;
+                    job_id,
+                    job_label,
+                    delivery,
+                    progress,
+                ).await;
             }
         }
     }
+}
+
+async fn deliver_progress(
+    telegram: &TelegramClient,
+    chat_id: i64,
+    job_id: u64,
+    job_label: &'static str,
+    mut delivery: ProgressDelivery,
+    progress: JobProgress,
+) -> ProgressDelivery {
+    let message = job_status_message(job_id, job_label, "Running", Some(&progress.message));
+    match delivery {
+        ProgressDelivery::Edit(message_id) => {
+            if edit_or_log(telegram, chat_id, message_id, message).await {
+                return delivery;
+            }
+            delivery = delivery.after_edit_result(false);
+            send_or_log(
+                telegram,
+                chat_id,
+                progress_fallback_message(job_id, &progress.message),
+            )
+            .await;
+        }
+        ProgressDelivery::Send => {
+            send_or_log(
+                telegram,
+                chat_id,
+                progress_fallback_message(job_id, &progress.message),
+            )
+            .await;
+        }
+    }
+    delivery
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2175,11 +2258,13 @@ mod tests {
     fn failed_access_key_callback_releases_same_ticket_for_retry() {
         let chat_id = 123;
         let auth_generation = 42;
+        let ticket_id = 7;
         let created_at = Instant::now();
         let mut logins = HashMap::from([(
             chat_id,
             PendingBilibiliAccessKeyLogin {
                 auth_generation,
+                ticket_id,
                 ticket: bilibili_core::create_access_key_ticket()
                     .expect("access-key ticket should be created"),
                 created_at,
@@ -2205,6 +2290,7 @@ mod tests {
             &mut logins,
             chat_id,
             auth_generation,
+            ticket_id,
             auth_generation,
             created_at,
         ));
@@ -2222,11 +2308,13 @@ mod tests {
     fn stale_access_key_callback_does_not_release_newer_generation() {
         let chat_id = 123;
         let auth_generation = 42;
+        let ticket_id = 7;
         let now = Instant::now();
         let mut logins = HashMap::from([(
             chat_id,
             PendingBilibiliAccessKeyLogin {
                 auth_generation,
+                ticket_id,
                 ticket: bilibili_core::create_access_key_ticket()
                     .expect("access-key ticket should be created"),
                 created_at: now,
@@ -2238,11 +2326,72 @@ mod tests {
             &mut logins,
             chat_id,
             auth_generation,
+            ticket_id,
             auth_generation + 1,
             now,
         ));
 
         assert!(logins[&chat_id].in_progress);
+    }
+
+    #[test]
+    fn stale_access_key_completion_cannot_clear_or_release_new_ticket() {
+        let chat_id = 123;
+        let auth_generation = 42;
+        let now = Instant::now();
+        let old_ticket_id = 7;
+        let new_ticket_id = 8;
+        let mut logins = HashMap::from([(
+            chat_id,
+            PendingBilibiliAccessKeyLogin {
+                auth_generation,
+                ticket_id: new_ticket_id,
+                ticket: bilibili_core::create_access_key_ticket()
+                    .expect("access-key ticket should be created"),
+                created_at: now,
+                in_progress: false,
+            },
+        )]);
+
+        assert!(!clear_claimed_bilibili_access_key_login(
+            &mut logins,
+            chat_id,
+            auth_generation,
+            old_ticket_id,
+        ));
+        assert!(!release_claimed_bilibili_access_key_login(
+            &mut logins,
+            chat_id,
+            auth_generation,
+            old_ticket_id,
+            auth_generation,
+            now,
+        ));
+        assert_eq!(logins[&chat_id].ticket_id, new_ticket_id);
+    }
+
+    #[test]
+    fn pruning_keeps_in_progress_access_key_ticket_until_completion() {
+        let chat_id = 123;
+        let created_at = Instant::now();
+        let mut logins = HashMap::from([(
+            chat_id,
+            PendingBilibiliAccessKeyLogin {
+                auth_generation: 42,
+                ticket_id: 7,
+                ticket: bilibili_core::create_access_key_ticket()
+                    .expect("access-key ticket should be created"),
+                created_at,
+                in_progress: true,
+            },
+        )]);
+
+        prune_expired_pending_bilibili_access_key_logins(
+            &mut logins,
+            created_at + BILIBILI_ACCESS_KEY_LOGIN_TTL + Duration::from_secs(1),
+        );
+
+        assert!(logins.contains_key(&chat_id));
     }
 
     #[tokio::test]

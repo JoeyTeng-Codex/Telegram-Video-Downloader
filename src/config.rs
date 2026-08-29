@@ -281,14 +281,72 @@ impl AppConfig {
 fn ensure_distinct_auth_paths(state_path: &Path, credential_file: &Path) -> Result<()> {
     let normalized_state = normalize_path_for_comparison(state_path)?;
     let normalized_credential = normalize_path_for_comparison(credential_file)?;
+    let cleanup_files = legacy_auth_cleanup_files(state_path);
+    let cleanup_dir = legacy_auth_cleanup_dir(state_path);
+    let normalized_cleanup_dir = normalize_path_for_comparison(&cleanup_dir)?;
+    let aliases_cleanup_file = cleanup_files.iter().try_fold(false, |aliased, path| {
+        Ok::<_, anyhow::Error>(
+            aliased
+                || normalize_path_for_comparison(path)? == normalized_credential
+                || existing_paths_share_identity(path, credential_file)?,
+        )
+    })?;
+    let inside_cleanup_dir = normalized_credential.starts_with(&normalized_cleanup_dir);
+    let aliases_cleanup_dir_entry =
+        existing_file_alias_in_directory(credential_file, &cleanup_dir)?;
     if normalized_state == normalized_credential
-        || existing_paths_share_identity(state_path, credential_file)?
+        || aliases_cleanup_file
+        || inside_cleanup_dir
+        || aliases_cleanup_dir_entry
     {
         bail!(
-            "bilibili.auth.state_path and bilibili.auth.credential_file must refer to distinct files"
+            "bilibili.auth.state_path and bilibili.auth.credential_file must refer to distinct files, and credential_file must be outside legacy auth cleanup paths"
         );
     }
     Ok(())
+}
+
+fn legacy_auth_cleanup_files(state_path: &Path) -> [PathBuf; 3] {
+    [
+        state_path.to_path_buf(),
+        path_with_suffix(state_path, ".bbdown.config"),
+        path_with_suffix(state_path, ".bbdown.config.json"),
+    ]
+}
+
+fn legacy_auth_cleanup_dir(state_path: &Path) -> PathBuf {
+    path_with_suffix(state_path, ".bbdown.config.d")
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn existing_file_alias_in_directory(file: &Path, directory: &Path) -> Result<bool> {
+    if metadata_if_present(file)?.is_none() {
+        return Ok(false);
+    }
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to inspect legacy auth cleanup directory {}",
+                    directory.display()
+                )
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_file() && existing_paths_share_identity(file, &entry.path())? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn normalize_path_for_comparison(path: &Path) -> Result<PathBuf> {
@@ -929,6 +987,44 @@ mod tests {
             .expect_err("same-inode auth paths should fail validation");
 
         assert!(error.to_string().contains("must refer to distinct files"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_credential_file_at_legacy_cleanup_paths() {
+        let root = temp_test_dir("auth-legacy-cleanup-paths");
+        fs::create_dir_all(&root).expect("auth root should create");
+        let state = root.join("state.json");
+
+        for credential in [
+            path_with_suffix(&state, ".bbdown.config"),
+            path_with_suffix(&state, ".bbdown.config.json"),
+            path_with_suffix(&state, ".bbdown.config.d").join("credentials.json"),
+        ] {
+            let error = ensure_distinct_auth_paths(&state, &credential)
+                .expect_err("legacy cleanup target must not hold credentials");
+            assert!(error.to_string().contains("legacy auth cleanup paths"));
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_credential_hardlink_to_legacy_cleanup_directory_entry() {
+        let root = temp_test_dir("auth-legacy-cleanup-hardlink");
+        let state = root.join("state.json");
+        let cleanup_dir = path_with_suffix(&state, ".bbdown.config.d");
+        fs::create_dir_all(&cleanup_dir).expect("cleanup directory should create");
+        let stale = cleanup_dir.join("stale.config");
+        let credential = root.join("credentials.json");
+        fs::write(&stale, "secret").expect("stale file should write");
+        fs::hard_link(&stale, &credential).expect("credential hard link should create");
+
+        let error = ensure_distinct_auth_paths(&state, &credential)
+            .expect_err("cleanup-directory hard link must be rejected");
+
+        assert!(error.to_string().contains("legacy auth cleanup paths"));
         let _ = fs::remove_dir_all(root);
     }
 

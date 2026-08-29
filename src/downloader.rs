@@ -17,7 +17,7 @@ use serde::{Deserialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard, watch};
 use tokio::time::{Instant, sleep_until, timeout as tokio_timeout};
 use tracing::info;
 
@@ -25,7 +25,7 @@ use crate::bilibili_auth;
 use crate::bilibili_core;
 use crate::config::AppConfig;
 use crate::router::{BilibiliSelection, JobRequest};
-use crate::safe_fs::{EntryIdentity, RootedFs};
+use crate::safe_fs::{BoundEntry, EntryIdentity, RootedFs};
 
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -65,6 +65,13 @@ pub struct JobReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobProgress {
     pub message: String,
+}
+
+pub type JobProgressSender = watch::Sender<Option<JobProgress>>;
+pub type JobProgressReceiver = watch::Receiver<Option<JobProgress>>;
+
+pub fn job_progress_channel() -> (JobProgressSender, JobProgressReceiver) {
+    watch::channel(None)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,7 +327,7 @@ impl From<&DownloadReport> for BilibiliDownloadReport {
 pub async fn run_job(
     config: &AppConfig,
     job: &JobRequest,
-    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+    progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
     match job {
         JobRequest::Bilibili { url, selection } => {
@@ -336,7 +343,7 @@ pub async fn run_job_with_duplicate_action(
     job: &JobRequest,
     action: VideoDuplicateAction,
     duplicate: &VideoDuplicate,
-    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+    progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
     if !matches!(
         job,
@@ -354,7 +361,7 @@ pub async fn run_job_with_duplicate_action(
 pub async fn run_video_job_staged_keep_both(
     config: &AppConfig,
     job: &JobRequest,
-    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+    progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
     let Some(identity) = fallback_video_identity(job) else {
         return run_job(config, job, progress).await;
@@ -570,7 +577,7 @@ fn duplicate_scan_video_dir(config: &AppConfig, _job: &JobRequest) -> PathBuf {
 async fn run_simple_job(
     config: &AppConfig,
     job: &JobRequest,
-    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+    progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
     let spec = command_spec(config, job)?;
     let output = run_command(config, &spec, progress.clone()).await?;
@@ -599,17 +606,18 @@ async fn run_bilibili_job(
     config: &AppConfig,
     url: &str,
     selection: Option<BilibiliSelection>,
-    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+    progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
     let _guard = video_output_lock("Bilibili download", progress.as_ref()).await;
-    run_bilibili_job_locked(config, url, selection, progress).await
+    run_bilibili_job_locked(config, url, selection, None, progress).await
 }
 
 async fn run_bilibili_job_locked(
     config: &AppConfig,
     url: &str,
     selection: Option<BilibiliSelection>,
-    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+    expected_overwrite_identity: Option<&VideoIdentity>,
+    progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
     sync_bilibili_rust_credentials(config)?;
     let mut options = bilibili_core::download_options(config)?;
@@ -628,6 +636,9 @@ async fn run_bilibili_job_locked(
     )
     .await?;
     let plan = BilibiliDownloadPlan::from(&core_plan);
+    if let Some(expected_identity) = expected_overwrite_identity {
+        ensure_bilibili_overwrite_plan_matches(&plan, expected_identity)?;
+    }
     let progress_reporter = BilibiliCoreProgress::new(progress.clone());
     let command_started_at = SystemTime::now();
     let core_report = client
@@ -685,11 +696,11 @@ async fn run_bilibili_job_locked(
 
 #[derive(Clone)]
 struct BilibiliCoreProgress {
-    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+    progress: Option<JobProgressSender>,
 }
 
 impl BilibiliCoreProgress {
-    fn new(progress: Option<mpsc::UnboundedSender<JobProgress>>) -> Self {
+    fn new(progress: Option<JobProgressSender>) -> Self {
         Self { progress }
     }
 }
@@ -804,7 +815,7 @@ async fn mux_bilibili_report_media(
     cwd: &Path,
     report: &mut BilibiliDownloadReport,
     since: SystemTime,
-    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+    progress: Option<JobProgressSender>,
 ) -> Result<()> {
     let report_title = report.title.clone();
     for entry in &mut report.entries {
@@ -1205,7 +1216,7 @@ async fn merge_bilibili_streams(
     metadata: &BilibiliMetadata,
     video_only: bool,
     command_started_at: SystemTime,
-    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+    progress: Option<JobProgressSender>,
 ) -> Result<Vec<PathBuf>> {
     let mut merged = Vec::new();
     for video in videos {
@@ -1581,7 +1592,7 @@ fn stem_without_unique_suffix(stem: &str) -> &str {
 async fn run_youtube_job(
     config: &AppConfig,
     url: &str,
-    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+    progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
     let metadata = fetch_youtube_metadata(config, url, progress.clone()).await?;
     let subtitle_plan = select_subtitles(&metadata, &config.video.subtitle_languages);
@@ -1594,7 +1605,7 @@ async fn run_youtube_job_locked(
     url: &str,
     metadata: YoutubeMetadata,
     subtitle_plan: SubtitlePlan,
-    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+    progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
     let spec = youtube_download_command_spec(config, url, &subtitle_plan);
     let output = run_command(config, &spec, progress).await?;
@@ -1656,7 +1667,7 @@ async fn run_staged_video_job(
     job: &JobRequest,
     action: VideoDuplicateAction,
     duplicate: &VideoDuplicate,
-    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+    progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
     let _guard = video_output_lock("Staged video download", progress.as_ref()).await;
     let final_dir = config.downloads.video_dir.clone();
@@ -1674,7 +1685,16 @@ async fn run_staged_video_job(
     preserve_bilibili_config_paths_for_staging(&mut staging_config, &final_dir);
     let result = match job {
         JobRequest::Bilibili { url, selection } => {
-            run_bilibili_job_locked(&staging_config, url, *selection, progress.clone()).await
+            let expected_identity =
+                matches!(action, VideoDuplicateAction::Overwrite).then_some(&duplicate.identity);
+            run_bilibili_job_locked(
+                &staging_config,
+                url,
+                *selection,
+                expected_identity,
+                progress.clone(),
+            )
+            .await
         }
         JobRequest::Youtube { url } => {
             let metadata = fetch_youtube_metadata(&staging_config, url, progress.clone()).await;
@@ -2260,7 +2280,7 @@ fn command_progress_name(spec: &CommandSpec) -> String {
 async fn fetch_youtube_metadata(
     config: &AppConfig,
     url: &str,
-    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+    progress: Option<JobProgressSender>,
 ) -> Result<YoutubeMetadata> {
     let spec = youtube_metadata_command_spec(config, url);
     let output = run_command(config, &spec, progress).await?;
@@ -2366,7 +2386,7 @@ async fn probe_bilibili_metadata(
 
 async fn video_output_lock(
     job_label: &str,
-    progress: Option<&mpsc::UnboundedSender<JobProgress>>,
+    progress: Option<&JobProgressSender>,
 ) -> MutexGuard<'static, ()> {
     let lock = VIDEO_OUTPUT_LOCK.get_or_init(|| Mutex::new(()));
     match lock.try_lock() {
@@ -2383,9 +2403,9 @@ async fn video_output_lock(
     }
 }
 
-fn send_progress(progress: Option<&mpsc::UnboundedSender<JobProgress>>, message: String) {
+fn send_progress(progress: Option<&JobProgressSender>, message: String) {
     if let Some(progress) = progress {
-        let _ = progress.send(JobProgress { message });
+        progress.send_replace(Some(JobProgress { message }));
     }
 }
 
@@ -2430,7 +2450,7 @@ struct CommandChunk {
 async fn run_command(
     config: &AppConfig,
     spec: &CommandSpec,
-    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+    progress: Option<JobProgressSender>,
 ) -> Result<CommandOutput> {
     let _cleanup = CommandCleanup::new(spec.cleanup_paths.clone());
     let mut file_activity = match &spec.activity_dir {
@@ -3039,7 +3059,7 @@ struct ProgressTracker {
     command_name: String,
     min_interval: Duration,
     next_send_at: Instant,
-    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+    progress: Option<JobProgressSender>,
     last_message: Option<String>,
     last_output: Option<String>,
     last_file_activity: Option<FileActivityReport>,
@@ -3050,7 +3070,7 @@ impl ProgressTracker {
     fn new(
         command_name: String,
         min_interval: Duration,
-        progress: Option<mpsc::UnboundedSender<JobProgress>>,
+        progress: Option<JobProgressSender>,
     ) -> Self {
         Self {
             stage: ProgressStage::initial_for(&command_name),
@@ -3140,17 +3160,12 @@ impl ProgressTracker {
         lines.join("\n")
     }
 
-    fn send(
-        &mut self,
-        progress: mpsc::UnboundedSender<JobProgress>,
-        message: String,
-        now: Instant,
-    ) {
+    fn send(&mut self, progress: JobProgressSender, message: String, now: Instant) {
         let message = redact_sensitive_output(&message);
         self.last_message = Some(message.clone());
         self.next_send_at = now + self.min_interval;
         info!(command = %self.command_name, message = %message, "command progress");
-        let _ = progress.send(JobProgress { message });
+        progress.send_replace(Some(JobProgress { message }));
     }
 }
 
@@ -3388,6 +3403,36 @@ fn bilibili_plan_overwrite_identities(plan: &BilibiliDownloadPlan) -> Vec<VideoI
         });
     }
     identities
+}
+
+fn ensure_bilibili_overwrite_plan_matches(
+    plan: &BilibiliDownloadPlan,
+    expected: &VideoIdentity,
+) -> Result<()> {
+    if expected.provider != VideoProvider::Bilibili || !is_bilibili_entry_identity(&expected.id) {
+        bail!("Bilibili overwrite is not bound to an exact entry identity");
+    }
+    let current_identities = bilibili_plan_overwrite_identities(plan);
+    if current_identities
+        .iter()
+        .any(|identity| identity == expected)
+    {
+        return Ok(());
+    }
+    let current = current_identities
+        .iter()
+        .map(|identity| identity.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "Bilibili overwrite target changed after confirmation: expected {}, resolved {}",
+        expected.id,
+        if current.is_empty() {
+            "no exact entry".to_string()
+        } else {
+            current
+        }
+    )
 }
 
 fn identity_is_overwrite_safe(identity: &VideoIdentity) -> bool {
@@ -3878,6 +3923,8 @@ struct MovedFile {
 struct FileBackup {
     original: PathBuf,
     backup: PathBuf,
+    original_entry: BoundEntry,
+    backup_entry: BoundEntry,
     identity: EntryIdentity,
 }
 
@@ -3887,8 +3934,9 @@ struct AcquiredOverwrite {
     target: PathBuf,
     backups: Vec<FileBackup>,
     backup_dir: PathBuf,
+    backup_dir_entry: BoundEntry,
     backup_dir_identity: EntryIdentity,
-    target_restored_identity: Option<EntryIdentity>,
+    target_restored: Option<(BoundEntry, EntryIdentity)>,
 }
 
 impl AcquiredOverwrite {
@@ -3915,7 +3963,7 @@ impl AcquiredOverwrite {
             return Err(err);
         }
         if original == self.target {
-            self.target_restored_identity = Some(backup.identity);
+            self.target_restored = Some((backup.original_entry.clone(), backup.identity));
         }
         Ok(())
     }
@@ -3937,20 +3985,22 @@ impl AcquiredOverwrite {
     }
 
     fn restore(self) -> Result<()> {
-        if let Some(target_identity) = self.target_restored_identity {
+        if let Some((target_entry, target_identity)) = &self.target_restored {
             restore_remaining_backups(
                 &self.root,
                 &self.backups,
                 &self.backup_dir,
+                &self.backup_dir_entry,
                 self.backup_dir_identity,
-                &self.target,
-                target_identity,
+                target_entry,
+                *target_identity,
             )
         } else {
             restore_backups(
                 &self.root,
                 &self.backups,
                 &self.backup_dir,
+                &self.backup_dir_entry,
                 self.backup_dir_identity,
                 &self.target,
             )
@@ -3962,6 +4012,7 @@ impl AcquiredOverwrite {
             &self.root,
             &self.backups,
             &self.backup_dir,
+            &self.backup_dir_entry,
             self.backup_dir_identity,
         )
     }
@@ -4001,12 +4052,13 @@ fn acquire_and_validate_overwrite_target(
     artifacts.remove(&target);
     artifacts.extend(metadata_sidecar_paths(&target));
     let backup_parent = target.parent().context("overwrite target has no parent")?;
-    let (backup_dir, backup_dir_identity) = create_overwrite_backup_dir(root, backup_parent)?;
+    let (backup_dir, backup_dir_entry, backup_dir_identity) =
+        create_overwrite_backup_dir(root, backup_parent)?;
     let mut backups = Vec::new();
 
     if let Err(err) = acquire_overwrite_path(root, &target, true, &backup_dir, &mut backups) {
         if backups.is_empty() {
-            let _ = root.remove_dir_if_identity(&backup_dir, backup_dir_identity);
+            let _ = root.remove_bound_dir_if_identity(&backup_dir_entry, backup_dir_identity);
             return Err(err);
         }
         return Err(rollback_acquired_overwrite(
@@ -4016,8 +4068,9 @@ fn acquire_and_validate_overwrite_target(
                 target,
                 backups,
                 backup_dir,
+                backup_dir_entry,
                 backup_dir_identity,
-                target_restored_identity: None,
+                target_restored: None,
             },
         ));
     }
@@ -4031,8 +4084,9 @@ fn acquire_and_validate_overwrite_target(
                     target,
                     backups,
                     backup_dir,
+                    backup_dir_entry,
                     backup_dir_identity,
-                    target_restored_identity: None,
+                    target_restored: None,
                 },
             ));
         }
@@ -4043,8 +4097,9 @@ fn acquire_and_validate_overwrite_target(
         target,
         backups,
         backup_dir,
+        backup_dir_entry,
         backup_dir_identity,
-        target_restored_identity: None,
+        target_restored: None,
     };
     if let Err(err) = validate_acquired_overwrite(root, duplicate, primary_media_kind, &acquired) {
         return Err(rollback_acquired_overwrite(err, acquired));
@@ -4052,7 +4107,10 @@ fn acquire_and_validate_overwrite_target(
     Ok(acquired)
 }
 
-fn create_overwrite_backup_dir(root: &RootedFs, parent: &Path) -> Result<(PathBuf, EntryIdentity)> {
+fn create_overwrite_backup_dir(
+    root: &RootedFs,
+    parent: &Path,
+) -> Result<(PathBuf, BoundEntry, EntryIdentity)> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -4064,7 +4122,17 @@ fn create_overwrite_backup_dir(root: &RootedFs, parent: &Path) -> Result<(PathBu
             std::process::id()
         ));
         match root.create_dir(&path, 0o700)? {
-            Some(identity) => return Ok((path, identity)),
+            Some(identity) => {
+                let entry = root.bind_entry(&path, false)?;
+                if root.bound_entry_identity(&entry)? != Some(identity) {
+                    let _ = root.remove_bound_dir_if_identity(&entry, identity);
+                    bail!(
+                        "overwrite backup directory identity changed while binding: {}",
+                        path.display()
+                    );
+                }
+                return Ok((path, entry, identity));
+            }
             None => continue,
         }
     }
@@ -4099,7 +4167,9 @@ fn acquire_overwrite_path(
     }
 
     let backup = backup_dir.join(format!("{:04x}", backups.len()));
-    root.rename_noreplace_if_identity(original, &backup, false, identity)
+    let original_entry = root.bind_entry(original, false)?;
+    let backup_entry = root.bind_entry(&backup, false)?;
+    root.rename_via_bound_parents_noreplace_if_identity(&original_entry, &backup_entry, identity)
         .with_context(|| {
             format!(
                 "failed to acquire overwrite path {} as {}",
@@ -4110,9 +4180,16 @@ fn acquire_overwrite_path(
     backups.push(FileBackup {
         original: original.to_path_buf(),
         backup: backup.clone(),
+        original_entry,
+        backup_entry,
         identity,
     });
-    require_entry_identity(root, &backup, identity, "acquired overwrite path")?;
+    require_bound_entry_identity(
+        root,
+        &backups.last().expect("backup was just pushed").backup_entry,
+        identity,
+        "acquired overwrite path",
+    )?;
     Ok(())
 }
 
@@ -4393,8 +4470,6 @@ fn artifact_overwrite_destination(source: &Path, target_video: &Path) -> Option<
     if let Some(suffix) = unbound_bilibili_sidecar_suffix(source) {
         return sidecar_destination_for_target_video(target_video, &suffix);
     }
-    let extension = source.extension()?.to_str()?;
-    let source_stem = source.file_stem()?.to_str()?;
     let target_stem = target_video.file_stem()?.to_str()?;
     if let Some(suffix) = source
         .file_name()?
@@ -4404,16 +4479,31 @@ fn artifact_overwrite_destination(source: &Path, target_video: &Path) -> Option<
     {
         return sidecar_destination_for_target_video(target_video, suffix);
     }
-    let suffix = source_stem
-        .find('.')
-        .map(|index| &source_stem[index..])
-        .unwrap_or("");
+    let suffix = artifact_sidecar_suffix(source)?;
     Some(
         target_video
             .parent()
             .unwrap_or_else(|| Path::new("."))
-            .join(format!("{target_stem}{suffix}.{extension}")),
+            .join(format!("{target_stem}{suffix}")),
     )
+}
+
+fn artifact_sidecar_suffix(source: &Path) -> Option<String> {
+    let name = source.file_name()?.to_str()?;
+    let lower_name = name.to_ascii_lowercase();
+    for suffix in [
+        "info.json",
+        "cover.jpg",
+        "cover.jpeg",
+        "cover.png",
+        "cover.webp",
+    ] {
+        if lower_name.ends_with(&format!(".{suffix}")) {
+            let start = name.len().checked_sub(suffix.len())?;
+            return Some(format!(".{}", &name[start..]));
+        }
+    }
+    Some(format!(".{}", source.extension()?.to_str()?))
 }
 
 fn execute_artifact_move_plan(root: &RootedFs, plan: Vec<MoveStep>) -> Result<Vec<MovedFile>> {
@@ -4737,18 +4827,16 @@ fn existing_video_artifacts(video: &Path) -> Result<Vec<PathBuf>> {
         entries.push(path);
     }
     let prefix = format!("{stem}.");
-    let video_is_only_primary = primary_stems.len() == 1 && primary_stems.contains(stem);
     for path in entries {
         if path == video {
             continue;
         }
-        if (is_known_video_sidecar(&path)
+        if is_known_video_sidecar(&path)
             && path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with(&prefix))
-            && best_primary_stem_for_sidecar(&path, &primary_stems).as_deref() == Some(stem))
-            || (video_is_only_primary && unbound_bilibili_sidecar_suffix(&path).is_some())
+            && best_primary_stem_for_sidecar(&path, &primary_stems).as_deref() == Some(stem)
         {
             artifacts.push(path);
         }
@@ -4824,29 +4912,52 @@ fn require_entry_identity(
     }
 }
 
+fn require_bound_entry_identity(
+    root: &RootedFs,
+    entry: &BoundEntry,
+    expected: EntryIdentity,
+    label: &str,
+) -> Result<()> {
+    match root.bound_entry_identity(entry)? {
+        Some(current) if current == expected => Ok(()),
+        Some(_) => bail!("{label} identity changed: {}", entry.path().display()),
+        None => bail!("{label} is missing: {}", entry.path().display()),
+    }
+}
+
 fn restore_file_backup(root: &RootedFs, backup: &FileBackup) -> Result<()> {
-    require_entry_identity(root, &backup.backup, backup.identity, "overwrite backup")?;
-    if root.entry_exists(&backup.original)? {
+    require_bound_entry_identity(
+        root,
+        &backup.backup_entry,
+        backup.identity,
+        "overwrite backup",
+    )?;
+    if root.bound_entry_identity(&backup.original_entry)?.is_some() {
         bail!(
             "restore destination is occupied; retained backup {} for {}",
             backup.backup.display(),
             backup.original.display()
         );
     }
-    root.rename_noreplace_if_identity(&backup.backup, &backup.original, false, backup.identity)
-        .with_context(|| {
-            format!(
-                "failed to restore overwrite backup {} to {}",
-                backup.backup.display(),
-                backup.original.display()
-            )
-        })
+    root.rename_via_bound_parents_noreplace_if_identity(
+        &backup.backup_entry,
+        &backup.original_entry,
+        backup.identity,
+    )
+    .with_context(|| {
+        format!(
+            "failed to restore overwrite backup {} to {}",
+            backup.backup.display(),
+            backup.original.display()
+        )
+    })
 }
 
 fn restore_backups(
     root: &RootedFs,
     backups: &[FileBackup],
     backup_dir: &Path,
+    backup_dir_entry: &BoundEntry,
     backup_dir_identity: EntryIdentity,
     target: &Path,
 ) -> Result<()> {
@@ -4868,7 +4979,7 @@ fn restore_backups(
         }
     }
     if failures.is_empty()
-        && let Err(err) = root.remove_dir_if_identity(backup_dir, backup_dir_identity)
+        && let Err(err) = root.remove_bound_dir_if_identity(backup_dir_entry, backup_dir_identity)
     {
         failures.push(format!(
             "failed to remove overwrite backup directory {}: {err}",
@@ -4886,11 +4997,12 @@ fn restore_remaining_backups(
     root: &RootedFs,
     backups: &[FileBackup],
     backup_dir: &Path,
+    backup_dir_entry: &BoundEntry,
     backup_dir_identity: EntryIdentity,
-    restored_target: &Path,
+    restored_target: &BoundEntry,
     restored_target_identity: EntryIdentity,
 ) -> Result<()> {
-    require_entry_identity(
+    require_bound_entry_identity(
         root,
         restored_target,
         restored_target_identity,
@@ -4904,7 +5016,7 @@ fn restore_remaining_backups(
         }
     }
     if failures.is_empty()
-        && let Err(err) = root.remove_dir_if_identity(backup_dir, backup_dir_identity)
+        && let Err(err) = root.remove_bound_dir_if_identity(backup_dir_entry, backup_dir_identity)
     {
         failures.push(format!(
             "failed to remove overwrite backup directory {}: {err}",
@@ -4922,6 +5034,7 @@ fn remove_backups(
     root: &RootedFs,
     backups: &[FileBackup],
     backup_dir: &Path,
+    backup_dir_entry: &BoundEntry,
     backup_dir_identity: EntryIdentity,
 ) -> Result<()> {
     let mut failures = Vec::new();
@@ -4933,7 +5046,8 @@ fn remove_backups(
             ));
             continue;
         }
-        if let Err(err) = root.remove_file_if_identity(&backup.backup, backup.identity) {
+        if let Err(err) = root.remove_bound_file_if_identity(&backup.backup_entry, backup.identity)
+        {
             failures.push(format!(
                 "failed to remove overwrite backup {}: {err}",
                 backup.backup.display()
@@ -4941,7 +5055,7 @@ fn remove_backups(
         }
     }
     if failures.is_empty()
-        && let Err(err) = root.remove_dir_if_identity(backup_dir, backup_dir_identity)
+        && let Err(err) = root.remove_bound_dir_if_identity(backup_dir_entry, backup_dir_identity)
     {
         failures.push(format!(
             "failed to remove overwrite backup directory {}: {err}",
@@ -5353,6 +5467,27 @@ mod tests {
             .position(|arg| arg == "--config-file")
             .and_then(|index| spec.args.get(index + 1))
             .map(PathBuf::from)
+    }
+
+    fn take_latest_progress(receiver: &mut JobProgressReceiver) -> JobProgress {
+        assert!(
+            receiver
+                .has_changed()
+                .expect("progress sender should exist"),
+            "progress should be sent"
+        );
+        receiver
+            .borrow_and_update()
+            .clone()
+            .expect("changed progress should have a value")
+    }
+
+    fn assert_no_progress(receiver: &JobProgressReceiver) {
+        assert!(
+            !receiver
+                .has_changed()
+                .expect("progress sender should exist")
+        );
     }
 
     fn metadata_with_subtitles() -> YoutubeMetadata {
@@ -5778,6 +5913,57 @@ mod tests {
 
         assert_eq!(duplicate, None);
         let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn bilibili_overwrite_plan_accepts_the_confirmed_entry_identity() {
+        let plan = BilibiliDownloadPlan {
+            title: "Season".to_string(),
+            entries: vec![BilibiliDownloadEntry {
+                index: 1,
+                aid: 10,
+                bvid: Some("BV123".to_string()),
+                cid: 20,
+                epid: Some(30),
+                title: "Episode".to_string(),
+            }],
+        };
+
+        ensure_bilibili_overwrite_plan_matches(
+            &plan,
+            &VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid20".to_string(),
+            },
+        )
+        .expect("same resolved entry should remain overwrite-safe");
+    }
+
+    #[test]
+    fn bilibili_overwrite_plan_rejects_latest_episode_drift() {
+        let plan = BilibiliDownloadPlan {
+            title: "Season".to_string(),
+            entries: vec![BilibiliDownloadEntry {
+                index: 1,
+                aid: 10,
+                bvid: Some("BV123".to_string()),
+                cid: 21,
+                epid: Some(31),
+                title: "New episode".to_string(),
+            }],
+        };
+
+        let error = ensure_bilibili_overwrite_plan_matches(
+            &plan,
+            &VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid20".to_string(),
+            },
+        )
+        .expect_err("changed latest episode must not overwrite the confirmed target");
+
+        assert!(error.to_string().contains("changed after confirmation"));
+        assert!(error.to_string().contains("cid21"));
     }
 
     #[test]
@@ -6464,7 +6650,7 @@ mod tests {
         fs::write(&existing, "video").expect("existing video should write");
         write_bilibili_identity_nfo(&existing, "cid123");
         fs::write(&xml, "old-xml").expect("old xml should write");
-        fs::write(staging_dir.join("Show.S01E01.xml"), "new-xml").expect("new xml should write");
+        fs::write(staging_dir.join("New.Title.xml"), "new-xml").expect("new xml should write");
         let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
         let duplicate = VideoDuplicate {
             identity: VideoIdentity {
@@ -6657,7 +6843,7 @@ mod tests {
     }
 
     #[test]
-    fn overwrite_replaces_bare_bilibili_danmaku_sidecar() {
+    fn overwrite_preserves_ambiguous_bare_bilibili_danmaku_sidecar() {
         let final_dir = temp_test_dir("overwrite-bare-bilibili-danmaku");
         let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
         fs::create_dir_all(&staging_dir).expect("staging dir should create");
@@ -6699,9 +6885,10 @@ mod tests {
                 .expect("bare danmaku should follow overwritten video basename"),
             "new-danmaku"
         );
-        assert!(
-            !final_dir.join("danmaku.xml").exists(),
-            "stale bare danmaku should be removed during overwrite backup cleanup"
+        assert_eq!(
+            fs::read_to_string(final_dir.join("danmaku.xml"))
+                .expect("ambiguous bare danmaku should remain"),
+            "old-danmaku"
         );
         assert!(
             !final_dir.join("danmaku (2).xml").exists(),
@@ -6711,7 +6898,7 @@ mod tests {
     }
 
     #[test]
-    fn overwrite_replaces_unbound_bilibili_subtitle_sidecar() {
+    fn overwrite_preserves_ambiguous_unbound_bilibili_subtitle_sidecar() {
         let final_dir = temp_test_dir("overwrite-unbound-bilibili-subtitle");
         let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
         fs::create_dir_all(&staging_dir).expect("staging dir should create");
@@ -6749,9 +6936,10 @@ mod tests {
                 .expect("subtitle should follow overwritten video basename"),
             "new-subtitle"
         );
-        assert!(
-            !final_dir.join("subtitle-zh-01-old.ass").exists(),
-            "stale unbound subtitle should be removed during overwrite backup cleanup"
+        assert_eq!(
+            fs::read_to_string(final_dir.join("subtitle-zh-01-old.ass"))
+                .expect("ambiguous unbound subtitle should remain"),
+            "old-subtitle"
         );
         assert!(
             !final_dir.join("subtitle-zh-01-new.ass").exists(),
@@ -6761,7 +6949,7 @@ mod tests {
     }
 
     #[test]
-    fn overwrite_replaces_unbound_bilibili_cover_sidecar() {
+    fn overwrite_preserves_ambiguous_unbound_bilibili_cover_sidecar() {
         let final_dir = temp_test_dir("overwrite-unbound-bilibili-cover");
         let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
         fs::create_dir_all(&staging_dir).expect("staging dir should create");
@@ -6799,9 +6987,10 @@ mod tests {
                 .expect("cover should follow overwritten video basename"),
             "new-cover"
         );
-        assert!(
-            !final_dir.join("cover-image-old.jpg").exists(),
-            "stale unbound cover should be removed during overwrite backup cleanup"
+        assert_eq!(
+            fs::read_to_string(final_dir.join("cover-image-old.jpg"))
+                .expect("ambiguous unbound cover should remain"),
+            "old-cover"
         );
         assert!(
             !final_dir.join("cover-image-new.jpg").exists(),
@@ -7676,6 +7865,50 @@ mod tests {
         assert!(!existing.with_extension("nfo").exists());
         assert!(backup_dir.is_dir());
         assert!(backup_paths.iter().all(|path| path.is_file()));
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn acquired_overwrite_restores_through_renamed_parent_binding() {
+        let final_dir = temp_test_dir("overwrite-renamed-parent-rollback");
+        let library = final_dir.join("library");
+        let renamed_library = final_dir.join("library-renamed");
+        fs::create_dir_all(&library).expect("library should create");
+        let existing = library.join("Episode.mkv");
+        fs::write(&existing, "original-video").expect("existing file should write");
+        write_bilibili_identity_nfo(&existing, "cid123");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        let root = RootedFs::new(&final_dir).expect("output root should open");
+        let acquired =
+            acquire_and_validate_overwrite_target(&root, &duplicate, StagedPrimaryMediaKind::Video)
+                .expect("overwrite target should be acquired");
+
+        fs::rename(&library, &renamed_library).expect("library should be renamed");
+        acquired
+            .restore()
+            .expect("bound rollback should restore into the same directory object");
+
+        assert_eq!(
+            fs::read_to_string(renamed_library.join("Episode.mkv"))
+                .expect("video should be restored under renamed parent"),
+            "original-video"
+        );
+        assert!(renamed_library.join("Episode.nfo").is_file());
+        assert!(
+            fs::read_dir(&renamed_library)
+                .expect("renamed library should scan")
+                .all(|entry| !entry
+                    .expect("entry should read")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(OVERWRITE_BACKUP_DIR_PREFIX))
+        );
         let _ = fs::remove_dir_all(final_dir);
     }
 
@@ -8590,7 +8823,7 @@ mod tests {
 
     #[test]
     fn redacts_bilibili_cookie_values_from_progress() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = job_progress_channel();
         let mut tracker =
             ProgressTracker::new("BBDown".to_string(), Duration::from_secs(30), Some(tx));
 
@@ -8599,11 +8832,23 @@ mod tests {
             b"Debug: --cookie SESSDATA=secret; bili_jct=csrf; ac_time_value=token",
         );
 
-        let message = rx.try_recv().expect("progress should be sent").message;
+        let message = take_latest_progress(&mut rx).message;
         assert!(!message.contains("secret"));
         assert!(!message.contains("csrf"));
         assert!(!message.contains("token"));
         assert!(message.contains("--cookie <redacted Bilibili cookie>"));
+    }
+
+    #[test]
+    fn progress_channel_coalesces_bursts_to_the_latest_message() {
+        let (tx, mut rx) = job_progress_channel();
+
+        for index in 0..1_000 {
+            send_progress(Some(&tx), format!("event {index}"));
+        }
+
+        assert_eq!(take_latest_progress(&mut rx).message, "event 999");
+        assert_no_progress(&rx);
     }
 
     #[test]
@@ -8675,23 +8920,23 @@ mod tests {
 
     #[test]
     fn throttles_percent_progress_updates() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = job_progress_channel();
         let mut tracker =
             ProgressTracker::new("yt-dlp".to_string(), Duration::from_secs(30), Some(tx));
 
         tracker.observe(CommandStream::Stdout, b"[download] 1.0%");
-        let first = rx.try_recv().unwrap().message;
+        let first = take_latest_progress(&mut rx).message;
         assert!(first.contains("yt-dlp: downloading media"));
         assert!(first.contains("Done: resolve"));
         assert!(first.contains("Todo: metadata, embed, move"));
         assert!(first.contains("Last output: yt-dlp: 1%"));
 
         tracker.observe(CommandStream::Stdout, b"[download] 2.0%");
-        assert!(rx.try_recv().is_err());
+        assert_no_progress(&rx);
 
         tracker.next_send_at = Instant::now() - Duration::from_secs(1);
         tracker.observe(CommandStream::Stdout, b"[download] 2.0%");
-        let second = rx.try_recv().unwrap().message;
+        let second = take_latest_progress(&mut rx).message;
         assert!(second.contains("Last output: yt-dlp: 2%"));
     }
 
@@ -8702,11 +8947,11 @@ mod tests {
         let command_name = command_progress_name(&spec);
         assert_eq!(command_name, "yt-dlp metadata");
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = job_progress_channel();
         let mut tracker = ProgressTracker::new(command_name, Duration::from_secs(30), Some(tx));
 
         tracker.observe(CommandStream::Stdout, b"[download] 1.0%");
-        let first = rx.try_recv().unwrap().message;
+        let first = take_latest_progress(&mut rx).message;
         assert!(first.contains("yt-dlp metadata: resolving metadata"));
         assert!(first.contains("Done: -"));
         assert!(first.contains("Todo: download, embed, move"));
@@ -8715,7 +8960,7 @@ mod tests {
 
     #[test]
     fn throttles_file_activity_progress_updates() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = job_progress_channel();
         let mut tracker =
             ProgressTracker::new("BBDown".to_string(), Duration::from_secs(30), Some(tx));
 
@@ -8727,7 +8972,7 @@ mod tests {
             last_change_age: Some(Duration::ZERO),
             changed_since_previous_poll: true,
         });
-        let first = rx.try_recv().unwrap().message;
+        let first = take_latest_progress(&mut rx).message;
         assert!(first.contains("BBDown: resolving metadata"));
         assert!(first.contains("Done: -"));
         assert!(first.contains("Todo: video, audio, mux, move"));
@@ -8744,38 +8989,38 @@ mod tests {
             last_change_age: Some(Duration::ZERO),
             changed_since_previous_poll: true,
         });
-        assert!(rx.try_recv().is_err());
+        assert_no_progress(&rx);
     }
 
     #[test]
     fn tracks_bbdown_stage_from_output() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = job_progress_channel();
         let mut tracker =
             ProgressTracker::new("BBDown".to_string(), Duration::from_secs(30), Some(tx));
 
         tracker.observe(CommandStream::Stdout, "开始下载P1视频\n".as_bytes());
-        let first = rx.try_recv().unwrap().message;
+        let first = take_latest_progress(&mut rx).message;
         assert!(first.contains("BBDown: downloading video"));
         assert!(first.contains("Done: resolve"));
         assert!(first.contains("Todo: audio, mux, move"));
 
         tracker.next_send_at = Instant::now() - Duration::from_secs(1);
         tracker.observe(CommandStream::Stdout, "下载P1视频完毕\n".as_bytes());
-        let video_done = rx.try_recv().unwrap().message;
+        let video_done = take_latest_progress(&mut rx).message;
         assert!(video_done.contains("BBDown: downloading video"));
         assert!(video_done.contains("Done: resolve"));
         assert!(video_done.contains("Todo: audio, mux, move"));
 
         tracker.next_send_at = Instant::now() - Duration::from_secs(1);
         tracker.observe(CommandStream::Stdout, "开始下载P1音频\n".as_bytes());
-        let second = rx.try_recv().unwrap().message;
+        let second = take_latest_progress(&mut rx).message;
         assert!(second.contains("BBDown: downloading audio"));
         assert!(second.contains("Done: resolve, video"));
         assert!(second.contains("Todo: mux, move"));
 
         tracker.next_send_at = Instant::now() - Duration::from_secs(1);
         tracker.observe(CommandStream::Stdout, "任务完成\n".as_bytes());
-        let third = rx.try_recv().unwrap().message;
+        let third = take_latest_progress(&mut rx).message;
         assert!(third.contains("BBDown: download complete"));
         assert!(third.contains("Done: resolve, video, audio"));
         assert!(third.contains("Todo: mux, move"));
@@ -8783,9 +9028,9 @@ mod tests {
 
     #[tokio::test]
     async fn reports_only_contended_video_output_lock_waits() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = job_progress_channel();
         let guard = video_output_lock("Bilibili download", Some(&tx)).await;
-        assert!(rx.try_recv().is_err());
+        assert_no_progress(&rx);
         drop(guard);
 
         let held_guard = VIDEO_OUTPUT_LOCK
@@ -8797,7 +9042,12 @@ mod tests {
         });
 
         assert_eq!(
-            rx.recv().await.expect("waiting progress should be sent"),
+            {
+                rx.changed().await.expect("waiting progress should be sent");
+                rx.borrow_and_update()
+                    .clone()
+                    .expect("waiting progress should have a value")
+            },
             JobProgress {
                 message: "Bilibili download: waiting for video output slot".to_string()
             }
@@ -8805,7 +9055,14 @@ mod tests {
 
         drop(held_guard);
         assert_eq!(
-            rx.recv().await.expect("acquired progress should be sent"),
+            {
+                rx.changed()
+                    .await
+                    .expect("acquired progress should be sent");
+                rx.borrow_and_update()
+                    .clone()
+                    .expect("acquired progress should have a value")
+            },
             JobProgress {
                 message: "Bilibili download: video output slot acquired".to_string()
             }
@@ -8872,7 +9129,16 @@ mod tests {
             activity_dir: Some(root.clone()),
             cleanup_paths: Vec::new(),
         };
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = job_progress_channel();
+        let progress_handle = tokio::spawn(async move {
+            let mut messages = Vec::new();
+            while rx.changed().await.is_ok() {
+                if let Some(progress) = rx.borrow_and_update().clone() {
+                    messages.push(progress.message);
+                }
+            }
+            messages
+        });
 
         let result = tokio_timeout(
             Duration::from_secs(8),
@@ -8884,10 +9150,9 @@ mod tests {
 
         assert!(result.stdout.is_empty());
         assert!(result.stderr.is_empty());
-        let mut messages = Vec::new();
-        while let Ok(progress) = rx.try_recv() {
-            messages.push(progress.message);
-        }
+        let messages = progress_handle
+            .await
+            .expect("progress collector should finish");
         let file_activity_messages = messages
             .iter()
             .filter(|message| message.contains("Files: 1 changed, 4 B written"))
