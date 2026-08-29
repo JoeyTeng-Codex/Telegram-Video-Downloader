@@ -38,6 +38,8 @@ cp config.example.toml config.toml
 
 重复视频检测会单次扫描视频文件名与同 basename sidecar，建立媒体 ID 索引后复用。YouTube 使用 URL 中的 video id；Bilibili 会先使用 URL 中的 `BV...` / `av...` / `ep...`，再通过 `bbdown-core` plan API 解析 bvid、aid、cid 和 epid，因此 `b23.tv` 短链和番剧条目也可以在下载前弹出重复选择。Bilibili 的 bvid/aid 可能同时对应多个分 P，只用于提示存在相关文件；只有单条下载计划的 cid/epid 能由 NFO 或 info JSON sidecar 证明并唯一匹配一个现有文件时才允许覆盖，文件名里的 cid/epid 只用于重复提示。全集和歧义匹配不会显示覆盖按钮，服务端也会再次拒绝不安全的覆盖请求。实际下载使用的 plan 还必须保留确认时的精确 cid/epid，否则任务中止。覆盖时，bot 会先把旧媒体及明确属于同 basename 的 sidecar 移入本次事务独占的隐藏备份目录，再从已取得的文件重建严格身份索引；无法明确归属的裸 `danmaku.*`、`subtitle-*` 或 `cover-*` 文件不会被旧文件清理误删。目标缺失、metadata 不可读、身份变化、路径被重新占用或新增歧义都会拒绝覆盖并尝试恢复原文件。如果单个已完成任务意外产出多个主媒体文件，bot 会保留旧文件并把全部新产物按“两者并存”提交，避免清理 staging 时丢失下载结果。检测失败时任务仍走 staging keep-both 移动，避免直接覆盖最终目录里的同名文件。
 
+覆盖按钮生成时会以 `O_NOFOLLOW` 打开并持有现有媒体文件，直到任务完成，避免确认后删除并复用 inode 的同路径文件继承覆盖授权。旧媒体备份保留原文件名，事务目录包含已落盘并同步的恢复 manifest；完整视频覆盖会先提交主媒体，再提交 sidecar。bot 每次启动都会扫描这些受控事务，原路径缺失时恢复旧文件，原路径已有新文件时完成旧备份清理。无法识别的旧版备份目录或结构异常的事务会保留并写入日志，不会被自动删除或阻止其他任务恢复。
+
 Bilibili 下载和登录不需要本机 `bbdown` 可执行文件；项目直接依赖 `BBDown-rust` 的 `bbdown-core` crate。bot 会关闭 crate 内置 mux，再通过配置的 `tools.ffmpeg` 执行受统一超时和进程管理约束的 mux，同时负责 NFO、staging 和重复文件处理；FLV concat mux 使用每次任务独占的隐藏临时清单，不会覆盖或清理下载目录里同名的用户文件。
 
 区域受限或 intl 番剧可以配置 `playurl_mode`、`restricted_area`、`restricted_area_proxies`、`restricted_api_proxies`。为兼容旧配置，`bilibili.extra_args` 和 `bilibili.global_args` 里的已知 BBDown-rust 全局项也会被 direct API 读取：endpoint base、`--playurl-mode`、`--restricted-area`、restricted proxy 和 `--request-timeout-seconds`。单值参数按 `extra_args`、`global_args`、结构化字段的顺序覆盖；restricted proxy 参数保持累加。`bilibili.plan_args` 不再用于主路径；`bilibili.download_args` 仅保留 `--only audio|video|subtitle|danmaku|cover` 这类下载模式迁移。

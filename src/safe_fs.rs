@@ -1,4 +1,6 @@
 use std::ffi::{CStr, CString, OsStr, OsString};
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -18,7 +20,7 @@ impl EntryIdentity {
         self.file_type == FileType::RegularFile
     }
 
-    fn is_dir(self) -> bool {
+    pub(crate) fn is_dir(self) -> bool {
         self.file_type == FileType::Directory
     }
 }
@@ -43,6 +45,59 @@ pub(crate) struct BoundEntry {
     path: PathBuf,
     parent: BoundParent,
     leaf: OsString,
+}
+
+#[derive(Clone)]
+pub(crate) struct BoundFile {
+    fd: Arc<OwnedFd>,
+    identity: EntryIdentity,
+}
+
+impl std::fmt::Debug for BoundFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundFile")
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for BoundFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+
+impl Eq for BoundFile {}
+
+impl BoundFile {
+    pub(crate) fn identity(&self) -> EntryIdentity {
+        self.identity
+    }
+
+    pub(crate) fn validate_identity(&self) -> Result<()> {
+        if identity_for_fd(self.fd.as_ref())? != self.identity {
+            bail!("bound file descriptor identity changed");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_limited(&self, limit: usize) -> Result<Vec<u8>> {
+        self.validate_identity()?;
+        let duplicate = rustix::io::dup(self.fd.as_ref())
+            .map_err(errno_to_io)
+            .context("failed to duplicate bound file descriptor")?;
+        let mut reader = File::from(duplicate).take((limit as u64).saturating_add(1));
+        let mut contents = Vec::new();
+        reader
+            .read_to_end(&mut contents)
+            .context("failed to read bound file")?;
+        if contents.len() > limit {
+            bail!("bound file exceeds the {limit}-byte read limit");
+        }
+        self.validate_identity()?;
+        Ok(contents)
+    }
 }
 
 impl BoundEntry {
@@ -103,6 +158,117 @@ impl RootedFs {
         identity_at(entry.parent.fd.as_ref(), &entry.leaf)
     }
 
+    pub(crate) fn open_bound_file(&self, path: &Path) -> Result<Option<BoundFile>> {
+        let entry = self.bind_entry(path, false)?;
+        let fd = match rustix::fs::openat(
+            entry.parent.fd.as_ref(),
+            &entry.leaf,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(err) if err == rustix::io::Errno::NOENT => return Ok(None),
+            Err(err) => {
+                return Err(errno_to_io(err))
+                    .with_context(|| format!("failed to open bound file {}", path.display()));
+            }
+        };
+        let identity = identity_for_fd(&fd)?;
+        if !identity.is_file() {
+            bail!("bound path is not a regular file: {}", path.display());
+        }
+        if identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(identity) {
+            bail!(
+                "bound file identity changed while opening: {}",
+                path.display()
+            );
+        }
+        self.validate_parent(&entry.parent)?;
+        Ok(Some(BoundFile {
+            fd: Arc::new(fd),
+            identity,
+        }))
+    }
+
+    pub(crate) fn create_new_bound_file(
+        &self,
+        path: &Path,
+        contents: &[u8],
+        mode: u16,
+    ) -> Result<(BoundEntry, EntryIdentity)> {
+        let entry = self.bind_entry(path, false)?;
+        let fd = rustix::fs::openat(
+            entry.parent.fd.as_ref(),
+            &entry.leaf,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::from_raw_mode(mode),
+        )
+        .map_err(errno_to_io)
+        .with_context(|| format!("failed to create bound file {}", path.display()))?;
+        let identity = identity_for_fd(&fd)?;
+        let mut file = File::from(fd);
+        if let Err(err) = file.write_all(contents).and_then(|()| file.sync_all()) {
+            drop(file);
+            let cleanup = self.remove_bound_file_if_identity(&entry, identity);
+            return Err(with_cleanup_error(
+                anyhow!(err).context(format!("failed to persist bound file {}", path.display())),
+                cleanup,
+                "bound file cleanup",
+            ));
+        }
+        if identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(identity) {
+            bail!("created bound file identity changed: {}", path.display());
+        }
+        self.validate_parent(&entry.parent)?;
+        sync_directory(entry.parent.fd.as_ref())?;
+        Ok((entry, identity))
+    }
+
+    pub(crate) fn list_bound_directory(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+    ) -> Result<Vec<(OsString, EntryIdentity)>> {
+        self.validate_bound_parent(&entry.parent)?;
+        let current = identity_at(entry.parent.fd.as_ref(), &entry.leaf)?
+            .ok_or_else(|| anyhow!("bound directory is missing: {}", entry.path.display()))?;
+        if current != expected || !current.is_dir() {
+            bail!("bound directory identity changed: {}", entry.path.display());
+        }
+        let directory = openat_directory(entry.parent.fd.as_ref(), &entry.leaf)
+            .with_context(|| format!("failed to open bound directory {}", entry.path.display()))?;
+        if identity_for_fd(&directory)? != expected {
+            bail!("bound directory identity changed: {}", entry.path.display());
+        }
+        let names = rustix::fs::Dir::read_from(&directory)
+            .map_err(errno_to_io)
+            .with_context(|| format!("failed to read bound directory {}", entry.path.display()))?
+            .map(|item| item.map_err(errno_to_io))
+            .collect::<std::result::Result<Vec<_>, std::io::Error>>()?;
+        let mut entries = Vec::new();
+        for item in names {
+            let name = item.file_name();
+            if matches!(name.to_bytes(), b"." | b"..") {
+                continue;
+            }
+            let display_name = name.to_str().with_context(|| {
+                format!(
+                    "bound directory contains a non-UTF-8 entry: {}",
+                    entry.path.display()
+                )
+            })?;
+            let identity = identity_at_cstr(&directory, name)?.ok_or_else(|| {
+                anyhow!(
+                    "bound directory entry disappeared: {}",
+                    entry.path.join(display_name).display()
+                )
+            })?;
+            entries.push((OsString::from(display_name), identity));
+        }
+        self.validate_bound_parent(&entry.parent)?;
+        Ok(entries)
+    }
+
     pub(crate) fn rename_via_bound_parents_noreplace_if_identity(
         &self,
         source: &BoundEntry,
@@ -142,13 +308,18 @@ impl RootedFs {
         })?;
         let validation = self.validate_bound_renamed_destination(destination, expected);
         if let Err(err) = validation {
-            let rollback = renameat_noreplace(
-                destination.parent.fd.as_ref(),
-                &destination.leaf,
-                source.parent.fd.as_ref(),
-                &source.leaf,
-            );
+            let rollback = rollback_bound_rename(source, destination, expected);
             return Err(with_cleanup_error(err, rollback, "bound move rollback"));
+        }
+        let durability = sync_directory(source.parent.fd.as_ref())
+            .and_then(|()| sync_directory(destination.parent.fd.as_ref()));
+        if let Err(err) = durability {
+            let rollback = rollback_bound_rename(source, destination, expected);
+            return Err(with_cleanup_error(
+                err.context("failed to persist bound move"),
+                rollback,
+                "bound move durability rollback",
+            ));
         }
         Ok(())
     }
@@ -213,7 +384,8 @@ impl RootedFs {
             .with_context(|| {
                 format!("failed to remove bound directory {}", entry.path.display())
             })?;
-        self.validate_bound_parent(&entry.parent)
+        self.validate_bound_parent(&entry.parent)?;
+        sync_directory(entry.parent.fd.as_ref())
     }
 
     pub(crate) fn entry_identity(&self, path: &Path) -> Result<Option<EntryIdentity>> {
@@ -254,6 +426,7 @@ impl RootedFs {
                 "created directory rollback",
             ));
         }
+        sync_directory(parent.fd.as_ref())?;
         Ok(Some(identity))
     }
 
@@ -398,7 +571,8 @@ impl RootedFs {
             .with_context(|| {
                 format!("failed to remove owned bound path {}", entry.path.display())
             })?;
-        self.validate_bound_parent(&entry.parent)
+        self.validate_bound_parent(&entry.parent)?;
+        sync_directory(entry.parent.fd.as_ref())
     }
 
     fn validate_root(&self) -> Result<()> {
@@ -577,6 +751,47 @@ fn openat_directory_cstr(parent: &OwnedFd, name: &CStr) -> Result<OwnedFd, std::
         Mode::empty(),
     )
     .map_err(errno_to_io)
+}
+
+fn rollback_bound_rename(
+    source: &BoundEntry,
+    destination: &BoundEntry,
+    expected: EntryIdentity,
+) -> Result<()> {
+    let current =
+        identity_at(destination.parent.fd.as_ref(), &destination.leaf)?.ok_or_else(|| {
+            anyhow!(
+                "bound rollback object is missing: {}",
+                destination.path.display()
+            )
+        })?;
+    if current != expected {
+        bail!(
+            "bound rollback object identity changed; retained current paths instead of moving a replacement: {}",
+            destination.path.display()
+        );
+    }
+    if identity_at(source.parent.fd.as_ref(), &source.leaf)?.is_some() {
+        bail!(
+            "bound rollback destination is occupied: {}",
+            source.path.display()
+        );
+    }
+    renameat_noreplace(
+        destination.parent.fd.as_ref(),
+        &destination.leaf,
+        source.parent.fd.as_ref(),
+        &source.leaf,
+    )?;
+    sync_directory(destination.parent.fd.as_ref())?;
+    sync_directory(source.parent.fd.as_ref())?;
+    Ok(())
+}
+
+fn sync_directory(directory: &OwnedFd) -> Result<()> {
+    rustix::fs::fsync(directory)
+        .map_err(errno_to_io)
+        .context("failed to sync bound directory")
 }
 
 fn identity_for_fd<Fd: AsFd>(fd: Fd) -> Result<EntryIdentity> {
@@ -972,5 +1187,36 @@ mod tests {
         assert!(!original.join("backup/video.mkv").exists());
         assert!(!replacement.join("library/video.mkv").exists());
         let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn bound_validation_rollback_never_moves_a_replacement_object() {
+        let root = temp_dir("bound-rollback-replacement");
+        fs::create_dir_all(root.join("staging")).expect("staging should create");
+        fs::create_dir_all(root.join("library")).expect("library should create");
+        let source_path = root.join("staging/video.mkv");
+        let destination_path = root.join("library/video.mkv");
+        fs::write(&destination_path, b"owned").expect("owned destination should write");
+        let rooted = RootedFs::new(&root).expect("root should bind");
+        let source = rooted
+            .bind_entry(&source_path, false)
+            .expect("source should bind");
+        let destination = rooted
+            .bind_entry(&destination_path, false)
+            .expect("destination should bind");
+        let expected = rooted
+            .bound_entry_identity(&destination)
+            .expect("destination identity should read")
+            .expect("destination should exist");
+
+        fs::remove_file(&destination_path).expect("owned destination should remove");
+        fs::write(&destination_path, b"replacement").expect("replacement should write");
+        let error = rollback_bound_rename(&source, &destination, expected)
+            .expect_err("replacement object must not be rolled back");
+
+        assert!(error.to_string().contains("identity changed"));
+        assert!(!source_path.exists());
+        assert_eq!(fs::read(destination_path).unwrap(), b"replacement");
+        let _ = fs::remove_dir_all(root);
     }
 }

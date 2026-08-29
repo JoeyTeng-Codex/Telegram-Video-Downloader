@@ -27,8 +27,8 @@ use tracing::{error, info, warn};
 use crate::config::AppConfig;
 use crate::downloader::{
     JobProgress, JobProgressReceiver, VideoDuplicate, VideoDuplicateAction,
-    find_video_duplicate_with_probe, job_progress_channel, run_job, run_job_with_duplicate_action,
-    run_video_job_staged_keep_both,
+    find_video_duplicate_with_probe, job_progress_channel, recover_pending_overwrite_transactions,
+    run_job, run_job_with_duplicate_action, run_video_job_staged_keep_both,
 };
 use crate::router::{
     BilibiliAuthCommand, BilibiliAuthLoginMode, BilibiliSelection, JobRequest, RouteResult,
@@ -41,6 +41,7 @@ use crate::telegram::{
 static BILIBILI_LOGIN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static BILIBILI_LOGIN_CANCEL_NOTIFY: OnceLock<Notify> = OnceLock::new();
 static BILIBILI_AUTH_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static BILIBILI_AUTH_REPLY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static BILIBILI_AUTH_GENERATION: AtomicU64 = AtomicU64::new(0);
 static PENDING_DUPLICATE_JOBS: OnceLock<Mutex<HashMap<u64, PendingDuplicateJob>>> = OnceLock::new();
 static PENDING_BILIBILI_SELECTION_JOBS: OnceLock<Mutex<HashMap<u64, PendingBilibiliSelectionJob>>> =
@@ -143,6 +144,9 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("config.toml"));
     let config = Arc::new(AppConfig::load(&config_path)?);
     config.ensure_runtime_dirs()?;
+    for recovery in recover_pending_overwrite_transactions(&config.downloads.video_dir)? {
+        warn!(message = %recovery, "recovered interrupted overwrite transaction");
+    }
 
     let telegram = TelegramClient::new(config.telegram.token.clone());
     if let Err(err) = telegram.set_my_commands(default_bot_commands()).await {
@@ -214,6 +218,9 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
 
     let config = AppConfig::load(&config_path)?;
     config.ensure_runtime_dirs()?;
+    for recovery in recover_pending_overwrite_transactions(&config.downloads.video_dir)? {
+        warn!(message = %recovery, "recovered interrupted overwrite transaction");
+    }
 
     match route_message(&text, &config.pdf.auto_domains) {
         RouteResult::Jobs(jobs) => {
@@ -1110,12 +1117,15 @@ fn prune_expired_pending_bilibili_access_key_logins(
 }
 
 async fn run_bbdown_status(telegram: TelegramClient, config: Arc<AppConfig>, chat_id: i64) {
-    let sync_result = {
+    let (auth_generation, sync_result) = {
         let _state_guard = bbdown_auth_state_lock().lock().await;
-        bilibili_auth::sync_bbdown_rust_credentials_from_state(
-            &config.bilibili.auth.state_path,
-            &config.bilibili.auth.credential_file,
-            config.bilibili.auth.credential_profile.as_deref(),
+        (
+            BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst),
+            bilibili_auth::sync_bbdown_rust_credentials_from_state(
+                &config.bilibili.auth.state_path,
+                &config.bilibili.auth.credential_file,
+                config.bilibili.auth.credential_profile.as_deref(),
+            ),
         )
     };
     let message = match sync_result {
@@ -1131,11 +1141,28 @@ async fn run_bbdown_status(telegram: TelegramClient, config: Arc<AppConfig>, cha
             summarize_bbdown_auth_error(&err)
         ),
     };
+    let _reply_guard = bbdown_auth_reply_lock().lock().await;
+    let message = current_bbdown_status_message(auth_generation, message);
     send_or_log(&telegram, chat_id, message).await;
+}
+
+fn current_bbdown_status_message(auth_generation: u64, message: String) -> String {
+    if auth_generation.is_multiple_of(2)
+        && BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst) == auth_generation
+    {
+        message
+    } else {
+        "BBDown credential state changed while status was checked; run /bbdown status again."
+            .to_string()
+    }
 }
 
 fn bbdown_auth_state_lock() -> &'static Mutex<()> {
     BILIBILI_AUTH_STATE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn bbdown_auth_reply_lock() -> &'static Mutex<()> {
+    BILIBILI_AUTH_REPLY_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn bbdown_login_cancel_notify() -> &'static Notify {
@@ -1143,6 +1170,8 @@ fn bbdown_login_cancel_notify() -> &'static Notify {
 }
 
 async fn run_bbdown_logout(telegram: TelegramClient, config: Arc<AppConfig>, chat_id: i64) {
+    // Odd generations mark an in-progress credential mutation. This also cancels active logins
+    // before local credential cleanup waits on any other async work.
     BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
     bbdown_login_cancel_notify().notify_waiters();
     pending_bilibili_access_key_logins().lock().await.clear();
@@ -1151,6 +1180,9 @@ async fn run_bbdown_logout(telegram: TelegramClient, config: Arc<AppConfig>, cha
         let legacy_state = bilibili_auth::delete_auth_state(&config.bilibili.auth.state_path);
         let credential_state =
             bilibili_core::credential_runtime(&config).and_then(|runtime| runtime.logout());
+        // Return to a stable even generation and invalidate status checks that started after
+        // logout was requested but before the credential files were cleared.
+        BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
         (legacy_state, credential_state)
     };
     let message = match (legacy_state, credential_state) {
@@ -1164,6 +1196,7 @@ async fn run_bbdown_logout(telegram: TelegramClient, config: Arc<AppConfig>, cha
             truncate(&err.to_string())
         ),
     };
+    let _reply_guard = bbdown_auth_reply_lock().lock().await;
     send_or_log(&telegram, chat_id, message).await;
 }
 
@@ -1949,11 +1982,11 @@ async fn run_queued_job(
                 details
             )
         }
-        Err(err) => format!(
-            "Failed job #{job_id}: {}\n{}",
-            job.label(),
-            truncate(&err.to_string())
-        ),
+        Err(err) => {
+            let error_chain = format!("{err:#}");
+            error!(job_id, error = %error_chain, "job failed");
+            failed_job_message(job_id, job.label(), &error_chain)
+        }
     };
 
     if let Some(message_id) = status_message_id {
@@ -1961,6 +1994,13 @@ async fn run_queued_job(
     } else {
         send_or_log(&telegram, chat_id, message).await;
     }
+}
+
+fn failed_job_message(job_id: u64, job_label: &str, error_chain: &str) -> String {
+    format!(
+        "Failed job #{job_id}: {job_label}\n{}",
+        truncate(error_chain)
+    )
 }
 
 async fn forward_progress(
@@ -2500,6 +2540,19 @@ mod tests {
     }
 
     #[test]
+    fn failed_job_message_preserves_recovery_details_from_the_error_chain() {
+        let message = failed_job_message(
+            9,
+            "Bilibili download",
+            "failed to move staged files: retained backup /tmp/library/.transaction/Episode.mkv",
+        );
+
+        assert!(message.contains("failed to move staged files"));
+        assert!(message.contains("retained backup"));
+        assert!(message.contains("/tmp/library/.transaction/Episode.mkv"));
+    }
+
+    #[test]
     fn progress_delivery_falls_back_to_send_after_edit_failure() {
         assert_eq!(
             ProgressDelivery::from_message_id(Some(42)),
@@ -2800,6 +2853,45 @@ mod tests {
 
         let err = result.expect_err("stale generation should cancel immediately");
         assert!(err.to_string().contains("canceled"));
+    }
+
+    #[tokio::test]
+    async fn bbdown_status_discards_a_result_after_logout_generation_changes() {
+        let _guard = TEST_AUTH_GENERATION_LOCK.lock().await;
+        let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+        assert_eq!(
+            current_bbdown_status_message(generation, "Credential valid".to_string()),
+            "Credential valid"
+        );
+
+        BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
+        let message = current_bbdown_status_message(generation, "Credential valid".to_string());
+        BILIBILI_AUTH_GENERATION.store(generation, Ordering::SeqCst);
+
+        assert!(message.contains("state changed"));
+        assert!(!message.contains("Credential valid"));
+    }
+
+    #[tokio::test]
+    async fn bbdown_status_rejects_a_generation_captured_during_logout() {
+        let _guard = TEST_AUTH_GENERATION_LOCK.lock().await;
+        let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+        assert!(generation.is_multiple_of(2));
+
+        BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
+        let during_logout = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+        let in_progress =
+            current_bbdown_status_message(during_logout, "Credential valid".to_string());
+
+        BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
+        let after_logout =
+            current_bbdown_status_message(during_logout, "Credential valid".to_string());
+        BILIBILI_AUTH_GENERATION.store(generation, Ordering::SeqCst);
+
+        assert!(in_progress.contains("state changed"));
+        assert!(after_logout.contains("state changed"));
+        assert!(!in_progress.contains("Credential valid"));
+        assert!(!after_logout.contains("Credential valid"));
     }
 
     #[tokio::test]

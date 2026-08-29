@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use bbdown_core::{
     DownloadFileKind, DownloadMode, DownloadProgressEvent, DownloadProgressSink, DownloadReport,
 };
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -25,7 +25,7 @@ use crate::bilibili_auth;
 use crate::bilibili_core;
 use crate::config::AppConfig;
 use crate::router::{BilibiliSelection, JobRequest};
-use crate::safe_fs::{BoundEntry, EntryIdentity, RootedFs, identity_for_open_file};
+use crate::safe_fs::{BoundEntry, BoundFile, EntryIdentity, RootedFs, identity_for_open_file};
 
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -33,6 +33,9 @@ static OVERWRITE_BACKUP_COUNTER: AtomicU64 = AtomicU64::new(1);
 const VIDEO_STAGING_DIR_NAME: &str = ".telegram-video-downloader-staging";
 const BILIBILI_FFMPEG_CONCAT_FILE_PREFIX: &str = ".telegram-video-downloader-ffmpeg-concat";
 const OVERWRITE_BACKUP_DIR_PREFIX: &str = ".telegram-video-downloader-overwrite";
+const OVERWRITE_RECOVERY_MANIFEST_NAME: &str = ".transaction.json";
+const OVERWRITE_RECOVERY_MANIFEST_VERSION: u32 = 1;
+const OVERWRITE_RECOVERY_MANIFEST_LIMIT: usize = 16 * 1024;
 const VIDEO_SIDECAR_EXTENSIONS: &[&str] = &[
     "nfo",
     "json",
@@ -87,10 +90,10 @@ pub struct VideoDuplicate {
     pub(crate) overwrite_confirmation: Option<VideoOverwriteConfirmation>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VideoOverwriteConfirmation {
     root_identity: EntryIdentity,
-    target_identity: EntryIdentity,
+    target_file: BoundFile,
 }
 
 impl VideoDuplicate {
@@ -470,7 +473,7 @@ fn find_video_duplicate_for_identities(
 struct VideoIdentityIndex {
     videos_by_identity: BTreeMap<VideoIdentity, Vec<PathBuf>>,
     overwrite_videos_by_identity: BTreeMap<VideoIdentity, Vec<PathBuf>>,
-    root_identity: Option<EntryIdentity>,
+    root: Option<RootedFs>,
     file_identities: BTreeMap<PathBuf, EntryIdentity>,
 }
 
@@ -499,9 +502,15 @@ impl VideoIdentityIndex {
     }
 
     fn overwrite_confirmation(&self, video: &Path) -> Option<VideoOverwriteConfirmation> {
+        let root = self.root.as_ref()?;
+        let expected = *self.file_identities.get(video)?;
+        let target_file = root.open_bound_file(video).ok().flatten()?;
+        if target_file.identity() != expected {
+            return None;
+        }
         Some(VideoOverwriteConfirmation {
-            root_identity: self.root_identity?,
-            target_identity: *self.file_identities.get(video)?,
+            root_identity: root.root_identity(),
+            target_file,
         })
     }
 }
@@ -541,7 +550,7 @@ fn build_video_identity_index_in_dir(
     let root = RootedFs::new(root)?;
     let media_files = list_primary_media_files(root.logical_root_path(), primary_media_kind)?;
     let mut index = VideoIdentityIndex {
-        root_identity: Some(root.root_identity()),
+        root: Some(root.clone()),
         ..VideoIdentityIndex::default()
     };
     for video in media_files {
@@ -3951,7 +3960,9 @@ fn collect_primary_media_files(
             if path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name == VIDEO_STAGING_DIR_NAME)
+                .is_some_and(|name| {
+                    name == VIDEO_STAGING_DIR_NAME || name.starts_with(OVERWRITE_BACKUP_DIR_PREFIX)
+                })
             {
                 continue;
             }
@@ -4097,14 +4108,29 @@ struct FileBackup {
     identity: EntryIdentity,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OverwriteRecoveryManifest {
+    version: u32,
+    target_file_name: PathBuf,
+}
+
+#[derive(Debug)]
+struct OverwriteRecoveryFiles {
+    backup_dir: PathBuf,
+    backup_dir_entry: BoundEntry,
+    backup_dir_identity: EntryIdentity,
+    manifest_path: PathBuf,
+    manifest_entry: BoundEntry,
+    manifest_identity: EntryIdentity,
+}
+
 #[derive(Debug)]
 struct AcquiredOverwrite {
     root: RootedFs,
     target: PathBuf,
     backups: Vec<FileBackup>,
-    backup_dir: PathBuf,
-    backup_dir_entry: BoundEntry,
-    backup_dir_identity: EntryIdentity,
+    recovery: OverwriteRecoveryFiles,
     target_restored: Option<(BoundEntry, EntryIdentity)>,
 }
 
@@ -4154,36 +4180,24 @@ impl AcquiredOverwrite {
     }
 
     fn restore(self) -> Result<()> {
+        if self.backups.is_empty() {
+            return remove_overwrite_transaction_dir(&self.root, &self.recovery);
+        }
         if let Some((target_entry, target_identity)) = &self.target_restored {
             restore_remaining_backups(
                 &self.root,
                 &self.backups,
-                &self.backup_dir,
-                &self.backup_dir_entry,
-                self.backup_dir_identity,
+                &self.recovery,
                 target_entry,
                 *target_identity,
             )
         } else {
-            restore_backups(
-                &self.root,
-                &self.backups,
-                &self.backup_dir,
-                &self.backup_dir_entry,
-                self.backup_dir_identity,
-                &self.target,
-            )
+            restore_backups(&self.root, &self.backups, &self.recovery, &self.target)
         }
     }
 
     fn commit(self) -> Result<()> {
-        remove_backups(
-            &self.root,
-            &self.backups,
-            &self.backup_dir,
-            &self.backup_dir_entry,
-            self.backup_dir_identity,
-        )
+        remove_backups(&self.root, &self.backups, &self.recovery)
     }
 }
 
@@ -4232,12 +4246,15 @@ fn acquire_and_validate_overwrite_target(
         .clone();
     let confirmation = duplicate
         .overwrite_confirmation
+        .as_ref()
         .context("overwrite target was not bound when replacement was confirmed")?;
     if root.root_identity() != confirmation.root_identity {
         bail!("output root changed after overwrite confirmation");
     }
+    confirmation.target_file.validate_identity()?;
+    let confirmed_target_identity = confirmation.target_file.identity();
     match root.entry_identity(&target)? {
-        Some(current) if current == confirmation.target_identity => {}
+        Some(current) if current == confirmed_target_identity => {}
         Some(_) => bail!(
             "overwrite target changed after confirmation: {}",
             target.display()
@@ -4254,61 +4271,52 @@ fn acquire_and_validate_overwrite_target(
     let backup_parent = target.parent().context("overwrite target has no parent")?;
     let (backup_dir, backup_dir_entry, backup_dir_identity) =
         create_overwrite_backup_dir(root, backup_parent)?;
-    let mut backups = Vec::new();
-
-    if let Err(err) = acquire_overwrite_path(
-        root,
-        &target,
-        true,
-        Some(confirmation.target_identity),
-        &backup_dir,
-        &mut backups,
-    ) {
-        if backups.is_empty() {
-            let _ = root.remove_bound_dir_if_identity(&backup_dir_entry, backup_dir_identity);
-            return Err(err);
-        }
-        return Err(rollback_acquired_overwrite(
-            err,
-            AcquiredOverwrite {
-                root: root.clone(),
-                target,
-                backups,
-                backup_dir,
-                backup_dir_entry,
-                backup_dir_identity,
-                target_restored: None,
-            },
-        ));
-    }
-    for artifact in artifacts {
-        if let Err(err) =
-            acquire_overwrite_path(root, &artifact, false, None, &backup_dir, &mut backups)
-        {
-            return Err(rollback_acquired_overwrite(
-                err,
-                AcquiredOverwrite {
-                    root: root.clone(),
-                    target,
-                    backups,
-                    backup_dir,
-                    backup_dir_entry,
-                    backup_dir_identity,
-                    target_restored: None,
-                },
-            ));
-        }
-    }
-
-    let acquired = AcquiredOverwrite {
+    let (manifest_path, manifest_entry, manifest_identity) =
+        match create_overwrite_recovery_manifest(root, &backup_dir, &target) {
+            Ok(manifest) => manifest,
+            Err(err) => {
+                let cleanup =
+                    root.remove_bound_dir_if_identity(&backup_dir_entry, backup_dir_identity);
+                return Err(match cleanup {
+                    Ok(()) => err,
+                    Err(cleanup) => anyhow!(
+                        "{err:#}; failed to clean empty overwrite transaction {}: {cleanup:#}",
+                        backup_dir.display()
+                    ),
+                });
+            }
+        };
+    let mut acquired = AcquiredOverwrite {
         root: root.clone(),
         target,
-        backups,
-        backup_dir,
-        backup_dir_entry,
-        backup_dir_identity,
+        backups: Vec::new(),
+        recovery: OverwriteRecoveryFiles {
+            backup_dir,
+            backup_dir_entry,
+            backup_dir_identity,
+            manifest_path,
+            manifest_entry,
+            manifest_identity,
+        },
         target_restored: None,
     };
+
+    let acquired_target = acquired.target.clone();
+    if let Err(err) = acquire_overwrite_path(
+        root,
+        &acquired_target,
+        true,
+        Some(confirmed_target_identity),
+        &mut acquired,
+    ) {
+        return Err(rollback_acquired_overwrite(err, acquired));
+    }
+    for artifact in artifacts {
+        if let Err(err) = acquire_overwrite_path(root, &artifact, false, None, &mut acquired) {
+            return Err(rollback_acquired_overwrite(err, acquired));
+        }
+    }
+
     if let Err(err) = validate_acquired_overwrite(root, duplicate, primary_media_kind, &acquired) {
         return Err(rollback_acquired_overwrite(err, acquired));
     }
@@ -4347,13 +4355,46 @@ fn create_overwrite_backup_dir(
     bail!("failed to allocate a unique overwrite backup directory")
 }
 
+fn create_overwrite_recovery_manifest(
+    root: &RootedFs,
+    backup_dir: &Path,
+    target: &Path,
+) -> Result<(PathBuf, BoundEntry, EntryIdentity)> {
+    if target.parent() != backup_dir.parent() {
+        bail!(
+            "overwrite target and recovery directory do not share a parent: {}",
+            target.display()
+        );
+    }
+    let target_file_name = PathBuf::from(
+        target
+            .file_name()
+            .context("overwrite target has no file name")?,
+    );
+    let manifest = OverwriteRecoveryManifest {
+        version: OVERWRITE_RECOVERY_MANIFEST_VERSION,
+        target_file_name,
+    };
+    let contents = serde_json::to_vec_pretty(&manifest)
+        .context("failed to encode overwrite recovery manifest")?;
+    let manifest_path = backup_dir.join(OVERWRITE_RECOVERY_MANIFEST_NAME);
+    let (manifest_entry, manifest_identity) = root
+        .create_new_bound_file(&manifest_path, &contents, 0o600)
+        .with_context(|| {
+            format!(
+                "failed to persist overwrite recovery manifest {}",
+                manifest_path.display()
+            )
+        })?;
+    Ok((manifest_path, manifest_entry, manifest_identity))
+}
+
 fn acquire_overwrite_path(
     root: &RootedFs,
     original: &Path,
     required: bool,
     expected_identity: Option<EntryIdentity>,
-    backup_dir: &Path,
-    backups: &mut Vec<FileBackup>,
+    acquired: &mut AcquiredOverwrite,
 ) -> Result<()> {
     let identity = match root.entry_identity(original)? {
         Some(identity) => identity,
@@ -4381,7 +4422,22 @@ fn acquire_overwrite_path(
         );
     }
 
-    let backup = backup_dir.join(format!("{:04x}", backups.len()));
+    if original.parent() != acquired.recovery.backup_dir.parent() {
+        bail!(
+            "refused to acquire overwrite path outside the transaction parent: {}",
+            original.display()
+        );
+    }
+    let file_name = original
+        .file_name()
+        .context("overwrite path has no file name")?;
+    if file_name == std::ffi::OsStr::new(OVERWRITE_RECOVERY_MANIFEST_NAME) {
+        bail!(
+            "overwrite path conflicts with the recovery manifest name: {}",
+            original.display()
+        );
+    }
+    let backup = acquired.recovery.backup_dir.join(file_name);
     let original_entry = root.bind_entry(original, false)?;
     let backup_entry = root.bind_entry(&backup, false)?;
     root.rename_via_bound_parents_noreplace_if_identity(&original_entry, &backup_entry, identity)
@@ -4392,7 +4448,7 @@ fn acquire_overwrite_path(
                 backup.display()
             )
         })?;
-    backups.push(FileBackup {
+    acquired.backups.push(FileBackup {
         original: original.to_path_buf(),
         backup: backup.clone(),
         original_entry,
@@ -4401,7 +4457,11 @@ fn acquire_overwrite_path(
     });
     require_bound_entry_identity(
         root,
-        &backups.last().expect("backup was just pushed").backup_entry,
+        &acquired
+            .backups
+            .last()
+            .expect("backup was just pushed")
+            .backup_entry,
         identity,
         "acquired overwrite path",
     )?;
@@ -4416,8 +4476,8 @@ fn validate_acquired_overwrite(
 ) -> Result<()> {
     require_entry_identity(
         root,
-        &acquired.backup_dir,
-        acquired.backup_dir_identity,
+        &acquired.recovery.backup_dir,
+        acquired.recovery.backup_dir_identity,
         "overwrite backup directory",
     )?;
     let target_backup = acquired
@@ -4510,8 +4570,8 @@ fn validate_acquired_overwrite(
     }
     require_entry_identity(
         root,
-        &acquired.backup_dir,
-        acquired.backup_dir_identity,
+        &acquired.recovery.backup_dir,
+        acquired.recovery.backup_dir_identity,
         "overwrite backup directory after validation",
     )?;
     Ok(())
@@ -4545,12 +4605,12 @@ fn bind_test_overwrite_confirmation(
     let Some(target) = duplicate.overwrite_target() else {
         return Ok(duplicate);
     };
-    let target_identity = root
-        .entry_identity(target)?
+    let target_file = root
+        .open_bound_file(target)?
         .with_context(|| format!("overwrite target is missing: {}", target.display()))?;
     duplicate = duplicate.with_overwrite_confirmation(VideoOverwriteConfirmation {
         root_identity: root.root_identity(),
-        target_identity,
+        target_file,
     });
     Ok(duplicate)
 }
@@ -4892,6 +4952,12 @@ fn staged_move_plan(
             source: source.clone(),
             destination,
         });
+    }
+
+    if overwrite_target.is_some() {
+        // The primary media path is the durable commit marker used by startup recovery. Move it
+        // before sidecars so a missing target cannot coexist with partially committed metadata.
+        steps.sort_by_key(|step| !is_primary_media_file(&step.source, primary_media_kind));
     }
 
     Ok(steps)
@@ -5282,9 +5348,7 @@ fn restore_file_backup(root: &RootedFs, backup: &FileBackup) -> Result<()> {
 fn restore_backups(
     root: &RootedFs,
     backups: &[FileBackup],
-    backup_dir: &Path,
-    backup_dir_entry: &BoundEntry,
-    backup_dir_identity: EntryIdentity,
+    recovery: &OverwriteRecoveryFiles,
     target: &Path,
 ) -> Result<()> {
     let mut failures = Vec::new();
@@ -5305,12 +5369,9 @@ fn restore_backups(
         }
     }
     if failures.is_empty()
-        && let Err(err) = root.remove_bound_dir_if_identity(backup_dir_entry, backup_dir_identity)
+        && let Err(err) = remove_overwrite_transaction_dir(root, recovery)
     {
-        failures.push(format!(
-            "failed to remove overwrite backup directory {}: {err}",
-            backup_dir.display()
-        ));
+        failures.push(format!("{err:#}"));
     }
     if failures.is_empty() {
         Ok(())
@@ -5322,9 +5383,7 @@ fn restore_backups(
 fn restore_remaining_backups(
     root: &RootedFs,
     backups: &[FileBackup],
-    backup_dir: &Path,
-    backup_dir_entry: &BoundEntry,
-    backup_dir_identity: EntryIdentity,
+    recovery: &OverwriteRecoveryFiles,
     restored_target: &BoundEntry,
     restored_target_identity: EntryIdentity,
 ) -> Result<()> {
@@ -5342,12 +5401,9 @@ fn restore_remaining_backups(
         }
     }
     if failures.is_empty()
-        && let Err(err) = root.remove_bound_dir_if_identity(backup_dir_entry, backup_dir_identity)
+        && let Err(err) = remove_overwrite_transaction_dir(root, recovery)
     {
-        failures.push(format!(
-            "failed to remove overwrite backup directory {}: {err}",
-            backup_dir.display()
-        ));
+        failures.push(format!("{err:#}"));
     }
     if failures.is_empty() {
         Ok(())
@@ -5359,13 +5415,11 @@ fn restore_remaining_backups(
 fn remove_backups(
     root: &RootedFs,
     backups: &[FileBackup],
-    backup_dir: &Path,
-    backup_dir_entry: &BoundEntry,
-    backup_dir_identity: EntryIdentity,
+    recovery: &OverwriteRecoveryFiles,
 ) -> Result<()> {
     let mut failures = Vec::new();
     for backup in backups {
-        if backup.backup.parent() != Some(backup_dir) {
+        if backup.backup.parent() != Some(recovery.backup_dir.as_path()) {
             failures.push(format!(
                 "refused to remove overwrite backup outside owned directory: {}",
                 backup.backup.display()
@@ -5381,18 +5435,257 @@ fn remove_backups(
         }
     }
     if failures.is_empty()
-        && let Err(err) = root.remove_bound_dir_if_identity(backup_dir_entry, backup_dir_identity)
+        && let Err(err) = remove_overwrite_transaction_dir(root, recovery)
     {
-        failures.push(format!(
-            "failed to remove overwrite backup directory {}: {err}",
-            backup_dir.display()
-        ));
+        failures.push(format!("{err:#}"));
     }
     if failures.is_empty() {
         Ok(())
     } else {
         bail!("{}", failures.join("; "))
     }
+}
+
+fn remove_overwrite_transaction_dir(
+    root: &RootedFs,
+    recovery: &OverwriteRecoveryFiles,
+) -> Result<()> {
+    root.remove_bound_file_if_identity(&recovery.manifest_entry, recovery.manifest_identity)
+        .with_context(|| {
+            format!(
+                "failed to remove overwrite recovery manifest {}",
+                recovery.manifest_path.display()
+            )
+        })?;
+    root.remove_bound_dir_if_identity(&recovery.backup_dir_entry, recovery.backup_dir_identity)
+        .with_context(|| {
+            format!(
+                "failed to remove overwrite recovery directory {}",
+                recovery.backup_dir.display()
+            )
+        })
+}
+
+pub fn recover_pending_overwrite_transactions(video_dir: &Path) -> Result<Vec<String>> {
+    let root = RootedFs::new(video_dir)?;
+    let mut directories = Vec::new();
+    collect_overwrite_recovery_directories(&root, video_dir, &mut directories)?;
+    directories.sort();
+
+    let mut recovered = Vec::new();
+    for directory in directories {
+        let manifest_path = directory.join(OVERWRITE_RECOVERY_MANIFEST_NAME);
+        match root.open_bound_file(&manifest_path) {
+            Ok(None) => recovered.push(format!(
+                "Retained unrecognized legacy overwrite backup directory: {}",
+                directory.display()
+            )),
+            Ok(Some(_)) => match recover_overwrite_transaction(&root, &directory) {
+                Ok(report) => recovered.extend(report),
+                Err(err) => recovered.push(format!(
+                    "Retained unresolved overwrite transaction {}: {err:#}",
+                    directory.display()
+                )),
+            },
+            Err(err) => recovered.push(format!(
+                "Retained unreadable overwrite transaction {}: {err:#}",
+                directory.display()
+            )),
+        }
+    }
+    Ok(recovered)
+}
+
+fn collect_overwrite_recovery_directories(
+    root: &RootedFs,
+    directory: &Path,
+    recovered: &mut Vec<PathBuf>,
+) -> Result<()> {
+    root.validate_configured_root()?;
+    for entry in fs::read_dir(directory).with_context(|| {
+        format!(
+            "failed to scan overwrite recovery root {}",
+            directory.display()
+        )
+    })? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(OVERWRITE_BACKUP_DIR_PREFIX) {
+            recovered.push(path);
+            continue;
+        }
+        if name == VIDEO_STAGING_DIR_NAME {
+            continue;
+        }
+        collect_overwrite_recovery_directories(root, &path, recovered)?;
+    }
+    root.validate_configured_root()
+}
+
+fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Vec<String>> {
+    let directory_entry = root.bind_entry(directory, false)?;
+    let directory_identity = root
+        .bound_entry_identity(&directory_entry)?
+        .with_context(|| {
+            format!(
+                "overwrite recovery directory is missing: {}",
+                directory.display()
+            )
+        })?;
+    if !directory_identity.is_dir() {
+        bail!(
+            "overwrite recovery path is not a directory: {}",
+            directory.display()
+        );
+    }
+
+    let manifest_path = directory.join(OVERWRITE_RECOVERY_MANIFEST_NAME);
+    let manifest_file = root.open_bound_file(&manifest_path)?.with_context(|| {
+        format!(
+            "overwrite recovery manifest is missing: {}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest_identity = manifest_file.identity();
+    let manifest_entry = root.bind_entry(&manifest_path, false)?;
+    if root.bound_entry_identity(&manifest_entry)? != Some(manifest_identity) {
+        bail!(
+            "overwrite recovery manifest identity changed: {}",
+            manifest_path.display()
+        );
+    }
+    let manifest: OverwriteRecoveryManifest =
+        serde_json::from_slice(&manifest_file.read_limited(OVERWRITE_RECOVERY_MANIFEST_LIMIT)?)
+            .with_context(|| {
+                format!(
+                    "failed to parse overwrite recovery manifest {}",
+                    manifest_path.display()
+                )
+            })?;
+    if manifest.version != OVERWRITE_RECOVERY_MANIFEST_VERSION {
+        bail!(
+            "unsupported overwrite recovery manifest version {} in {}",
+            manifest.version,
+            manifest_path.display()
+        );
+    }
+    let target_file_name = single_recovery_file_name(&manifest.target_file_name)?;
+    let parent = directory
+        .parent()
+        .context("overwrite recovery directory has no parent")?;
+    let target = parent.join(&target_file_name);
+
+    let mut backups = root
+        .list_bound_directory(&directory_entry, directory_identity)?
+        .into_iter()
+        .filter(|(name, _)| name != std::ffi::OsStr::new(OVERWRITE_RECOVERY_MANIFEST_NAME))
+        .collect::<Vec<_>>();
+    for (name, identity) in &backups {
+        if !identity.is_file() {
+            bail!(
+                "overwrite recovery directory contains a non-file entry: {}",
+                directory.join(name).display()
+            );
+        }
+    }
+    backups.sort_by_key(|(name, _)| name == &target_file_name);
+
+    let target_identity = root.entry_identity(&target)?;
+    if target_identity.is_some_and(|identity| !identity.is_file()) {
+        bail!(
+            "overwrite recovery target is not a regular file: {}",
+            target.display()
+        );
+    }
+    let target_backup_exists = backups.iter().any(|(name, _)| name == &target_file_name);
+    if !backups.is_empty() && target_identity.is_none() && !target_backup_exists {
+        bail!(
+            "overwrite recovery target and its backup are both missing: {}",
+            target.display()
+        );
+    }
+
+    let mut report = Vec::new();
+    for (name, backup_identity) in backups {
+        let backup = directory.join(&name);
+        let original = parent.join(&name);
+        let backup_entry = root.bind_entry(&backup, false)?;
+        match root.entry_identity(&original)? {
+            Some(original_identity) if original_identity.is_file() => {
+                root.remove_bound_file_if_identity(&backup_entry, backup_identity)
+                    .with_context(|| {
+                        format!(
+                            "failed to finalize recovered overwrite backup {}",
+                            backup.display()
+                        )
+                    })?;
+                report.push(format!(
+                    "Finalized committed overwrite file: {}",
+                    original.display()
+                ));
+            }
+            Some(_) => {
+                bail!(
+                    "overwrite recovery destination is occupied by a non-file: {}",
+                    original.display()
+                );
+            }
+            None => {
+                let original_entry = root.bind_entry(&original, false)?;
+                root.rename_via_bound_parents_noreplace_if_identity(
+                    &backup_entry,
+                    &original_entry,
+                    backup_identity,
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to restore overwrite backup {} to {}",
+                        backup.display(),
+                        original.display()
+                    )
+                })?;
+                report.push(format!(
+                    "Restored interrupted overwrite: {}",
+                    original.display()
+                ));
+            }
+        }
+    }
+
+    let recovery = OverwriteRecoveryFiles {
+        backup_dir: directory.to_path_buf(),
+        backup_dir_entry: directory_entry,
+        backup_dir_identity: directory_identity,
+        manifest_path,
+        manifest_entry,
+        manifest_identity,
+    };
+    remove_overwrite_transaction_dir(root, &recovery)?;
+    report.push(format!(
+        "Recovered overwrite transaction: {}",
+        directory.display()
+    ));
+    Ok(report)
+}
+
+fn single_recovery_file_name(path: &Path) -> Result<std::ffi::OsString> {
+    let mut components = path.components();
+    let name = match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(name)), None) => name.to_os_string(),
+        _ => bail!(
+            "overwrite recovery manifest contains an invalid target file name: {}",
+            path.display()
+        ),
+    };
+    if name == std::ffi::OsStr::new(OVERWRITE_RECOVERY_MANIFEST_NAME) {
+        bail!("overwrite recovery target conflicts with the manifest name");
+    }
+    Ok(name)
 }
 
 fn unique_bilibili_mux_output_path(
@@ -6597,8 +6890,17 @@ mod tests {
         let duplicate = find_video_duplicate_without_probe(&config, &job)
             .expect("duplicate scan should succeed")
             .expect("confirmed duplicate should exist");
+        let confirmed_file = duplicate
+            .overwrite_confirmation
+            .as_ref()
+            .expect("overwrite confirmation should retain a file handle")
+            .target_file
+            .clone();
 
         fs::remove_file(&existing).expect("confirmed video should remove");
+        confirmed_file
+            .validate_identity()
+            .expect("the unlinked confirmed object should remain held open");
         fs::write(&existing, "replacement-video").expect("replacement video should write");
         let staged = staging_dir.join("Example [PHH1wTDF-1M].mkv");
         fs::write(&staged, "new-video").expect("staged video should write");
@@ -8450,7 +8752,7 @@ mod tests {
         let acquired =
             acquire_and_validate_overwrite_target(&root, &duplicate, StagedPrimaryMediaKind::Video)
                 .expect("overwrite target should be acquired");
-        let backup_dir = acquired.backup_dir.clone();
+        let backup_dir = acquired.recovery.backup_dir.clone();
         let backup_paths = acquired
             .backups
             .iter()
@@ -8522,6 +8824,117 @@ mod tests {
                     .to_string_lossy()
                     .starts_with(OVERWRITE_BACKUP_DIR_PREFIX))
         );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn startup_recovery_restores_an_interrupted_overwrite() {
+        let final_dir = temp_test_dir("overwrite-startup-restore");
+        let existing = final_dir.join("Episode.mkv");
+        fs::write(&existing, "original-video").expect("existing file should write");
+        write_bilibili_identity_nfo(&existing, "cid123");
+        let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        let root = RootedFs::new(&final_dir).expect("output root should open");
+        let duplicate =
+            bind_test_overwrite_confirmation(&root, VideoDuplicateAction::Overwrite, &duplicate)
+                .expect("overwrite confirmation should bind");
+        let acquired =
+            acquire_and_validate_overwrite_target(&root, &duplicate, StagedPrimaryMediaKind::Video)
+                .expect("overwrite target should be acquired");
+        drop(acquired);
+
+        let report = recover_pending_overwrite_transactions(&final_dir)
+            .expect("interrupted overwrite should recover");
+
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "original-video");
+        assert!(existing.with_extension("nfo").is_file());
+        assert!(overwrite_backup_dirs(&final_dir).is_empty());
+        assert!(
+            report
+                .iter()
+                .any(|line| line.contains("Restored interrupted"))
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn overwrite_move_plan_commits_primary_media_before_sidecars() {
+        let final_dir = temp_test_dir("overwrite-primary-first");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        let staged_video = staging_dir.join("Episode.mkv");
+        let staged_nfo = staging_dir.join("Episode.nfo");
+        let overwrite_target = final_dir.join("Existing.mkv");
+
+        let plan = staged_move_plan(
+            &staging_dir,
+            &final_dir,
+            &[staged_nfo, staged_video.clone()],
+            Some(&overwrite_target),
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("overwrite move plan should build");
+
+        assert_eq!(plan[0].source, staged_video);
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn startup_recovery_retains_a_malformed_transaction_without_blocking_startup() {
+        let final_dir = temp_test_dir("overwrite-startup-malformed");
+        let transaction = final_dir.join(format!("{OVERWRITE_BACKUP_DIR_PREFIX}-malformed"));
+        fs::create_dir(&transaction).expect("transaction directory should create");
+        let manifest = transaction.join(OVERWRITE_RECOVERY_MANIFEST_NAME);
+        fs::write(&manifest, b"{").expect("malformed manifest should write");
+
+        let report = recover_pending_overwrite_transactions(&final_dir)
+            .expect("malformed recovery state should be reported without aborting startup");
+
+        assert!(transaction.is_dir());
+        assert!(manifest.is_file());
+        assert!(report.iter().any(|line| {
+            line.contains("Retained unresolved overwrite transaction")
+                && line.contains("failed to parse overwrite recovery manifest")
+        }));
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn startup_recovery_keeps_new_media_and_restores_a_missing_sidecar() {
+        let final_dir = temp_test_dir("overwrite-startup-complete");
+        let existing = final_dir.join("Episode.mkv");
+        fs::write(&existing, "original-video").expect("existing file should write");
+        write_bilibili_identity_nfo(&existing, "cid123");
+        let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        let root = RootedFs::new(&final_dir).expect("output root should open");
+        let duplicate =
+            bind_test_overwrite_confirmation(&root, VideoDuplicateAction::Overwrite, &duplicate)
+                .expect("overwrite confirmation should bind");
+        let acquired =
+            acquire_and_validate_overwrite_target(&root, &duplicate, StagedPrimaryMediaKind::Video)
+                .expect("overwrite target should be acquired");
+        fs::write(&existing, "replacement-video").expect("replacement should write");
+        drop(acquired);
+
+        recover_pending_overwrite_transactions(&final_dir)
+            .expect("partially committed overwrite should recover");
+
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "replacement-video");
+        assert!(existing.with_extension("nfo").is_file());
+        assert!(overwrite_backup_dirs(&final_dir).is_empty());
         let _ = fs::remove_dir_all(final_dir);
     }
 
