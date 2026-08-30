@@ -1386,6 +1386,11 @@ struct ReservedMuxOutput {
     published: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BilibiliMuxCommitCheckpoint {
+    AnchorPersistedBeforePublication,
+}
+
 impl ReservedMuxOutput {
     fn create(
         root: &RootedFs,
@@ -1510,7 +1515,14 @@ impl ReservedMuxOutput {
         self.staged_entry.path()
     }
 
-    fn commit(mut self) -> Result<(BoundFile, BilibiliMuxRecovery)> {
+    fn commit(self) -> Result<(BoundFile, BilibiliMuxRecovery)> {
+        self.commit_with_hook(&mut |_| Ok(()))
+    }
+
+    fn commit_with_hook<F>(mut self, hook: &mut F) -> Result<(BoundFile, BilibiliMuxRecovery)>
+    where
+        F: FnMut(BilibiliMuxCommitCheckpoint) -> Result<()>,
+    {
         self.file
             .sync_all()
             .context("failed to persist private Bilibili mux output")?;
@@ -1526,6 +1538,32 @@ impl ReservedMuxOutput {
                 self.staged_entry.path().display()
             );
         }
+        let anchor_path = self
+            .staging_dir_entry
+            .path()
+            .join(BILIBILI_MUX_RECOVERY_ANCHOR_NAME);
+        let anchor_entry = self.root.bind_entry(&anchor_path, false)?;
+        self.root
+            .hard_link_via_bound_parents_noreplace_if_identity(
+                &self.staged_entry,
+                &anchor_entry,
+                self.file.identity(),
+            )
+            .with_context(|| {
+                format!(
+                    "failed to anchor private Bilibili mux output {}",
+                    self.staged_entry.path().display()
+                )
+            })?;
+        let anchor = self
+            .root
+            .open_bound_file(&anchor_path)?
+            .context("private Bilibili mux output anchor is missing")?;
+        if anchor.identity() != self.file.identity() {
+            bail!("private Bilibili mux output anchor identity changed");
+        }
+        hook(BilibiliMuxCommitCheckpoint::AnchorPersistedBeforePublication)?;
+        self.published = true;
         self.root
             .rename_via_bound_parents_noreplace_if_identity(
                 &self.staged_entry,
@@ -1538,31 +1576,6 @@ impl ReservedMuxOutput {
                     self.final_entry.path().display()
                 )
             })?;
-        self.published = true;
-        let anchor_path = self
-            .staging_dir_entry
-            .path()
-            .join(BILIBILI_MUX_RECOVERY_ANCHOR_NAME);
-        let anchor_entry = self.root.bind_entry(&anchor_path, false)?;
-        self.root
-            .hard_link_via_bound_parents_noreplace_if_identity(
-                &self.final_entry,
-                &anchor_entry,
-                self.file.identity(),
-            )
-            .with_context(|| {
-                format!(
-                    "failed to anchor published Bilibili mux output {}",
-                    self.final_entry.path().display()
-                )
-            })?;
-        let anchor = self
-            .root
-            .open_bound_file(&anchor_path)?
-            .context("published Bilibili mux output anchor is missing")?;
-        if anchor.identity() != self.file.identity() {
-            bail!("published Bilibili mux output anchor identity changed");
-        }
         self.manifest.phase = BilibiliMuxRecoveryPhase::CleaningInputs;
         let (manifest_entry, manifest_identity) = replace_bilibili_mux_recovery_manifest(
             &self.root,
@@ -1609,7 +1622,7 @@ impl Drop for ReservedMuxOutput {
         } else if self.active && self.published {
             info!(
                 path = %self.staging_dir_entry.path().display(),
-                "retained published Bilibili mux transaction for startup recovery"
+                "retained Bilibili mux transaction for startup recovery"
             );
         }
     }
@@ -2494,10 +2507,22 @@ fn recover_bilibili_mux_transaction(root: &RootedFs, directory: &Path) -> Result
         if root.entry_identity(&parent.join(output_name))?.is_some() {
             bail!("both staged and published Bilibili mux outputs exist");
         }
-        let expected = BTreeSet::from([
+        let anchor_path = directory.join(BILIBILI_MUX_RECOVERY_ANCHOR_NAME);
+        let anchor_identity = root.entry_identity(&anchor_path)?;
+        if anchor_identity.is_some_and(|identity| {
+            !identity.is_file()
+                || identity.device() != pending.manifest.output_device
+                || identity.inode() != pending.manifest.output_inode
+        }) {
+            bail!("Bilibili mux prepublication anchor identity changed");
+        }
+        let mut expected = BTreeSet::from([
             std::ffi::OsString::from(BILIBILI_MUX_RECOVERY_MANIFEST_NAME),
             staged_name,
         ]);
+        if anchor_identity.is_some() {
+            expected.insert(std::ffi::OsString::from(BILIBILI_MUX_RECOVERY_ANCHOR_NAME));
+        }
         require_bilibili_mux_transaction_entries(root, &pending, &expected)?;
         root.remove_bound_tree_durably_if_identity(
             &pending.directory_entry,
@@ -2512,7 +2537,7 @@ fn recover_bilibili_mux_transaction(root: &RootedFs, directory: &Path) -> Result
         bail!("Bilibili mux staged output identity changed");
     }
 
-    let (output_path, output, anchor) = ensure_bilibili_mux_output_anchor(root, &pending)?;
+    let (output_path, output, anchor) = ensure_bilibili_mux_output_from_anchor(root, &pending)?;
     if pending.manifest.phase == BilibiliMuxRecoveryPhase::Muxing {
         pending.manifest.phase = BilibiliMuxRecoveryPhase::CleaningInputs;
         let (entry, identity) = replace_bilibili_mux_recovery_manifest(
@@ -2629,7 +2654,7 @@ fn load_bilibili_mux_recovery(
     })
 }
 
-fn ensure_bilibili_mux_output_anchor(
+fn ensure_bilibili_mux_output_from_anchor(
     root: &RootedFs,
     pending: &PendingBilibiliMuxRecovery,
 ) -> Result<(PathBuf, BoundFile, BoundFile)> {
@@ -2655,11 +2680,9 @@ fn ensure_bilibili_mux_output_anchor(
         }
     }
     match (output_identity, anchor_identity) {
-        (Some(_), None) => root.hard_link_via_bound_parents_noreplace_if_identity(
-            &output_entry,
-            &anchor_entry,
-            output_identity.expect("output identity is present"),
-        )?,
+        (Some(_), None) => {
+            bail!("published Bilibili mux output has no durable prepublication anchor")
+        }
         (None, Some(_)) => root.hard_link_via_bound_parents_noreplace_if_identity(
             &anchor_entry,
             &output_entry,
@@ -7125,7 +7148,7 @@ where
         match validate_video_staging_directory(root, &path, identity) {
             Ok(entry) => {
                 match recover_owned_video_staging_directory(root, &path, &entry, identity, hook) {
-                    Ok(message) => report.messages.push(message),
+                    Ok(messages) => report.messages.extend(messages),
                     Err(failure) => {
                         report.unresolved = true;
                         if let Some(overwrite) = failure.overwrite {
@@ -7157,25 +7180,36 @@ fn recover_owned_video_staging_directory<F>(
     entry: &BoundEntry,
     identity: EntryIdentity,
     hook: &mut F,
-) -> std::result::Result<String, VideoStagingRecoveryFailure>
+) -> std::result::Result<Vec<String>, VideoStagingRecoveryFailure>
 where
     F: FnMut(StagedPublicationDirection, &StagedPublicationStep) -> Result<()>,
 {
     let mut overwrite = None;
-    let result = (|| -> Result<String> {
+    let result = (|| -> Result<Vec<String>> {
         let manifest_path = path.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME);
         let Some(manifest_file) = root.open_bound_file(&manifest_path)? else {
             if let Some(reason) = retained_video_staging_reason(root, path, identity)? {
-                return Ok(format!(
+                let mux_recovery = recover_pending_bilibili_mux_transactions_locked(root, path)?;
+                if mux_recovery.unresolved {
+                    bail!(
+                        "retained staged job has unresolved Bilibili mux recovery: {}",
+                        mux_recovery.messages.join("; ")
+                    );
+                }
+                validate_video_staging_directory(root, path, identity)
+                    .context("retained staged job changed during Bilibili mux recovery")?;
+                let mut messages = mux_recovery.messages;
+                messages.push(format!(
                     "Retained completed staged video job for manual recovery: {} ({reason})",
                     path.display()
                 ));
+                return Ok(messages);
             }
             root.remove_bound_tree_durably_if_identity(entry, identity)?;
-            return Ok(format!(
+            return Ok(vec![format!(
                 "Discarded interrupted staged video job: {}",
                 path.display()
-            ));
+            )]);
         };
         manifest_file.validate_private_single_link(0o600)?;
         let manifest: StagedPublicationManifest = serde_json::from_slice(
@@ -7203,10 +7237,10 @@ where
             StagedPublicationDirection::RollForward => "Rolled forward",
             StagedPublicationDirection::RollBack => "Rolled back",
         };
-        Ok(format!(
+        Ok(vec![format!(
             "{action} interrupted staged video publication: {}",
             path.display()
-        ))
+        )])
     })();
     result.map_err(|error| VideoStagingRecoveryFailure { error, overwrite })
 }
@@ -15209,6 +15243,161 @@ mod tests {
                 .iter()
                 .any(|line| { line.contains("Discarded interrupted staged video job") })
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retained_staging_recovers_nested_muxing_transaction() {
+        let root = temp_test_dir("retained-bilibili-muxing-recovery");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+        let staging = create_video_staging_dir(&rooted).expect("production staging should create");
+        staging
+            .retain_for_manual_recovery(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)
+            .expect("completed staging marker should persist");
+        let staging_path = staging.path().to_path_buf();
+        let raw = staging_path.join("video.m4s");
+        let output = staging_path.join("Episode.mp4");
+        fs::write(&raw, "raw-video").expect("raw input should write");
+        let inputs = vec![BilibiliMediaInput {
+            kind: "video".to_string(),
+            path: raw.clone(),
+        }];
+        let bound_inputs =
+            bind_bilibili_mux_inputs(&rooted, &inputs).expect("raw input should bind");
+        let reservation = ReservedMuxOutput::create(&rooted, &output, &bound_inputs)
+            .expect("mux transaction should reserve");
+        let transaction = reservation.staging_dir_entry.path().to_path_buf();
+        fs::write(reservation.command_path(), "partial-mux")
+            .expect("partial mux output should write");
+        std::mem::forget(reservation);
+        drop(staging);
+
+        let report = recover_pending_overwrite_transactions(&root)
+            .expect("retained staging should recover its nested mux transaction");
+
+        assert!(raw.is_file());
+        assert!(!output.exists());
+        assert!(!transaction.exists());
+        assert!(staging_path.is_dir());
+        assert!(
+            report
+                .iter()
+                .any(|line| { line.contains("Discarded interrupted Bilibili mux staging") })
+        );
+        assert!(report.iter().any(|line| {
+            line.contains("Retained completed staged video job for manual recovery")
+        }));
+        let (state, _) =
+            video_recovery_state_file(&rooted).expect("recovery state should remain readable");
+        assert!(video_recovery_state_is_clean(&state).expect("recovery state should validate"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retained_staging_finishes_nested_published_mux_cleanup() {
+        let root = temp_test_dir("retained-bilibili-cleaning-inputs-recovery");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+        let staging = create_video_staging_dir(&rooted).expect("production staging should create");
+        staging
+            .retain_for_manual_recovery(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)
+            .expect("completed staging marker should persist");
+        let staging_path = staging.path().to_path_buf();
+        let raw = staging_path.join("video.m4s");
+        let output = staging_path.join("Episode.mp4");
+        fs::write(&raw, "raw-video").expect("raw input should write");
+        let inputs = vec![BilibiliMediaInput {
+            kind: "video".to_string(),
+            path: raw.clone(),
+        }];
+        let bound_inputs =
+            bind_bilibili_mux_inputs(&rooted, &inputs).expect("raw input should bind");
+        let reservation = ReservedMuxOutput::create(&rooted, &output, &bound_inputs)
+            .expect("mux transaction should reserve");
+        let staged_output = reservation.command_path().to_path_buf();
+        let transaction = reservation.staging_dir_entry.path().to_path_buf();
+        let anchor = transaction.join(BILIBILI_MUX_RECOVERY_ANCHOR_NAME);
+        fs::write(&staged_output, "mux-output").expect("mux output should write");
+        let mut observed_anchor_before_publication = false;
+        let (bound_output, recovery) = reservation
+            .commit_with_hook(&mut |checkpoint| {
+                assert_eq!(
+                    checkpoint,
+                    BilibiliMuxCommitCheckpoint::AnchorPersistedBeforePublication
+                );
+                assert!(staged_output.is_file());
+                assert!(anchor.is_file());
+                assert!(!output.exists());
+                observed_anchor_before_publication = true;
+                Ok(())
+            })
+            .expect("mux output should commit");
+        assert!(observed_anchor_before_publication);
+        drop(bound_output);
+        drop(recovery);
+        drop(bound_inputs);
+        drop(staging);
+
+        let report = recover_pending_overwrite_transactions(&root)
+            .expect("retained staging should finish nested mux cleanup");
+
+        assert_eq!(fs::read_to_string(&output).unwrap(), "mux-output");
+        assert!(!raw.exists());
+        assert!(!transaction.exists());
+        assert!(staging_path.is_dir());
+        assert!(
+            report
+                .iter()
+                .any(|line| line.contains("Recovered Bilibili mux transaction"))
+        );
+        assert!(report.iter().any(|line| {
+            line.contains("Retained completed staged video job for manual recovery")
+        }));
+        let (state, _) =
+            video_recovery_state_file(&rooted).expect("recovery state should remain readable");
+        assert!(video_recovery_state_is_clean(&state).expect("recovery state should validate"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mux_recovery_rejects_a_published_output_without_a_durable_anchor() {
+        let root = temp_test_dir("bilibili-mux-missing-anchor-recovery");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+        let raw = root.join("video.m4s");
+        let output = root.join("Episode.mp4");
+        fs::write(&raw, "raw-video").expect("raw input should write");
+        let inputs = vec![BilibiliMediaInput {
+            kind: "video".to_string(),
+            path: raw.clone(),
+        }];
+        let bound_inputs =
+            bind_bilibili_mux_inputs(&rooted, &inputs).expect("raw input should bind");
+        let reservation = ReservedMuxOutput::create(&rooted, &output, &bound_inputs)
+            .expect("mux transaction should reserve");
+        let transaction = reservation.staging_dir_entry.path().to_path_buf();
+        fs::write(reservation.command_path(), "mux-output").expect("mux output should write");
+        reservation
+            .file
+            .sync_all()
+            .expect("mux output should persist");
+        rooted
+            .rename_via_bound_parents_noreplace_if_identity(
+                &reservation.staged_entry,
+                &reservation.final_entry,
+                reservation.file.identity(),
+            )
+            .expect("legacy crash window should publish without an anchor");
+        std::mem::forget(reservation);
+
+        let report = recover_pending_bilibili_mux_transactions_locked(&rooted, &root)
+            .expect("missing anchor should be reported without destructive cleanup");
+
+        assert!(report.unresolved);
+        assert_eq!(fs::read_to_string(&output).unwrap(), "mux-output");
+        assert_eq!(fs::read_to_string(&raw).unwrap(), "raw-video");
+        assert!(transaction.is_dir());
+        assert!(report.messages.iter().any(|line| {
+            line.contains("published Bilibili mux output has no durable prepublication anchor")
+        }));
         let _ = fs::remove_dir_all(root);
     }
 
