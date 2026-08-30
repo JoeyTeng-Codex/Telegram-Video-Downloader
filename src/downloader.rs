@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use bbdown_core::{
     DownloadFileKind, DownloadMode, DownloadProgressEvent, DownloadProgressSink, DownloadReport,
+    ResolvedContent,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -414,6 +415,10 @@ struct BilibiliDownloadEntry {
     cid: u64,
     epid: Option<u64>,
     title: String,
+    #[serde(default)]
+    uploader: Option<String>,
+    #[serde(default)]
+    publish_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -514,10 +519,79 @@ impl From<&bbdown_core::DownloadPlan> for BilibiliDownloadPlan {
                     cid: entry.cid,
                     epid: entry.epid,
                     title: entry.title.clone(),
+                    uploader: None,
+                    publish_date: None,
                 })
                 .collect(),
         }
     }
+}
+
+impl BilibiliDownloadPlan {
+    fn apply_resolved_metadata(&mut self, resolved: &ResolvedContent) {
+        match resolved {
+            ResolvedContent::Video(video) => {
+                let uploader = bilibili_owner_name(video.owner.as_ref());
+                let publish_date = video.pub_time.and_then(format_bilibili_publish_date);
+                for entry in &mut self.entries {
+                    if entry.aid == video.aid {
+                        entry.uploader.clone_from(&uploader);
+                        entry.publish_date.clone_from(&publish_date);
+                    }
+                }
+            }
+            ResolvedContent::Season(season) => {
+                for entry in &mut self.entries {
+                    let episode = season
+                        .selected_episodes
+                        .iter()
+                        .find(|episode| Some(episode.epid) == entry.epid)
+                        .or_else(|| {
+                            season.selected_episodes.iter().find(|episode| {
+                                episode.cid == entry.cid
+                                    || (episode.aid == entry.aid && episode.index == entry.index)
+                            })
+                        });
+                    entry.publish_date = episode
+                        .and_then(|episode| episode.pub_time)
+                        .and_then(format_bilibili_publish_date);
+                }
+            }
+            ResolvedContent::Collection(collection) => {
+                let collection_uploader = bilibili_owner_name(collection.collection.owner.as_ref());
+                let collection_publish_date = collection
+                    .collection
+                    .pub_time
+                    .and_then(format_bilibili_publish_date);
+                for entry in &mut self.entries {
+                    let item = collection
+                        .selected_items
+                        .iter()
+                        .find(|item| item.cid == entry.cid)
+                        .or_else(|| {
+                            collection
+                                .selected_items
+                                .iter()
+                                .find(|item| item.aid == entry.aid && item.index == entry.index)
+                        });
+                    entry.uploader = item
+                        .and_then(|item| bilibili_owner_name(item.owner.as_ref()))
+                        .or_else(|| collection_uploader.clone());
+                    entry.publish_date = item
+                        .and_then(|item| item.pub_time)
+                        .and_then(format_bilibili_publish_date)
+                        .or_else(|| collection_publish_date.clone());
+                }
+            }
+        }
+    }
+}
+
+fn bilibili_owner_name(owner: Option<&bbdown_core::Owner>) -> Option<String> {
+    owner
+        .map(|owner| owner.name.trim())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
 }
 
 impl From<&DownloadReport> for BilibiliDownloadReport {
@@ -1145,15 +1219,56 @@ async fn run_bilibili_job_locked(
         options = options.with_mux(bbdown_core::MuxOptions::Disabled);
     }
     let client = bilibili_core::client(config)?;
-    let core_plan = probe_bilibili_plan_with_mode(
-        &client,
-        url,
-        selection,
-        options.mode,
-        BILIBILI_METADATA_PROBE_TIMEOUT,
-    )
-    .await?;
-    let plan = BilibiliDownloadPlan::from(&core_plan);
+    let (core_plan, resolved_metadata) = if config.video.write_nfo {
+        let plan_probe = probe_bilibili_plan_with_mode(
+            &client,
+            url,
+            selection,
+            options.mode,
+            BILIBILI_METADATA_PROBE_TIMEOUT,
+        );
+        let metadata_probe = probe_bilibili_resolved_content(
+            &client,
+            url,
+            selection,
+            BILIBILI_METADATA_PROBE_TIMEOUT,
+        );
+        tokio::pin!(plan_probe);
+        tokio::pin!(metadata_probe);
+        tokio::select! {
+            core_plan = &mut plan_probe => {
+                let core_plan = core_plan?;
+                (core_plan, metadata_probe.await.map(Some))
+            }
+            metadata = &mut metadata_probe => {
+                let core_plan = plan_probe.await?;
+                (core_plan, metadata.map(Some))
+            }
+        }
+    } else {
+        (
+            probe_bilibili_plan_with_mode(
+                &client,
+                url,
+                selection,
+                options.mode,
+                BILIBILI_METADATA_PROBE_TIMEOUT,
+            )
+            .await?,
+            Ok(None),
+        )
+    };
+    let (resolved_metadata, metadata_warning) = match resolved_metadata {
+        Ok(metadata) => (metadata, None),
+        Err(err) => (
+            None,
+            Some(format!("Bilibili NFO metadata skipped: {err:#}")),
+        ),
+    };
+    let mut plan = BilibiliDownloadPlan::from(&core_plan);
+    if let Some(resolved_metadata) = resolved_metadata.as_ref() {
+        plan.apply_resolved_metadata(resolved_metadata);
+    }
     if let Some(expected_identity) = expected_overwrite_identity {
         ensure_bilibili_overwrite_plan_matches(&plan, expected_identity)?;
     }
@@ -1192,6 +1307,9 @@ async fn run_bilibili_job_locked(
     )];
     if !report.title.trim().is_empty() {
         details.push(format!("Title: {}", report.title));
+    }
+    if let Some(metadata_warning) = metadata_warning {
+        details.push(metadata_warning);
     }
     if config.video.write_nfo {
         match write_bilibili_nfos(&output_dir, url, &plan, &report) {
@@ -2905,8 +3023,8 @@ fn write_bilibili_nfos(
                 unique_id: ids.primary_unique_id.as_str(),
                 alternate_unique_ids,
                 source_url,
-                studio: Some("Bilibili"),
-                premiered: None,
+                studio: plan_entry.and_then(|entry| entry.uploader.as_deref()),
+                premiered: plan_entry.and_then(|entry| entry.publish_date.as_deref()),
             },
         )?;
         nfos.push(nfo_path);
@@ -4209,6 +4327,21 @@ async fn probe_bilibili_plan_with_mode(
     .await
     .context("Bilibili plan probe timed out")?
     .context("failed to probe Bilibili plan with bbdown-core")
+}
+
+async fn probe_bilibili_resolved_content(
+    client: &bbdown_core::BiliClient,
+    url: &str,
+    selection: Option<BilibiliSelection>,
+    timeout: Duration,
+) -> Result<ResolvedContent> {
+    tokio_timeout(
+        timeout,
+        client.resolve_input(url, bilibili_core::selection(selection)),
+    )
+    .await
+    .context("Bilibili metadata probe timed out")?
+    .context("failed to probe Bilibili metadata with bbdown-core")
 }
 
 fn parse_bilibili_plan(stdout: &str) -> Result<BilibiliDownloadPlan> {
@@ -10701,6 +10834,29 @@ fn format_yt_date(upload_date: &str) -> Option<String> {
     }
 }
 
+fn format_bilibili_publish_date(timestamp: i64) -> Option<String> {
+    const BILIBILI_TIMEZONE_OFFSET_SECONDS: i64 = 8 * 60 * 60;
+    const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+
+    let local_timestamp = timestamp.checked_add(BILIBILI_TIMEZONE_OFFSET_SECONDS)?;
+    let days_since_epoch = local_timestamp.div_euclid(SECONDS_PER_DAY);
+    let shifted_days = days_since_epoch.checked_add(719_468)?;
+    let era = shifted_days.div_euclid(146_097);
+    let day_of_era = shifted_days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    if !(1..=9_999).contains(&year) {
+        return None;
+    }
+    Some(format!("{year:04}-{month:02}-{day:02}"))
+}
+
 fn summarize_output(stdout: &str, stderr: &str) -> String {
     let stderr_tail = tail_lines(&redact_sensitive_output(stderr), 10);
     let stdout_tail = tail_lines(&redact_sensitive_output(stdout), 10);
@@ -11392,6 +11548,8 @@ mod tests {
                 cid: 222,
                 epid: Some(333),
                 title: "Part 2".to_string(),
+                uploader: None,
+                publish_date: None,
             }],
         };
         let mut identities = video_identity(&job).into_iter().collect::<Vec<_>>();
@@ -11575,6 +11733,8 @@ mod tests {
                 cid: 20,
                 epid: Some(30),
                 title: "Episode".to_string(),
+                uploader: None,
+                publish_date: None,
             }],
         };
 
@@ -11599,6 +11759,8 @@ mod tests {
                 cid: 21,
                 epid: Some(31),
                 title: "New episode".to_string(),
+                uploader: None,
+                publish_date: None,
             }],
         };
 
@@ -11764,6 +11926,8 @@ mod tests {
                 cid: 987_654_321,
                 epid: Some(123_456),
                 title: "Episode One".to_string(),
+                uploader: Some("Example Uploader".to_string()),
+                publish_date: Some("2026-05-05".to_string()),
             }],
         };
         let report = BilibiliDownloadReport {
@@ -11796,7 +11960,62 @@ mod tests {
         );
         assert!(nfo.contains("<uniqueid type=\"bilibili-cid\">cid987654321</uniqueid>"));
         assert!(nfo.contains("<uniqueid type=\"bilibili-epid\">ep123456</uniqueid>"));
+        assert!(nfo.contains("<studio>Example Uploader</studio>"));
+        assert!(nfo.contains("<premiered>2026-05-05</premiered>"));
+        assert!(nfo.contains("<year>2026</year>"));
         let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn applies_bilibili_core_video_metadata_to_nfo_plan_entries() {
+        let mut plan = BilibiliDownloadPlan {
+            title: "Multi-part video".to_string(),
+            entries: vec![BilibiliDownloadEntry {
+                index: 1,
+                aid: 123,
+                bvid: Some("BV123".to_string()),
+                cid: 456,
+                epid: None,
+                title: "Part 1".to_string(),
+                uploader: None,
+                publish_date: None,
+            }],
+        };
+        let resolved = ResolvedContent::Video(bbdown_core::VideoMetadata {
+            aid: 123,
+            bvid: Some("BV123".to_string()),
+            title: "Multi-part video".to_string(),
+            description: "Description".to_string(),
+            cover_url: None,
+            pub_time: Some(1_700_000_000),
+            owner: Some(bbdown_core::Owner {
+                mid: 42,
+                name: " Example Uploader ".to_string(),
+            }),
+            tags: Vec::new(),
+            pages: Vec::new(),
+        });
+
+        plan.apply_resolved_metadata(&resolved);
+
+        assert_eq!(
+            plan.entries[0].uploader.as_deref(),
+            Some("Example Uploader")
+        );
+        assert_eq!(plan.entries[0].publish_date.as_deref(), Some("2023-11-15"));
+    }
+
+    #[test]
+    fn formats_bilibili_publication_dates_in_the_service_timezone() {
+        assert_eq!(
+            format_bilibili_publish_date(0).as_deref(),
+            Some("1970-01-01")
+        );
+        assert_eq!(
+            format_bilibili_publish_date(1_709_164_800).as_deref(),
+            Some("2024-02-29")
+        );
+        assert_eq!(format_bilibili_publish_date(i64::MAX), None);
     }
 
     #[test]
