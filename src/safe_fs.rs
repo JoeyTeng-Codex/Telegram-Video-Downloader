@@ -399,6 +399,20 @@ impl RootedFs {
 
     pub(crate) fn open_bound_file(&self, path: &Path) -> Result<Option<BoundFile>> {
         let entry = self.bind_entry(path, false)?;
+        let file = self.open_file_from_bound_entry(&entry)?;
+        if file.is_some() {
+            self.validate_parent(&entry.parent)?;
+        }
+        Ok(file)
+    }
+
+    pub(crate) fn open_file_from_bound_entry(
+        &self,
+        entry: &BoundEntry,
+    ) -> Result<Option<BoundFile>> {
+        // This variant protects the held parent object rather than reachability through a mutable
+        // configured root path. Callers still revalidate the selected leaf identity after reading.
+        self.validate_bound_parent(&entry.parent)?;
         let fd = match rustix::fs::openat(
             entry.parent.fd.as_ref(),
             &entry.leaf,
@@ -408,21 +422,22 @@ impl RootedFs {
             Ok(fd) => fd,
             Err(err) if err == rustix::io::Errno::NOENT => return Ok(None),
             Err(err) => {
-                return Err(errno_to_io(err))
-                    .with_context(|| format!("failed to open bound file {}", path.display()));
+                return Err(errno_to_io(err)).with_context(|| {
+                    format!("failed to open bound file {}", entry.path.display())
+                });
             }
         };
         let identity = identity_for_fd(&fd)?;
         if !identity.is_file() {
-            bail!("bound path is not a regular file: {}", path.display());
+            bail!("bound path is not a regular file: {}", entry.path.display());
         }
         if identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(identity) {
             bail!(
                 "bound file identity changed while opening: {}",
-                path.display()
+                entry.path.display()
             );
         }
-        self.validate_parent(&entry.parent)?;
+        self.validate_bound_parent(&entry.parent)?;
         Ok(Some(BoundFile {
             fd: Arc::new(fd),
             identity,

@@ -7172,10 +7172,13 @@ fn create_video_staging_dir(root: &RootedFs) -> Result<BoundStagingDir> {
                 }
                 let entry = validate_video_staging_directory(root, &candidate, identity)?;
                 let directory = root.open_bound_directory(&entry, identity)?;
+                let retention_entry =
+                    root.bind_entry(&candidate.join(VIDEO_STAGING_RETENTION_FILE_NAME), false)?;
                 return Ok(BoundStagingDir {
                     root: root.clone(),
                     entry,
                     directory,
+                    retention_entry,
                     identity,
                     removed: false,
                     preserve_on_drop: AtomicBool::new(false),
@@ -7287,7 +7290,27 @@ fn retained_video_staging_reason_for_identity(
     staging_device: u64,
     staging_inode: u64,
 ) -> Result<Option<String>> {
-    let Some(marker) = root.open_bound_file(marker_path)? else {
+    let marker_entry = root.bind_entry(marker_path, false)?;
+    retained_video_staging_reason_from_bound_entry(
+        root,
+        &marker_entry,
+        output_root_device,
+        output_root_inode,
+        staging_device,
+        staging_inode,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retained_video_staging_reason_from_bound_entry(
+    root: &RootedFs,
+    marker_entry: &BoundEntry,
+    output_root_device: u64,
+    output_root_inode: u64,
+    staging_device: u64,
+    staging_inode: u64,
+) -> Result<Option<String>> {
+    let Some(marker) = root.open_file_from_bound_entry(marker_entry)? else {
         return Ok(None);
     };
     marker.validate_private_single_link(0o600)?;
@@ -7303,7 +7326,7 @@ fn retained_video_staging_reason_for_identity(
     {
         bail!("staged download retention marker does not match its owned directory");
     }
-    if root.entry_identity(marker_path)? != Some(marker.identity()) {
+    if root.bound_entry_identity(marker_entry)? != Some(marker.identity()) {
         bail!("staged download retention marker identity changed after validation");
     }
     Ok(Some(retention.reason))
@@ -7965,6 +7988,7 @@ struct BoundStagingDir {
     root: RootedFs,
     entry: BoundEntry,
     directory: BoundDirectory,
+    retention_entry: BoundEntry,
     identity: EntryIdentity,
     removed: bool,
     preserve_on_drop: AtomicBool,
@@ -8013,6 +8037,35 @@ impl Drop for BoundStagingDir {
     fn drop(&mut self) {
         if self.removed || self.preserve_on_drop.load(Ordering::Acquire) {
             return;
+        }
+        // Protected property: completed staging content survives parent-task cancellation. The
+        // bound parent ties the marker to this staging object, persisted root/staging identities
+        // prove ownership, and the final leaf identity check detects replacement. Only a confirmed
+        // missing marker authorizes automatic cleanup.
+        match retained_video_staging_reason_from_bound_entry(
+            &self.root,
+            &self.retention_entry,
+            self.root.root_identity().device(),
+            self.root.root_identity().inode(),
+            self.identity.device(),
+            self.identity.inode(),
+        ) {
+            Ok(Some(_)) => {
+                info!(
+                    path = %self.entry.path().display(),
+                    "retaining completed bound staging directory during drop"
+                );
+                return;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                info!(
+                    path = %self.entry.path().display(),
+                    error = %err,
+                    "retaining bound staging directory because its completion marker could not be verified"
+                );
+                return;
+            }
         }
         if let Err(err) = self
             .root
@@ -12435,6 +12488,44 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&staged_video).unwrap(),
+            "completed-video"
+        );
+        assert!(staging_dir.is_dir());
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_after_worker_completion_marker_preserves_staged_media() {
+        let config = test_config();
+        let final_dir = temp_test_dir("worker-completion-cancellation-retention");
+        let root = RootedFs::new(&final_dir).expect("output root should bind");
+        let staging =
+            create_video_staging_dir(&root).expect("production staging directory should create");
+        let staging_dir = staging.path().to_path_buf();
+        let staged_video = staging_dir.join("Episode.mkv");
+        fs::write(&staged_video, "completed-video").expect("completed video should write");
+        let request = build_bilibili_worker_request(
+            &config,
+            "https://www.bilibili.com/video/BV123",
+            None,
+            None,
+            &staging,
+        );
+        let worker_root =
+            RootedFs::new(&staging_dir).expect("worker should bind the staging directory");
+
+        persist_bilibili_worker_completion(&worker_root, &request)
+            .expect("worker completion marker should persist");
+        assert!(
+            !staging.preserve_on_drop.load(Ordering::Acquire),
+            "the parent-side retention flag should still model the cancellation window"
+        );
+        drop(worker_root);
+        drop(staging);
+
+        assert_eq!(
+            fs::read_to_string(&staged_video).expect("completed media should survive cancellation"),
             "completed-video"
         );
         assert!(staging_dir.is_dir());
