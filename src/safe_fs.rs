@@ -576,34 +576,6 @@ impl RootedFs {
         })
     }
 
-    pub(crate) fn open_or_create_bound_file(&self, path: &Path, mode: u16) -> Result<BoundFile> {
-        let entry = self.bind_entry(path, false)?;
-        let fd = rustix::fs::openat(
-            entry.parent.fd.as_ref(),
-            &entry.leaf,
-            OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::from_raw_mode(mode),
-        )
-        .map_err(errno_to_io)
-        .with_context(|| format!("failed to open bound file {}", path.display()))?;
-        let identity = identity_for_fd(&fd)?;
-        if !identity.is_file() {
-            bail!("bound path is not a regular file: {}", path.display());
-        }
-        if identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(identity) {
-            bail!(
-                "bound file identity changed while opening: {}",
-                path.display()
-            );
-        }
-        self.validate_parent(&entry.parent)?;
-        sync_directory(entry.parent.fd.as_ref())?;
-        Ok(BoundFile {
-            fd: Arc::new(fd),
-            identity,
-        })
-    }
-
     pub(crate) fn create_new_bound_file(
         &self,
         path: &Path,

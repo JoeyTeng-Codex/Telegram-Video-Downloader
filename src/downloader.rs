@@ -4622,8 +4622,6 @@ impl Drop for VideoRecoveryState {
 fn video_output_lock_file(root: &RootedFs) -> Result<BoundFile> {
     // Protected property: every process must flock the same inode. The authenticated control
     // directory keeps that inode alive if the legacy root-level path is unlinked.
-    let control_path = root.logical_root_path().join(VIDEO_CONTROL_DIR_NAME);
-    let control_preexisted = root.entry_identity(&control_path)?.is_some();
     let control = video_control_directory(root)?;
     root.validate_private_bound_directory(&control.entry, control.identity, 0o700)?;
 
@@ -4631,24 +4629,8 @@ fn video_output_lock_file(root: &RootedFs) -> Result<BoundFile> {
     let anchor_path = control.path.join(VIDEO_OUTPUT_LOCK_ANCHOR_FILE_NAME);
     let legacy_entry = root.bind_entry(&legacy_path, false)?;
     let anchor_entry = root.bind_entry(&anchor_path, false)?;
-    let mut legacy_identity = root.bound_entry_identity(&legacy_entry)?;
-    let mut anchor_identity = root.bound_entry_identity(&anchor_entry)?;
-
-    if legacy_identity.is_none() && anchor_identity.is_none() {
-        if control_preexisted {
-            bail!(
-                "cross-process video output lock anchor disappeared from initialized control directory"
-            );
-        }
-        let created = root
-            .open_or_create_bound_file(&anchor_path, 0o600)
-            .context("failed to initialize the cross-process video output lock anchor")?;
-        anchor_identity = root.bound_entry_identity(&anchor_entry)?;
-        legacy_identity = root.bound_entry_identity(&legacy_entry)?;
-        if anchor_identity != Some(created.identity()) {
-            bail!("cross-process video output lock anchor changed during initialization");
-        }
-    }
+    let legacy_identity = root.bound_entry_identity(&legacy_entry)?;
+    let anchor_identity = root.bound_entry_identity(&anchor_entry)?;
 
     let expected = match (anchor_identity, legacy_identity) {
         (Some(anchor), Some(legacy)) if anchor == legacy => anchor,
@@ -4685,7 +4667,9 @@ fn video_output_lock_file(root: &RootedFs) -> Result<BoundFile> {
             )?;
             legacy
         }
-        (None, None) => bail!("cross-process video output lock disappeared during initialization"),
+        (None, None) => bail!(
+            "cross-process video output lock anchor disappeared from initialized control directory"
+        ),
     };
 
     let file = root
@@ -4743,6 +4727,22 @@ fn install_video_control_directory(root: &RootedFs, path: &Path) -> Result<()> {
                 0o600,
             )
             .context("failed to create video control ownership record")
+        {
+            let cleanup = root.remove_bound_tree_if_identity(&entry, identity);
+            return match cleanup {
+                Ok(()) => Err(err),
+                Err(cleanup) => Err(err.context(format!(
+                    "failed to clean video control initialization directory: {cleanup:#}"
+                ))),
+            };
+        }
+        if let Err(err) = root
+            .create_new_bound_file(
+                &candidate.join(VIDEO_OUTPUT_LOCK_ANCHOR_FILE_NAME),
+                b"",
+                0o600,
+            )
+            .context("failed to create video output lock anchor")
         {
             let cleanup = root.remove_bound_tree_if_identity(&entry, identity);
             return match cleanup {
@@ -17901,7 +17901,6 @@ mv video.original video.m4s || exit 46
             existing_videos: vec![existing.clone()],
         };
         let root = RootedFs::new(&video_dir).expect("output root should bind");
-        drop(video_output_lock_file(&root).expect("crashed owner lock should initialize"));
         let duplicate =
             bind_test_overwrite_confirmation(&root, VideoDuplicateAction::Overwrite, &duplicate)
                 .expect("overwrite confirmation should bind");
@@ -17966,7 +17965,6 @@ mv video.original video.m4s || exit 46
         let unresolved = nested.join(format!("{OVERWRITE_BACKUP_DIR_PREFIX}-legacy"));
         fs::create_dir_all(&unresolved).expect("legacy recovery directory should create");
         let root = RootedFs::new(&video_dir).expect("output root should bind");
-        drop(video_output_lock_file(&root).expect("previous owner lock should initialize"));
         video_recovery_state_file(&root)
             .expect("recovery state should open")
             .0
@@ -18027,6 +18025,13 @@ mv video.original video.m4s || exit 46
 
         assert_eq!(control.path, video_dir.join(VIDEO_CONTROL_DIR_NAME));
         assert!(control.path.join(VIDEO_CONTROL_OWNER_FILE_NAME).is_file());
+        let anchor = root
+            .open_bound_file(&control.path.join(VIDEO_OUTPUT_LOCK_ANCHOR_FILE_NAME))
+            .expect("published lock anchor should open")
+            .expect("published control directory should contain its lock anchor");
+        anchor
+            .validate_private_single_link(0o600)
+            .expect("unpublished lock anchor should be private and unique");
         assert_eq!(
             fs::read_to_string(stale.join("partial")).unwrap(),
             "interrupted"
