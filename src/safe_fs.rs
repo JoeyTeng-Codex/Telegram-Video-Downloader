@@ -114,6 +114,34 @@ struct PrivateRemoveQuarantine {
     manifest_identity: EntryIdentity,
 }
 
+#[derive(Clone, Copy)]
+enum PostQuarantineFailure {
+    Retain,
+    Restore,
+}
+
+#[derive(Clone, Copy)]
+struct RemoveQuarantinePolicy {
+    recursive: bool,
+    post_failure: PostQuarantineFailure,
+}
+
+impl RemoveQuarantinePolicy {
+    fn retain(recursive: bool) -> Self {
+        Self {
+            recursive,
+            post_failure: PostQuarantineFailure::Retain,
+        }
+    }
+
+    fn restore_file() -> Self {
+        Self {
+            recursive: false,
+            post_failure: PostQuarantineFailure::Restore,
+        }
+    }
+}
+
 impl std::fmt::Debug for BoundFile {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -756,6 +784,25 @@ impl RootedFs {
         self.remove_bound_entry_if_identity(entry, expected, AtFlags::empty())
     }
 
+    pub(crate) fn remove_bound_file_if_identity_with_validation<F>(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+        validate_quarantined_identity: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        self.remove_bound_entry_if_identity_with_hooks(
+            entry,
+            expected,
+            AtFlags::empty(),
+            RemoveQuarantinePolicy::restore_file(),
+            || {},
+            validate_quarantined_identity,
+        )
+    }
+
     pub(crate) fn remove_bound_dir_if_identity(
         &self,
         entry: &BoundEntry,
@@ -806,7 +853,7 @@ impl RootedFs {
             entry,
             expected,
             AtFlags::REMOVEDIR,
-            true,
+            RemoveQuarantinePolicy::retain(true),
             || {},
             || Ok(()),
         )
@@ -985,7 +1032,7 @@ impl RootedFs {
             entry,
             expected,
             flags,
-            false,
+            RemoveQuarantinePolicy::retain(false),
             || {},
             || Ok(()),
         )
@@ -1006,7 +1053,7 @@ impl RootedFs {
             entry,
             expected,
             flags,
-            false,
+            RemoveQuarantinePolicy::retain(false),
             before_quarantine_move,
             || Ok(()),
         )
@@ -1017,7 +1064,7 @@ impl RootedFs {
         entry: &BoundEntry,
         expected: EntryIdentity,
         flags: AtFlags,
-        recursive: bool,
+        policy: RemoveQuarantinePolicy,
         before_quarantine_move: F,
         after_quarantine_move: G,
     ) -> Result<()>
@@ -1044,7 +1091,7 @@ impl RootedFs {
                 entry.path.display()
             );
         }
-        if recursive && !removes_directory {
+        if policy.recursive && !removes_directory {
             bail!(
                 "recursive owned-path removal requires a directory: {}",
                 entry.path.display()
@@ -1057,7 +1104,8 @@ impl RootedFs {
             );
         }
 
-        let quarantine = create_private_remove_quarantine(&entry.parent, expected, recursive)?;
+        let quarantine =
+            create_private_remove_quarantine(&entry.parent, expected, policy.recursive)?;
         let quarantine_path = entry
             .path
             .parent()
@@ -1112,19 +1160,44 @@ impl RootedFs {
             );
         }
 
-        after_quarantine_move().with_context(|| {
-            format!(
-                "interrupted after quarantining owned bound path; retained quarantine {}",
-                quarantine_path.display()
-            )
-        })?;
+        if let Err(validation_error) = after_quarantine_move() {
+            let validation_error = validation_error.context(format!(
+                "bound path removal validation rejected {}",
+                entry.path.display()
+            ));
+            match policy.post_failure {
+                PostQuarantineFailure::Retain => {
+                    return Err(validation_error.context(format!(
+                        "interrupted after quarantining owned bound path; retained quarantine {}",
+                        quarantine_path.display()
+                    )));
+                }
+                PostQuarantineFailure::Restore => {
+                    let restore = renameat_noreplace(
+                        &quarantine.directory,
+                        quarantined_leaf,
+                        entry.parent.fd.as_ref(),
+                        &entry.leaf,
+                    )
+                    .and_then(|()| sync_directory(&quarantine.directory))
+                    .and_then(|()| sync_directory(entry.parent.fd.as_ref()))
+                    .and_then(|()| remove_private_remove_quarantine(&entry.parent, &quarantine))
+                    .and_then(|()| self.validate_bound_parent(&entry.parent));
+                    return Err(with_cleanup_error(
+                        validation_error,
+                        restore,
+                        "validated bound-path removal rollback",
+                    ));
+                }
+            }
+        }
 
         remove_quarantined_entry(
             &quarantine.directory,
             quarantined_leaf,
             expected,
             flags,
-            recursive,
+            policy.recursive,
             &quarantine_path,
         )?;
         sync_directory(&quarantine.directory)?;
@@ -1165,7 +1238,7 @@ impl RootedFs {
             entry,
             expected,
             AtFlags::empty(),
-            false,
+            RemoveQuarantinePolicy::retain(false),
             || {},
             after_quarantine_move,
         )
@@ -2797,6 +2870,39 @@ mod tests {
         );
         assert_eq!(fs::read(&owned_path).unwrap(), b"replacement");
         assert_eq!(fs::read(&retained_path).unwrap(), b"owned");
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(REMOVE_QUARANTINE_PREFIX)
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validated_removal_restores_the_quarantined_object_on_rejection() {
+        let root = temp_dir("bound-remove-validation-rollback");
+        fs::create_dir_all(&root).expect("root should create");
+        let owned_path = root.join("owned.txt");
+        fs::write(&owned_path, b"owned").expect("owned file should write");
+        let rooted = RootedFs::new(&root).expect("root should bind");
+        let entry = rooted
+            .bind_entry(&owned_path, false)
+            .expect("owned file should bind");
+        let expected = rooted
+            .bound_entry_identity(&entry)
+            .expect("owned identity should read")
+            .expect("owned file should exist");
+
+        let error = rooted
+            .remove_bound_file_if_identity_with_validation(&entry, expected, || {
+                bail!("active credential identity appeared")
+            })
+            .expect_err("rejected removal must restore its selected object");
+
+        assert!(format!("{error:#}").contains("active credential identity appeared"));
+        assert_eq!(fs::read(&owned_path).unwrap(), b"owned");
         assert!(fs::read_dir(&root).unwrap().all(|entry| {
             !entry
                 .unwrap()

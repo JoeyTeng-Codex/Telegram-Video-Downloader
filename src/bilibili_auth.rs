@@ -21,6 +21,8 @@ use rustix::fs::{CWD, FlockOperation, RenameFlags};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::safe_fs::{BoundEntry, BoundFile, EntryIdentity, RootedFs};
+
 const USER_AGENT_VALUE: &str = "Mozilla/5.0";
 const QRCODE_GENERATE_URL: &str =
     "https://passport.bilibili.com/x/passport-login/web/qrcode/generate";
@@ -1597,12 +1599,112 @@ fn write_private_bytes(path: &Path, content: &[u8], label: &str) -> Result<()> {
     Ok(())
 }
 
-fn remove_file_if_exists(path: &Path) -> Result<bool> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err).with_context(|| format!("failed to delete {}", path.display())),
+struct BoundCleanupTarget {
+    root: RootedFs,
+    entry: BoundEntry,
+    file: BoundFile,
+}
+
+impl BoundCleanupTarget {
+    fn identity(&self) -> EntryIdentity {
+        self.file.identity()
     }
+}
+
+fn remove_cleanup_file_if_exists(path: &Path, credential_file: &Path) -> Result<bool> {
+    remove_cleanup_file_if_exists_with_hook(path, credential_file, || Ok(()))
+}
+
+fn remove_cleanup_file_if_exists_with_hook<F>(
+    path: &Path,
+    credential_file: &Path,
+    after_quarantine_move: F,
+) -> Result<bool>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let Some(target) = bind_cleanup_target(path)? else {
+        return Ok(false);
+    };
+    // Protected property: never unlink the object selected by the active credential path. Hold
+    // the initial object identity, then rebind the credential after the target is quarantined so
+    // a namespace replacement either rejects and restores the target or fails closed.
+    let initial_credential = bind_cleanup_target(credential_file)?;
+    ensure_cleanup_identity_is_not_credential(
+        path,
+        target.identity(),
+        initial_credential
+            .as_ref()
+            .map(BoundCleanupTarget::identity),
+    )?;
+
+    let expected = target.identity();
+    target
+        .root
+        .remove_bound_file_if_identity_with_validation(&target.entry, expected, || {
+            after_quarantine_move()?;
+            let current_credential = bind_cleanup_target(credential_file)?;
+            ensure_cleanup_identity_is_not_credential(
+                path,
+                expected,
+                current_credential
+                    .as_ref()
+                    .map(BoundCleanupTarget::identity),
+            )
+        })
+        .with_context(|| format!("failed to delete legacy auth file {}", path.display()))?;
+    Ok(true)
+}
+
+fn bind_cleanup_target(path: &Path) -> Result<Option<BoundCleanupTarget>> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve the current directory for auth cleanup")?
+            .join(path)
+    };
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to inspect Bilibili auth cleanup path {}",
+                    path.display()
+                )
+            });
+        }
+    }
+
+    let parent = path
+        .parent()
+        .context("Bilibili auth cleanup path has no parent")?;
+    let root = RootedFs::new(parent).with_context(|| {
+        format!(
+            "failed to bind Bilibili auth cleanup directory {}",
+            parent.display()
+        )
+    })?;
+    let Some(file) = root.open_bound_file(&path)? else {
+        return Ok(None);
+    };
+    let entry = root.bind_entry(&path, false)?;
+    Ok(Some(BoundCleanupTarget { root, entry, file }))
+}
+
+fn ensure_cleanup_identity_is_not_credential(
+    path: &Path,
+    target: EntryIdentity,
+    credential: Option<EntryIdentity>,
+) -> Result<()> {
+    if credential == Some(target) {
+        bail!(
+            "legacy Bilibili auth cleanup target aliases the active credential file: {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn cleanup_stale_bbdown_config_files_unlocked(path: &Path, credential_file: &Path) -> Result<bool> {
@@ -1631,81 +1733,21 @@ fn cleanup_stale_bbdown_config_files_unlocked(path: &Path, credential_file: &Pat
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => return Err(err.into()),
         }
-        ensure_cleanup_target_is_not_credential(&path, credential_file)?;
-        match fs::remove_file(&path) {
-            Ok(()) => removed = true,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "failed to delete stale BBDown auth config {}",
-                        path.display()
-                    )
-                });
-            }
+        if remove_cleanup_file_if_exists(&path, credential_file).with_context(|| {
+            format!(
+                "failed to delete stale BBDown auth config {}",
+                path.display()
+            )
+        })? {
+            removed = true;
         }
     }
-    ensure_cleanup_target_is_not_credential(&config_dir, credential_file)?;
     let _ = fs::remove_dir(&config_dir);
     Ok(removed)
 }
 
 fn remove_legacy_file_if_exists(path: &Path, credential_file: &Path) -> Result<bool> {
-    ensure_cleanup_target_is_not_credential(path, credential_file)?;
-    remove_file_if_exists(path)
-}
-
-fn ensure_cleanup_target_is_not_credential(path: &Path, credential_file: &Path) -> Result<()> {
-    let target = metadata_if_present_for_cleanup(path)?;
-    let credential = metadata_if_present_for_cleanup(credential_file)?;
-    let (Some(target), Some(credential)) = (target, credential) else {
-        return Ok(());
-    };
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-
-        if target.dev() == credential.dev() && target.ino() == credential.ino() {
-            bail!(
-                "legacy Bilibili auth cleanup target aliases the active credential file: {}",
-                path.display()
-            );
-        }
-    }
-
-    #[cfg(not(unix))]
-    if fs::canonicalize(path).with_context(|| {
-        format!(
-            "failed to resolve legacy auth cleanup target {}",
-            path.display()
-        )
-    })? == fs::canonicalize(credential_file).with_context(|| {
-        format!(
-            "failed to resolve active BBDown credential file {}",
-            credential_file.display()
-        )
-    })? {
-        bail!(
-            "legacy Bilibili auth cleanup target aliases the active credential file: {}",
-            path.display()
-        );
-    }
-
-    Ok(())
-}
-
-fn metadata_if_present_for_cleanup(path: &Path) -> Result<Option<fs::Metadata>> {
-    match fs::metadata(path) {
-        Ok(metadata) => Ok(Some(metadata)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err).with_context(|| {
-            format!(
-                "failed to inspect Bilibili auth cleanup path {}",
-                path.display()
-            )
-        }),
-    }
+    remove_cleanup_file_if_exists(path, credential_file)
 }
 
 fn active_bbdown_config_files() -> &'static Mutex<HashSet<PathBuf>> {
@@ -2027,6 +2069,58 @@ mod tests {
         if let Some(parent) = state_path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_restores_a_target_that_becomes_the_active_credential() {
+        use std::os::unix::fs::MetadataExt;
+
+        let state_path = temp_state_file("cleanup-credential-namespace-swap");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        fs::create_dir_all(&root).expect("auth directory should create");
+        let cleanup_target = root.join("legacy-state.json");
+        let credential_file = root.join("credentials.json");
+        let credential_candidate = root.join("new-credentials.json");
+        fs::write(&cleanup_target, b"newly-saved-credentials")
+            .expect("cleanup target should write");
+        fs::hard_link(&cleanup_target, &credential_candidate)
+            .expect("credential candidate hard link should create");
+        fs::write(&credential_file, b"old-credentials").expect("old credential should write");
+
+        let error =
+            remove_cleanup_file_if_exists_with_hook(&cleanup_target, &credential_file, || {
+                fs::remove_file(&credential_file).context("failed to remove old credential")?;
+                fs::rename(&credential_candidate, &credential_file)
+                    .context("failed to install raced credential")?;
+                Ok(())
+            })
+            .expect_err("cleanup must restore an object selected as the active credential");
+
+        assert!(format!("{error:#}").contains("aliases the active credential file"));
+        assert_eq!(
+            fs::read(&credential_file).unwrap(),
+            b"newly-saved-credentials"
+        );
+        assert_eq!(
+            fs::read(&cleanup_target).unwrap(),
+            b"newly-saved-credentials"
+        );
+        let credential_metadata = fs::metadata(&credential_file).unwrap();
+        let cleanup_metadata = fs::metadata(&cleanup_target).unwrap();
+        assert_eq!(credential_metadata.dev(), cleanup_metadata.dev());
+        assert_eq!(credential_metadata.ino(), cleanup_metadata.ino());
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".telegram-video-downloader-remove")
+        }));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(target_os = "macos")]
