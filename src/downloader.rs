@@ -4043,7 +4043,7 @@ struct StagedPublicationManifest {
     steps: Vec<StagedPublicationStep>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StagedPublicationOverwrite {
     transaction_path: PathBuf,
@@ -4417,7 +4417,11 @@ async fn video_output_lock(
         let quarantine_recovery = root.reconcile_remove_quarantines_with_status()?;
         let staging_recovery = recover_pending_video_staging_directories_locked(&root)?;
         let mux_recovery = recover_pending_bilibili_mux_transactions_locked(&root, video_dir)?;
-        let overwrite_recovery = recover_pending_overwrite_transactions_locked(&root, video_dir)?;
+        let overwrite_recovery = recover_pending_overwrite_transactions_locked(
+            &root,
+            video_dir,
+            &staging_recovery.blocked_overwrites,
+        )?;
         unresolved_recovery = quarantine_recovery.unresolved
             || staging_recovery.unresolved
             || mux_recovery.unresolved
@@ -6331,6 +6335,13 @@ fn validate_video_staging_directory(
 struct VideoStagingRecoveryReport {
     messages: Vec<String>,
     unresolved: bool,
+    blocked_overwrites: BTreeSet<StagedPublicationOverwrite>,
+}
+
+#[derive(Debug)]
+struct VideoStagingRecoveryFailure {
+    error: anyhow::Error,
+    overwrite: Option<StagedPublicationOverwrite>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6339,9 +6350,41 @@ enum StagedPublicationDirection {
     RollBack,
 }
 
+#[derive(Debug)]
+struct IncompleteMoveRollback {
+    error: anyhow::Error,
+    rollback_error: anyhow::Error,
+}
+
+impl std::fmt::Display for IncompleteMoveRollback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{:#}; staged-file rollback failed: {:#}",
+            self.error, self.rollback_error
+        )
+    }
+}
+
+impl std::error::Error for IncompleteMoveRollback {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+
 fn recover_pending_video_staging_directories_locked(
     root: &RootedFs,
 ) -> Result<VideoStagingRecoveryReport> {
+    recover_pending_video_staging_directories_locked_with_hook(root, &mut |_, _| Ok(()))
+}
+
+fn recover_pending_video_staging_directories_locked_with_hook<F>(
+    root: &RootedFs,
+    hook: &mut F,
+) -> Result<VideoStagingRecoveryReport>
+where
+    F: FnMut(StagedPublicationDirection, &StagedPublicationStep) -> Result<()>,
+{
     let parent_path = root.logical_root_path().join(VIDEO_STAGING_DIR_NAME);
     let Some(parent_identity) = root.entry_identity(&parent_path)? else {
         return Ok(VideoStagingRecoveryReport::default());
@@ -6371,17 +6414,22 @@ fn recover_pending_video_staging_directories_locked(
             continue;
         }
         match validate_video_staging_directory(root, &path, identity) {
-            Ok(entry) => match recover_owned_video_staging_directory(root, &path, &entry, identity)
-            {
-                Ok(message) => report.messages.push(message),
-                Err(err) => {
-                    report.unresolved = true;
-                    report.messages.push(format!(
-                        "Retained unresolved staged video job {}: {err:#}",
-                        path.display()
-                    ));
+            Ok(entry) => {
+                match recover_owned_video_staging_directory(root, &path, &entry, identity, hook) {
+                    Ok(message) => report.messages.push(message),
+                    Err(failure) => {
+                        report.unresolved = true;
+                        if let Some(overwrite) = failure.overwrite {
+                            report.blocked_overwrites.insert(overwrite);
+                        }
+                        report.messages.push(format!(
+                            "Retained unresolved staged video job {}: {:#}",
+                            path.display(),
+                            failure.error
+                        ));
+                    }
                 }
-            },
+            }
             Err(err) => {
                 report.unresolved = true;
                 report.messages.push(format!(
@@ -6394,49 +6442,58 @@ fn recover_pending_video_staging_directories_locked(
     Ok(report)
 }
 
-fn recover_owned_video_staging_directory(
+fn recover_owned_video_staging_directory<F>(
     root: &RootedFs,
     path: &Path,
     entry: &BoundEntry,
     identity: EntryIdentity,
-) -> Result<String> {
-    let manifest_path = path.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME);
-    let Some(manifest_file) = root.open_bound_file(&manifest_path)? else {
+    hook: &mut F,
+) -> std::result::Result<String, VideoStagingRecoveryFailure>
+where
+    F: FnMut(StagedPublicationDirection, &StagedPublicationStep) -> Result<()>,
+{
+    let mut overwrite = None;
+    let result = (|| -> Result<String> {
+        let manifest_path = path.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME);
+        let Some(manifest_file) = root.open_bound_file(&manifest_path)? else {
+            root.remove_bound_tree_durably_if_identity(entry, identity)?;
+            return Ok(format!(
+                "Discarded interrupted staged video job: {}",
+                path.display()
+            ));
+        };
+        manifest_file.validate_private_single_link(0o600)?;
+        let manifest: StagedPublicationManifest = serde_json::from_slice(
+            &manifest_file.read_limited(VIDEO_STAGING_PUBLICATION_MANIFEST_LIMIT)?,
+        )
+        .context("failed to parse staged publication manifest")?;
+        validate_staged_publication_manifest(root, path, identity, &manifest)?;
+        overwrite = manifest.overwrite.clone();
+        let direction = staged_publication_direction(root, manifest.overwrite.as_ref())?;
+        match direction {
+            StagedPublicationDirection::RollForward => {
+                for step in &manifest.steps {
+                    recover_staged_publication_step(root, step, direction, hook)?;
+                }
+            }
+            StagedPublicationDirection::RollBack => {
+                for step in manifest.steps.iter().rev() {
+                    recover_staged_publication_step(root, step, direction, hook)?;
+                }
+            }
+        }
+        validate_video_staging_directory(root, path, identity)?;
         root.remove_bound_tree_durably_if_identity(entry, identity)?;
-        return Ok(format!(
-            "Discarded interrupted staged video job: {}",
+        let action = match direction {
+            StagedPublicationDirection::RollForward => "Rolled forward",
+            StagedPublicationDirection::RollBack => "Rolled back",
+        };
+        Ok(format!(
+            "{action} interrupted staged video publication: {}",
             path.display()
-        ));
-    };
-    manifest_file.validate_private_single_link(0o600)?;
-    let manifest: StagedPublicationManifest = serde_json::from_slice(
-        &manifest_file.read_limited(VIDEO_STAGING_PUBLICATION_MANIFEST_LIMIT)?,
-    )
-    .context("failed to parse staged publication manifest")?;
-    validate_staged_publication_manifest(root, path, identity, &manifest)?;
-    let direction = staged_publication_direction(root, manifest.overwrite.as_ref())?;
-    match direction {
-        StagedPublicationDirection::RollForward => {
-            for step in &manifest.steps {
-                recover_staged_publication_step(root, step, direction)?;
-            }
-        }
-        StagedPublicationDirection::RollBack => {
-            for step in manifest.steps.iter().rev() {
-                recover_staged_publication_step(root, step, direction)?;
-            }
-        }
-    }
-    validate_video_staging_directory(root, path, identity)?;
-    root.remove_bound_tree_durably_if_identity(entry, identity)?;
-    let action = match direction {
-        StagedPublicationDirection::RollForward => "Rolled forward",
-        StagedPublicationDirection::RollBack => "Rolled back",
-    };
-    Ok(format!(
-        "{action} interrupted staged video publication: {}",
-        path.display()
-    ))
+        ))
+    })();
+    result.map_err(|error| VideoStagingRecoveryFailure { error, overwrite })
 }
 
 fn validate_staged_publication_manifest(
@@ -6519,11 +6576,15 @@ fn staged_publication_direction(
     })
 }
 
-fn recover_staged_publication_step(
+fn recover_staged_publication_step<F>(
     root: &RootedFs,
     step: &StagedPublicationStep,
     direction: StagedPublicationDirection,
-) -> Result<()> {
+    hook: &mut F,
+) -> Result<()>
+where
+    F: FnMut(StagedPublicationDirection, &StagedPublicationStep) -> Result<()>,
+{
     let source = root.logical_root_path().join(&step.source_path);
     let destination = root.logical_root_path().join(&step.destination_path);
     let (from, to) = match direction {
@@ -6532,14 +6593,14 @@ fn recover_staged_publication_step(
     };
     let from_identity = publication_step_identity(root, from, step)?;
     let to_identity = publication_step_identity(root, to, step)?;
-    let identity = match (from_identity, to_identity) {
+    let (identity, moved) = match (from_identity, to_identity) {
         (Some(identity), None) => {
             let from_entry = root.bind_entry(from, false)?;
             let to_entry = root.bind_entry(to, true)?;
             root.rename_via_bound_parents_noreplace_if_identity(&from_entry, &to_entry, identity)?;
-            identity
+            (identity, true)
         }
-        (None, Some(identity)) => identity,
+        (None, Some(identity)) => (identity, false),
         (Some(_), Some(_)) => bail!(
             "staged publication object exists at both recovery paths: {} and {}",
             from.display(),
@@ -6551,6 +6612,9 @@ fn recover_staged_publication_step(
             to.display()
         ),
     };
+    if moved {
+        hook(direction, step)?;
+    }
     let file = root
         .open_bound_file(to)?
         .with_context(|| format!("recovered publication file is missing: {}", to.display()))?;
@@ -7056,16 +7120,16 @@ fn acquire_and_validate_overwrite_target(
         Some(confirmed_target_identity),
         &mut acquired,
     ) {
-        return Err(rollback_acquired_overwrite(err, acquired));
+        return Err(rollback_acquired_overwrite(err, acquired, None));
     }
     for artifact in artifacts {
         if let Err(err) = acquire_overwrite_path(root, &artifact, false, None, &mut acquired) {
-            return Err(rollback_acquired_overwrite(err, acquired));
+            return Err(rollback_acquired_overwrite(err, acquired, None));
         }
     }
 
     if let Err(err) = validate_acquired_overwrite(root, duplicate, primary_media_kind, &acquired) {
-        return Err(rollback_acquired_overwrite(err, acquired));
+        return Err(rollback_acquired_overwrite(err, acquired, None));
     }
     Ok(acquired)
 }
@@ -7609,11 +7673,42 @@ fn is_identity_metadata_path(path: &Path) -> bool {
     identity_metadata_kind(path).is_some()
 }
 
-fn rollback_acquired_overwrite(error: anyhow::Error, acquired: AcquiredOverwrite) -> anyhow::Error {
+fn rollback_acquired_overwrite(
+    error: anyhow::Error,
+    acquired: AcquiredOverwrite,
+    staging: Option<&BoundStagingDir>,
+) -> anyhow::Error {
+    if incomplete_move_rollback(&error) {
+        if let Some(staging) = staging {
+            staging.preserve_for_recovery();
+        }
+        return error;
+    }
     match acquired.restore() {
         Ok(()) => error,
         Err(restore_error) => {
+            if let Some(staging) = staging {
+                staging.preserve_for_recovery();
+            }
             anyhow!("{error:#}\nfailed to restore acquired overwrite files: {restore_error:#}")
+        }
+    }
+}
+
+fn finish_failed_staged_move(
+    error: anyhow::Error,
+    acquired: Option<AcquiredOverwrite>,
+    staging: Option<&BoundStagingDir>,
+) -> anyhow::Error {
+    match acquired {
+        Some(acquired) => rollback_acquired_overwrite(error, acquired, staging),
+        None => {
+            if incomplete_move_rollback(&error)
+                && let Some(staging) = staging
+            {
+                staging.preserve_for_recovery();
+            }
+            error
         }
     }
 }
@@ -7756,10 +7851,7 @@ fn move_staged_video_files_with_root(
             }
             Ok(moved.moved_videos)
         }
-        Err(err) => Err(match acquisition {
-            Some(acquisition) => rollback_acquired_overwrite(err, acquisition),
-            None => err,
-        }),
+        Err(err) => Err(finish_failed_staged_move(err, acquisition, context.staging)),
     }
 }
 
@@ -7837,7 +7929,7 @@ fn move_staged_artifact_files_with_root(
         Ok(plan) => plan,
         Err(err) => {
             return Err(match acquisition {
-                Some(acquired) => rollback_acquired_overwrite(err, acquired),
+                Some(acquired) => rollback_acquired_overwrite(err, acquired, None),
                 None => err,
             });
         }
@@ -7846,7 +7938,7 @@ fn move_staged_artifact_files_with_root(
         && let Err(err) = prepare_staged_publication(root, staging, &mut plan, acquisition.as_ref())
     {
         return Err(match acquisition {
-            Some(acquired) => rollback_acquired_overwrite(err, acquired),
+            Some(acquired) => rollback_acquired_overwrite(err, acquired, context.staging),
             None => err,
         });
     }
@@ -7860,7 +7952,7 @@ fn move_staged_artifact_files_with_root(
             if let Some(mut acquired) = acquisition.take() {
                 if let Err(err) = acquired.restore_unreplaced(&replaced_destinations) {
                     let err = with_move_rollback_error(root, err, &moved);
-                    return Err(rollback_acquired_overwrite(err, acquired));
+                    return Err(rollback_acquired_overwrite(err, acquired, context.staging));
                 }
                 let committed_target = acquired.target.clone();
                 commit_acquired_overwrite(acquired, &moved, &committed_target, context.staging)
@@ -7868,10 +7960,7 @@ fn move_staged_artifact_files_with_root(
             }
             Ok(moved.into_iter().map(|moved| moved.destination).collect())
         }
-        Err(err) => Err(match acquisition {
-            Some(acquired) => rollback_acquired_overwrite(err, acquired),
-            None => err,
-        }),
+        Err(err) => Err(finish_failed_staged_move(err, acquisition, context.staging)),
     }
 }
 
@@ -8222,15 +8311,41 @@ fn execute_move_plan(
     plan: Vec<MoveStep>,
     primary_media_kind: StagedPrimaryMediaKind,
 ) -> Result<MovePlanResult> {
+    execute_move_plan_with_hook(root, plan, primary_media_kind, &mut |_| Ok(()))
+}
+
+fn execute_move_plan_with_hook<F>(
+    root: &RootedFs,
+    plan: Vec<MoveStep>,
+    primary_media_kind: StagedPrimaryMediaKind,
+    hook: &mut F,
+) -> Result<MovePlanResult>
+where
+    F: FnMut(&MovedFile) -> Result<()>,
+{
     let mut moved = Vec::new();
     let mut moved_videos = Vec::new();
     for step in plan {
         match move_step_with_bound_parents(root, step.clone()) {
             Ok(moved_file) => {
-                if is_primary_media_file(&moved_file.destination, primary_media_kind) {
-                    moved_videos.push(moved_file.destination.clone());
-                }
+                let is_primary = is_primary_media_file(&moved_file.destination, primary_media_kind);
                 moved.push(moved_file);
+                if let Err(err) = hook(moved.last().expect("moved file was just pushed")) {
+                    return Err(with_move_rollback_error(
+                        root,
+                        err.context("staged move hook failed after publication"),
+                        &moved,
+                    ));
+                }
+                if is_primary {
+                    moved_videos.push(
+                        moved
+                            .last()
+                            .expect("moved file was just pushed")
+                            .destination
+                            .clone(),
+                    );
+                }
             }
             Err(err) => {
                 let err = err.context(format!(
@@ -8408,10 +8523,15 @@ fn with_move_rollback_error(
 ) -> anyhow::Error {
     match rollback_moves(root, moved) {
         Ok(()) => error,
-        Err(rollback_error) => {
-            anyhow!("{error:#}; staged-file rollback failed: {rollback_error:#}")
-        }
+        Err(rollback_error) => anyhow::Error::new(IncompleteMoveRollback {
+            error,
+            rollback_error,
+        }),
     }
+}
+
+fn incomplete_move_rollback(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<IncompleteMoveRollback>().is_some()
 }
 
 fn require_entry_identity(
@@ -8762,7 +8882,11 @@ pub fn recover_pending_overwrite_transactions(video_dir: &Path) -> Result<Vec<St
     let quarantine_recovery = root.reconcile_remove_quarantines_with_status()?;
     let staging_recovery = recover_pending_video_staging_directories_locked(&root)?;
     let mux_recovery = recover_pending_bilibili_mux_transactions_locked(&root, video_dir)?;
-    let overwrite_recovery = recover_pending_overwrite_transactions_locked(&root, video_dir)?;
+    let overwrite_recovery = recover_pending_overwrite_transactions_locked(
+        &root,
+        video_dir,
+        &staging_recovery.blocked_overwrites,
+    )?;
     let unresolved = quarantine_recovery.unresolved
         || staging_recovery.unresolved
         || mux_recovery.unresolved
@@ -8785,9 +8909,29 @@ struct OverwriteRecoveryReport {
     unresolved: bool,
 }
 
+fn overwrite_recovery_is_blocked(
+    root: &RootedFs,
+    directory: &Path,
+    blocked: &BTreeSet<StagedPublicationOverwrite>,
+) -> Result<bool> {
+    if blocked.is_empty() {
+        return Ok(false);
+    }
+    let Some(identity) = root.entry_identity(directory)? else {
+        return Ok(false);
+    };
+    let candidate = StagedPublicationOverwrite {
+        transaction_path: publication_relative_path(root, directory)?,
+        transaction_device: identity.device(),
+        transaction_inode: identity.inode(),
+    };
+    Ok(blocked.contains(&candidate))
+}
+
 fn recover_pending_overwrite_transactions_locked(
     root: &RootedFs,
     video_dir: &Path,
+    blocked: &BTreeSet<StagedPublicationOverwrite>,
 ) -> Result<OverwriteRecoveryReport> {
     let mut directories = Vec::new();
     let mut report = OverwriteRecoveryReport::default();
@@ -8802,6 +8946,14 @@ fn recover_pending_overwrite_transactions_locked(
     directories.sort();
 
     for directory in directories {
+        if overwrite_recovery_is_blocked(root, &directory, blocked)? {
+            report.unresolved = true;
+            report.messages.push(format!(
+                "Deferred overwrite transaction referenced by an unresolved staged publication: {}",
+                directory.display()
+            ));
+            continue;
+        }
         let manifest_path = directory.join(OVERWRITE_RECOVERY_MANIFEST_NAME);
         match root.open_bound_file(&manifest_path) {
             Ok(None) => {
@@ -10747,6 +10899,158 @@ mod tests {
             OverwriteCommitCheckpoint::AfterManifestReplace,
             true,
         );
+    }
+
+    #[test]
+    fn incomplete_move_rollback_preserves_staging_for_startup_recovery() {
+        let final_dir = temp_test_dir("staged-publication-incomplete-move-rollback");
+        let root = RootedFs::new(&final_dir).expect("output root should bind");
+        let staging =
+            create_video_staging_dir(&root).expect("production staging directory should create");
+        let staging_dir = staging.path().to_path_buf();
+        let staged_video = staging_dir.join("Episode.mkv");
+        fs::write(&staged_video, "new-video").expect("staged video should write");
+        let mut plan = staged_move_plan(
+            &staging_dir,
+            &final_dir,
+            std::slice::from_ref(&staged_video),
+            None,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("keep-both move plan should build");
+        prepare_staged_publication(&root, &staging, &mut plan, None)
+            .expect("publication manifest should persist");
+        let error =
+            execute_move_plan_with_hook(&root, plan, StagedPrimaryMediaKind::Video, &mut |moved| {
+                fs::write(&moved.source, "rollback-blocker")
+                    .context("failed to install rollback blocker")?;
+                bail!("injected post-publication move failure");
+            })
+            .expect_err("occupied source should make the injected rollback incomplete");
+        assert!(incomplete_move_rollback(&error));
+        let error = finish_failed_staged_move(error, None, Some(&staging));
+        assert!(incomplete_move_rollback(&error));
+        drop(staging);
+        assert!(staging_dir.is_dir());
+        assert!(
+            staging_dir
+                .join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME)
+                .is_file()
+        );
+
+        fs::remove_file(&staged_video).expect("rollback blocker should remove");
+        let report = recover_pending_video_staging_directories_locked(&root)
+            .expect("startup should finish the retained publication");
+
+        assert!(!report.unresolved);
+        assert_eq!(
+            fs::read_to_string(final_dir.join("Episode.mkv")).unwrap(),
+            "new-video"
+        );
+        assert!(!staging_dir.exists());
+        assert!(
+            report.messages.iter().any(|line| {
+                line.contains("Rolled forward interrupted staged video publication")
+            })
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn unresolved_staging_rollback_defers_referenced_overwrite_recovery() {
+        let final_dir = temp_test_dir("staged-publication-deferred-overwrite");
+        let existing = final_dir.join("Episode.mkv");
+        fs::write(&existing, "original-video").expect("existing video should write");
+        write_bilibili_identity_nfo(&existing, "cid123");
+        let root = RootedFs::new(&final_dir).expect("output root should bind");
+        let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        let duplicate =
+            bind_test_overwrite_confirmation(&root, VideoDuplicateAction::Overwrite, &duplicate)
+                .expect("overwrite confirmation should bind");
+        let acquired =
+            acquire_and_validate_overwrite_target(&root, &duplicate, StagedPrimaryMediaKind::Video)
+                .expect("overwrite target should be acquired");
+        let staging =
+            create_video_staging_dir(&root).expect("production staging directory should create");
+        let staging_dir = staging.path().to_path_buf();
+        let staged_video = staging_dir.join("Episode.mkv");
+        fs::write(&staged_video, "replacement-video").expect("replacement should stage");
+        let mut plan = staged_move_plan(
+            &staging_dir,
+            &final_dir,
+            std::slice::from_ref(&staged_video),
+            Some(&existing),
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("overwrite move plan should build");
+        prepare_staged_publication(&root, &staging, &mut plan, Some(&acquired))
+            .expect("publication manifest should persist");
+        execute_move_plan(&root, plan, StagedPrimaryMediaKind::Video)
+            .expect("replacement should publish");
+        staging.preserve_for_recovery();
+        drop(staging);
+        drop(acquired);
+
+        let mut injected = false;
+        let first_staging = recover_pending_video_staging_directories_locked_with_hook(
+            &root,
+            &mut |direction, _| {
+                if !injected && direction == StagedPublicationDirection::RollBack {
+                    injected = true;
+                    bail!("injected failure after rollback rename");
+                }
+                Ok(())
+            },
+        )
+        .expect("failed staging recovery should be reported");
+        assert!(injected);
+        assert!(first_staging.unresolved);
+        assert_eq!(first_staging.blocked_overwrites.len(), 1);
+        assert!(!existing.exists());
+        assert_eq!(
+            fs::read_to_string(&staged_video).unwrap(),
+            "replacement-video"
+        );
+
+        let first_overwrite = recover_pending_overwrite_transactions_locked(
+            &root,
+            &final_dir,
+            &first_staging.blocked_overwrites,
+        )
+        .expect("referenced overwrite scan should defer without failing");
+        assert!(first_overwrite.unresolved);
+        assert!(first_overwrite.messages.iter().any(|line| {
+            line.contains(
+                "Deferred overwrite transaction referenced by an unresolved staged publication",
+            )
+        }));
+        assert_eq!(overwrite_backup_dirs(&final_dir).len(), 1);
+        assert!(!existing.exists());
+
+        let second_staging = recover_pending_video_staging_directories_locked(&root)
+            .expect("staging rollback retry should finish");
+        assert!(!second_staging.unresolved);
+        assert!(second_staging.blocked_overwrites.is_empty());
+        let second_overwrite = recover_pending_overwrite_transactions_locked(
+            &root,
+            &final_dir,
+            &second_staging.blocked_overwrites,
+        )
+        .expect("overwrite recovery should resume after staging resolves");
+
+        assert!(!second_overwrite.unresolved);
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "original-video");
+        assert!(existing.with_extension("nfo").is_file());
+        assert!(!staging_dir.exists());
+        assert!(overwrite_backup_dirs(&final_dir).is_empty());
+        let _ = fs::remove_dir_all(final_dir);
     }
 
     #[test]
