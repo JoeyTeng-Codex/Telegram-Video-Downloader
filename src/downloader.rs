@@ -147,6 +147,13 @@ struct AdditionalInheritedCommandFd {
     target: i32,
 }
 
+#[cfg(unix)]
+#[derive(Debug)]
+struct PreparedCommandFds {
+    inherited: Vec<(OwnedFd, i32)>,
+    targets: BTreeSet<i32>,
+}
+
 #[cfg(not(unix))]
 #[derive(Debug)]
 struct AdditionalInheritedCommandFd;
@@ -4911,12 +4918,13 @@ async fn run_command_with_execution_context_and_additional_fds(
         None
     };
     #[cfg(unix)]
-    let mut inherited_fds = prepare_inherited_command_fds(inherited_files)?;
-    #[cfg(unix)]
-    append_additional_inherited_command_fds(&mut inherited_fds, additional_inherited_fds)?;
+    let PreparedCommandFds {
+        inherited: inherited_fds,
+        targets: inherited_fd_targets,
+    } = prepare_command_inherited_fds(inherited_files, additional_inherited_fds)?;
     #[cfg(unix)]
     let bound_cwd_fd = bound_cwd
-        .map(|directory| prepare_bound_command_cwd_fd(directory, inherited_files.len()))
+        .map(|directory| prepare_bound_command_cwd_fd(directory, &inherited_fd_targets))
         .transpose()?;
     #[cfg(not(unix))]
     if !inherited_files.is_empty()
@@ -5123,36 +5131,59 @@ async fn run_command_with_execution_context_and_additional_fds(
 #[cfg(unix)]
 fn prepare_bound_command_cwd_fd(
     directory: &BoundDirectory,
-    inherited_file_count: usize,
+    targets: &BTreeSet<i32>,
 ) -> Result<OwnedFd> {
-    let inherited_file_count = i32::try_from(inherited_file_count)
-        .context("too many inherited command files for a bound working directory")?;
-    let minimum = BILIBILI_MUX_FD_BASE
-        .checked_add(inherited_file_count.saturating_mul(2))
-        .and_then(|descriptor| descriptor.checked_add(32))
-        .context("too many inherited command files for a bound working directory")?;
-    directory.duplicate_fd_cloexec_at_least(minimum)
+    duplicate_command_fd_avoiding_targets(
+        |minimum| directory.duplicate_fd_cloexec_at_least(minimum),
+        targets,
+    )
 }
 
 #[cfg(unix)]
-fn prepare_inherited_command_fds(files: &[BoundFile]) -> Result<Vec<(OwnedFd, i32)>> {
-    let count = i32::try_from(files.len()).context("too many inherited command files")?;
-    let minimum_source_fd = BILIBILI_MUX_FD_BASE
-        .checked_add(count)
-        .and_then(|descriptor| descriptor.checked_add(16))
-        .context("too many inherited command files")?;
-    files
-        .iter()
-        .enumerate()
-        .map(|(index, file)| {
-            let index = i32::try_from(index).context("too many inherited command files")?;
-            let target = BILIBILI_MUX_FD_BASE
-                .checked_add(index)
-                .context("too many inherited command files")?;
-            let source = file.duplicate_fd_cloexec_at_least(minimum_source_fd)?;
-            Ok((source, target))
-        })
-        .collect()
+fn prepare_command_inherited_fds(
+    files: &[BoundFile],
+    additional: Vec<AdditionalInheritedCommandFd>,
+) -> Result<PreparedCommandFds> {
+    let mut targets = BTreeSet::new();
+    for index in 0..files.len() {
+        let index = i32::try_from(index).context("too many inherited command files")?;
+        let target = BILIBILI_MUX_FD_BASE
+            .checked_add(index)
+            .context("too many inherited command files")?;
+        if !targets.insert(target) {
+            bail!("inherited command descriptor target is duplicated");
+        }
+    }
+    for inherited in &additional {
+        if inherited.target <= libc::STDERR_FILENO || !targets.insert(inherited.target) {
+            bail!("inherited command descriptor target is invalid or duplicated");
+        }
+    }
+
+    let mut inherited_fds = Vec::with_capacity(files.len().saturating_add(additional.len()));
+    for (index, file) in files.iter().enumerate() {
+        let index = i32::try_from(index).context("too many inherited command files")?;
+        let target = BILIBILI_MUX_FD_BASE
+            .checked_add(index)
+            .context("too many inherited command files")?;
+        let source = duplicate_command_fd_avoiding_targets(
+            |minimum| file.duplicate_fd_cloexec_at_least(minimum),
+            &targets,
+        )?;
+        inherited_fds.push((source, target));
+    }
+    for AdditionalInheritedCommandFd { source, target } in additional {
+        let source = if targets.contains(&source.as_raw_fd()) {
+            duplicate_inherited_command_fd_avoiding_targets(&source, &targets)?
+        } else {
+            source
+        };
+        inherited_fds.push((source, target));
+    }
+    Ok(PreparedCommandFds {
+        inherited: inherited_fds,
+        targets,
+    })
 }
 
 #[cfg(unix)]
@@ -5197,41 +5228,30 @@ fn prepare_additional_inherited_command_fd(
 }
 
 #[cfg(unix)]
-fn append_additional_inherited_command_fds(
-    inherited_fds: &mut Vec<(OwnedFd, i32)>,
-    additional: Vec<AdditionalInheritedCommandFd>,
-) -> Result<()> {
-    let mut targets = inherited_fds
-        .iter()
-        .map(|(_, target)| *target)
-        .collect::<BTreeSet<_>>();
-    for AdditionalInheritedCommandFd { target, .. } in &additional {
-        if *target <= libc::STDERR_FILENO || !targets.insert(*target) {
-            bail!("inherited command descriptor target is invalid or duplicated");
-        }
-    }
-    inherited_fds.extend(
-        additional
-            .into_iter()
-            .map(|inherited| (inherited.source, inherited.target)),
-    );
-    for (source, _) in inherited_fds {
-        if targets.contains(&source.as_raw_fd()) {
-            *source = duplicate_inherited_command_fd_avoiding_targets(source, &targets)?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
 fn duplicate_inherited_command_fd_avoiding_targets(
     source: &impl AsFd,
     targets: &BTreeSet<i32>,
 ) -> Result<OwnedFd> {
+    duplicate_command_fd_avoiding_targets(
+        |minimum| {
+            rustix::io::fcntl_dupfd_cloexec(source, minimum)
+                .context("failed to allocate a collision-free inherited command descriptor")
+        },
+        targets,
+    )
+}
+
+#[cfg(unix)]
+fn duplicate_command_fd_avoiding_targets<F>(
+    mut duplicate_at_least: F,
+    targets: &BTreeSet<i32>,
+) -> Result<OwnedFd>
+where
+    F: FnMut(i32) -> Result<OwnedFd>,
+{
     let mut minimum = libc::STDERR_FILENO + 1;
     loop {
-        let duplicate = rustix::io::fcntl_dupfd_cloexec(source, minimum)
-            .context("failed to allocate a collision-free inherited command descriptor")?;
+        let duplicate = duplicate_at_least(minimum)?;
         let descriptor = duplicate.as_raw_fd();
         if !targets.contains(&descriptor) {
             return Ok(duplicate);
@@ -7479,6 +7499,54 @@ struct AcquiredOverwrite {
     target_restored: Option<(BoundEntry, EntryIdentity)>,
 }
 
+#[derive(Clone, Copy)]
+enum StagedOverwriteCommit<'a> {
+    None,
+    ReplacePrimary {
+        acquired: &'a AcquiredOverwrite,
+        primary_media_kind: StagedPrimaryMediaKind,
+    },
+    RestoreTarget {
+        acquired: &'a AcquiredOverwrite,
+    },
+}
+
+impl<'a> StagedOverwriteCommit<'a> {
+    fn acquired(self) -> Option<&'a AcquiredOverwrite> {
+        match self {
+            Self::None => None,
+            Self::ReplacePrimary { acquired, .. } | Self::RestoreTarget { acquired } => {
+                Some(acquired)
+            }
+        }
+    }
+
+    fn preflight(self, plan: &[MoveStep]) -> Result<()> {
+        match self {
+            Self::None => Ok(()),
+            Self::ReplacePrimary {
+                acquired,
+                primary_media_kind,
+            } => {
+                let mut primary_destinations = plan
+                    .iter()
+                    .filter(|step| is_primary_media_file(&step.source, primary_media_kind))
+                    .map(|step| step.destination.as_path());
+                let committed_target = primary_destinations
+                    .next()
+                    .context("overwrite publication has no primary media destination")?;
+                if primary_destinations.next().is_some() {
+                    bail!("overwrite publication has multiple primary media destinations");
+                }
+                preflight_committed_overwrite_manifest(acquired, plan, committed_target, false)
+            }
+            Self::RestoreTarget { acquired } => {
+                preflight_committed_overwrite_manifest(acquired, plan, acquired.target(), true)
+            }
+        }
+    }
+}
+
 impl AcquiredOverwrite {
     fn target(&self) -> &Path {
         &self.target
@@ -7631,7 +7699,7 @@ fn prepare_staged_publication(
     root: &RootedFs,
     staging: &BoundStagingDir,
     plan: &mut [MoveStep],
-    overwrite: Option<&AcquiredOverwrite>,
+    overwrite: StagedOverwriteCommit<'_>,
 ) -> Result<()> {
     prepare_staged_publication_with_limits_and_sync(
         root,
@@ -7656,7 +7724,7 @@ fn prepare_staged_publication_with_limits_and_sync<F>(
     root: &RootedFs,
     staging: &BoundStagingDir,
     plan: &mut [MoveStep],
-    overwrite: Option<&AcquiredOverwrite>,
+    overwrite: StagedOverwriteCommit<'_>,
     max_steps: usize,
     manifest_limit: usize,
     sync_source_directory: &mut F,
@@ -7673,7 +7741,7 @@ where
     let mut destinations = BTreeSet::new();
     let mut source_directories = BTreeSet::new();
     let mut records = Vec::with_capacity(plan.len().min(max_steps.saturating_add(1)));
-    for step in plan {
+    for step in plan.iter_mut() {
         let source_relative = publication_relative_path(root, &step.source)?;
         let destination_relative = publication_relative_path(root, &step.destination)?;
         let staged_relative = step.source.strip_prefix(staging.path()).with_context(|| {
@@ -7726,6 +7794,8 @@ where
         }
     }
 
+    overwrite.preflight(plan)?;
+
     sync_staged_source_directories(root, staging, source_directories, sync_source_directory)?;
     if plan_len > max_steps {
         return Err(retain_oversized_staged_publication(
@@ -7738,6 +7808,7 @@ where
     }
 
     let overwrite = overwrite
+        .acquired()
         .map(|acquired| {
             if acquired.root.root_identity() != root.root_identity() {
                 bail!("overwrite transaction belongs to a different output root");
@@ -8118,6 +8189,84 @@ fn output_directory_identity(root: &RootedFs, path: &Path) -> Result<EntryIdenti
         .context("output transaction parent is missing")
 }
 
+fn preflight_committed_overwrite_manifest(
+    acquired: &AcquiredOverwrite,
+    plan: &[MoveStep],
+    committed_target: &Path,
+    restore_acquired_target: bool,
+) -> Result<()> {
+    let transaction_parent = acquired
+        .recovery
+        .backup_dir
+        .parent()
+        .context("overwrite transaction has no parent")?;
+    let mut identities = BTreeMap::new();
+    for step in plan {
+        if step.destination.parent() != Some(transaction_parent) {
+            continue;
+        }
+        let identity = step.expected_identity.with_context(|| {
+            format!(
+                "staged overwrite source identity is missing: {}",
+                step.source.display()
+            )
+        })?;
+        insert_committed_file_identity(&mut identities, &step.destination, identity)?;
+    }
+    if restore_acquired_target {
+        let target_backup = acquired
+            .backups
+            .iter()
+            .find(|backup| backup.original == acquired.target)
+            .context("acquired overwrite target backup is missing before publication")?;
+        insert_committed_file_identity(
+            &mut identities,
+            &target_backup.original,
+            target_backup.identity,
+        )?;
+    }
+    encoded_committed_overwrite_manifest(acquired, &identities, committed_target).map(|_| ())
+}
+
+fn encoded_committed_overwrite_manifest(
+    acquired: &AcquiredOverwrite,
+    identities: &BTreeMap<PathBuf, EntryIdentity>,
+    committed_target: &Path,
+) -> Result<(OverwriteRecoveryManifest, Vec<u8>)> {
+    let transaction_parent = acquired
+        .recovery
+        .backup_dir
+        .parent()
+        .context("overwrite transaction has no parent")?;
+    if committed_target.parent() != Some(transaction_parent) {
+        bail!(
+            "committed overwrite target is outside the transaction parent: {}",
+            committed_target.display()
+        );
+    }
+    let target_file_name = PathBuf::from(
+        committed_target
+            .file_name()
+            .context("committed overwrite target has no file name")?,
+    );
+    if !identities.contains_key(&target_file_name) {
+        bail!(
+            "overwrite commit did not retain a bound target object: {}",
+            committed_target.display()
+        );
+    }
+    let manifest = overwrite_recovery_manifest(
+        &acquired.root,
+        &acquired.recovery.backup_dir,
+        acquired.recovery.backup_dir_identity,
+        target_file_name,
+        OverwriteRecoveryPhase::Committed,
+        committed_overwrite_file_records(identities),
+    )?;
+    let contents = encode_overwrite_recovery_manifest(&manifest)?;
+    Ok((manifest, contents))
+}
+
 fn persist_committed_overwrite_manifest(
     acquired: &mut AcquiredOverwrite,
     moved: &[MovedFile],
@@ -8165,34 +8314,8 @@ where
         insert_committed_file_identity(&mut identities, entry.path(), *identity)?;
     }
 
-    if committed_target.parent() != Some(transaction_parent) {
-        bail!(
-            "committed overwrite target is outside the transaction parent: {}",
-            committed_target.display()
-        );
-    }
-    let target_file_name = PathBuf::from(
-        committed_target
-            .file_name()
-            .context("committed overwrite target has no file name")?,
-    );
-    if !identities.contains_key(&target_file_name) {
-        bail!(
-            "overwrite commit did not retain a bound target object: {}",
-            committed_target.display()
-        );
-    }
-
-    let committed_files = committed_overwrite_file_records(&identities);
-    let manifest = overwrite_recovery_manifest(
-        &acquired.root,
-        &acquired.recovery.backup_dir,
-        acquired.recovery.backup_dir_identity,
-        target_file_name,
-        OverwriteRecoveryPhase::Committed,
-        committed_files.clone(),
-    )?;
-    let contents = encode_overwrite_recovery_manifest(&manifest)?;
+    let (manifest, contents) =
+        encoded_committed_overwrite_manifest(acquired, &identities, committed_target)?;
 
     let mut files = BTreeMap::new();
     for (file_name, identity) in &identities {
@@ -8220,7 +8343,7 @@ where
         acquired,
         transaction_parent,
         &identities,
-        &committed_files,
+        &manifest.committed_files,
         hook,
     )?;
     let temp_path = acquired
@@ -8752,7 +8875,14 @@ fn move_staged_video_files_inner(
         primary_media_kind,
     )?;
     if let Some(staging) = context.staging {
-        prepare_staged_publication(root, staging, &mut plan, acquisition)?;
+        let overwrite = match acquisition {
+            Some(acquired) => StagedOverwriteCommit::ReplacePrimary {
+                acquired,
+                primary_media_kind,
+            },
+            None => StagedOverwriteCommit::None,
+        };
+        prepare_staged_publication(root, staging, &mut plan, overwrite)?;
     }
     execute_move_plan(root, plan, primary_media_kind)
 }
@@ -8814,7 +8944,15 @@ fn move_staged_artifact_files_with_root(
         }
     };
     if let Some(staging) = context.staging
-        && let Err(err) = prepare_staged_publication(root, staging, &mut plan, acquisition.as_ref())
+        && let Err(err) = prepare_staged_publication(
+            root,
+            staging,
+            &mut plan,
+            match acquisition.as_ref() {
+                Some(acquired) => StagedOverwriteCommit::RestoreTarget { acquired },
+                None => StagedOverwriteCommit::None,
+            },
+        )
     {
         return Err(match acquisition {
             Some(acquired) => rollback_acquired_overwrite(err, acquired, context.staging),
@@ -10790,8 +10928,16 @@ mod tests {
             StagedPrimaryMediaKind::Video,
         )
         .expect("overwrite move plan should build");
-        prepare_staged_publication(&root, &staging, &mut plan, Some(&acquired))
-            .expect("publication manifest should persist");
+        prepare_staged_publication(
+            &root,
+            &staging,
+            &mut plan,
+            StagedOverwriteCommit::ReplacePrimary {
+                acquired: &acquired,
+                primary_media_kind: StagedPrimaryMediaKind::Video,
+            },
+        )
+        .expect("publication manifest should persist");
         let moved = execute_move_plan(&root, plan, StagedPrimaryMediaKind::Video)
             .expect("replacement should publish");
         let committed_target = moved
@@ -11722,7 +11868,7 @@ mod tests {
             StagedPrimaryMediaKind::Video,
         )
         .expect("keep-both move plan should build");
-        prepare_staged_publication(&root, &staging, &mut plan, None)
+        prepare_staged_publication(&root, &staging, &mut plan, StagedOverwriteCommit::None)
             .expect("publication manifest should persist");
         assert_eq!(plan.len(), 2);
         move_step_with_bound_parents(&root, plan[0].clone())
@@ -11780,7 +11926,7 @@ mod tests {
             &root,
             &staging,
             &mut plan,
-            None,
+            StagedOverwriteCommit::None,
             VIDEO_STAGING_PUBLICATION_MAX_STEPS,
             VIDEO_STAGING_PUBLICATION_MANIFEST_LIMIT,
             &mut |path, directory| {
@@ -11879,7 +12025,7 @@ mod tests {
                 &root,
                 &staging,
                 &mut plan,
-                None,
+                StagedOverwriteCommit::None,
                 max_steps,
                 manifest_limit,
                 &mut |_, directory| directory.sync_all(),
@@ -11958,7 +12104,7 @@ mod tests {
             StagedPrimaryMediaKind::Video,
         )
         .expect("keep-both move plan should build");
-        prepare_staged_publication(&root, &staging, &mut plan, None)
+        prepare_staged_publication(&root, &staging, &mut plan, StagedOverwriteCommit::None)
             .expect("publication manifest should persist");
         let error =
             execute_move_plan_with_hook(&root, plan, StagedPrimaryMediaKind::Video, &mut |moved| {
@@ -12030,8 +12176,16 @@ mod tests {
             StagedPrimaryMediaKind::Video,
         )
         .expect("overwrite move plan should build");
-        prepare_staged_publication(&root, &staging, &mut plan, Some(&acquired))
-            .expect("publication manifest should persist");
+        prepare_staged_publication(
+            &root,
+            &staging,
+            &mut plan,
+            StagedOverwriteCommit::ReplacePrimary {
+                acquired: &acquired,
+                primary_media_kind: StagedPrimaryMediaKind::Video,
+            },
+        )
+        .expect("publication manifest should persist");
         execute_move_plan(&root, plan, StagedPrimaryMediaKind::Video)
             .expect("replacement should publish");
         staging.preserve_for_recovery();
@@ -12127,8 +12281,16 @@ mod tests {
             StagedPrimaryMediaKind::Video,
         )
         .expect("overwrite move plan should build");
-        prepare_staged_publication(&root, &staging, &mut plan, Some(&acquired))
-            .expect("overwrite publication manifest should persist");
+        prepare_staged_publication(
+            &root,
+            &staging,
+            &mut plan,
+            StagedOverwriteCommit::ReplacePrimary {
+                acquired: &acquired,
+                primary_media_kind: StagedPrimaryMediaKind::Video,
+            },
+        )
+        .expect("overwrite publication manifest should persist");
         move_step_with_bound_parents(&root, plan[0].clone())
             .expect("replacement publication step should move");
         staging.removed = true;
@@ -14551,7 +14713,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_committed_overwrite_manifest_stays_in_recoverable_acquired_state() {
+    fn oversized_committed_overwrite_manifest_preserves_completed_staging() {
         let final_dir = temp_test_dir("overwrite-oversized-committed-manifest");
         let existing = final_dir.join("Episode.mkv");
         fs::write(&existing, "original-video").expect("existing file should write");
@@ -14568,78 +14730,59 @@ mod tests {
         let duplicate =
             bind_test_overwrite_confirmation(&root, VideoDuplicateAction::Overwrite, &duplicate)
                 .expect("overwrite confirmation should bind");
-        let mut acquired =
-            acquire_and_validate_overwrite_target(&root, &duplicate, StagedPrimaryMediaKind::Video)
-                .expect("overwrite target should be acquired");
-        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-oversized");
-        fs::create_dir_all(&staging_dir).expect("staging directory should create");
-        let mut moved = Vec::new();
+        let staging =
+            create_video_staging_dir(&root).expect("production staging directory should create");
+        staging
+            .retain_for_manual_recovery(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)
+            .expect("completed download marker should persist");
+        let staging_dir = staging.path().to_path_buf();
+        let mut staged_files = Vec::new();
         for index in 0..128 {
             let file_name = if index == 0 {
                 "Episode.mkv".to_string()
             } else {
                 format!("artifact-{index:03}-{}.json", "x".repeat(160))
             };
-            let source = staging_dir.join(&file_name);
-            let destination = final_dir.join(&file_name);
-            fs::write(&source, format!("replacement-{index}"))
+            let staged = staging_dir.join(file_name);
+            fs::write(&staged, format!("replacement-{index}"))
                 .expect("replacement output should stage");
-            moved.push(
-                move_step_with_bound_parents(
-                    &root,
-                    MoveStep {
-                        source,
-                        destination,
-                        expected_identity: None,
-                    },
-                )
-                .expect("replacement output should publish"),
-            );
+            staged_files.push(staged);
         }
 
-        let error = persist_committed_overwrite_manifest(&mut acquired, &moved, &existing)
-            .expect_err("oversized committed recovery state should be rejected");
+        let error = move_staged_video_files_with_root(
+            MoveExecutionContext {
+                root: &root,
+                staging: Some(&staging),
+            },
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::Overwrite,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect_err("oversized committed recovery state should stop before publication");
 
         assert!(
             format!("{error:#}").contains("overwrite recovery manifest exceeds its size limit")
         );
-        let manifest_file = root
-            .open_bound_file(&acquired.recovery.manifest_path)
-            .expect("acquired manifest should open")
-            .expect("acquired manifest should remain");
-        let manifest: OverwriteRecoveryManifest = serde_json::from_slice(
-            &manifest_file
-                .read_limited(OVERWRITE_RECOVERY_MANIFEST_LIMIT)
-                .expect("acquired manifest should remain readable"),
-        )
-        .expect("acquired manifest should parse");
-        assert_eq!(manifest.phase, OverwriteRecoveryPhase::Acquired);
-        assert!(
-            fs::read_dir(&acquired.recovery.backup_dir)
-                .expect("overwrite transaction should read")
-                .filter_map(|entry| entry.ok())
-                .all(|entry| !entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(OVERWRITE_COMMITTED_ANCHOR_PREFIX))
-        );
-
-        for output in &moved {
-            fs::remove_file(&output.destination).expect("uncommitted output should remove");
-        }
-        drop(moved);
-        drop(acquired);
-        let report = recover_pending_overwrite_transactions(&final_dir)
-            .expect("acquired overwrite should recover");
-
         assert_eq!(fs::read_to_string(&existing).unwrap(), "original-video");
         assert!(existing.with_extension("nfo").is_file());
         assert!(overwrite_backup_dirs(&final_dir).is_empty());
+        assert!(staged_files.iter().all(|path| path.is_file()));
         assert!(
-            report
-                .iter()
-                .any(|line| line.contains("Restored interrupted overwrite"))
+            !staging_dir
+                .join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME)
+                .exists()
         );
+        drop(staging);
+        let report = recover_pending_video_staging_directories_locked(&root)
+            .expect("completed oversized overwrite should remain recoverable");
+        assert!(!report.unresolved);
+        assert!(report.messages.iter().any(|line| {
+            line.contains("Retained completed staged video job for manual recovery")
+        }));
+        assert!(staged_files.iter().all(|path| path.is_file()));
         let _ = fs::remove_dir_all(final_dir);
     }
 
@@ -16901,7 +17044,7 @@ mv video.original video.m4s || exit 46
                     return Err(std::io::Error::last_os_error());
                 }
                 let mut limits = limits.assume_init();
-                limits.rlim_cur = limits.rlim_cur.min(256 as libc::rlim_t);
+                limits.rlim_cur = limits.rlim_cur.min(80 as libc::rlim_t);
                 if libc::setrlimit(libc::RLIMIT_NOFILE, &limits) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -16926,16 +17069,30 @@ mv video.original video.m4s || exit 46
         let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) };
         assert_eq!(result, 0, "process file descriptor limit should read");
         let limits = unsafe { limits.assume_init() };
-        assert!(limits.rlim_cur <= 256 as libc::rlim_t);
+        assert!(limits.rlim_cur <= 80 as libc::rlim_t);
 
         let root = temp_test_dir("inherited-worker-low-fd-limit");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+        let staging = create_video_staging_dir(&rooted).expect("bound command cwd should create");
+        let request_path = staging.path().join("request.json");
+        let (_, request_identity) = rooted
+            .create_new_bound_file(&request_path, b"request", 0o600)
+            .expect("inherited request should create");
+        let request_file = rooted
+            .open_bound_file(&request_path)
+            .expect("inherited request should open")
+            .expect("inherited request should exist");
+        assert_eq!(request_file.identity(), request_identity);
         let mut config = test_config();
         config.bot.command_timeout_seconds = 5;
         config.bot.command_idle_timeout_seconds = 5;
         let spec = CommandSpec {
             program: PathBuf::from("/bin/sh"),
-            args: vec!["-c".to_string(), "exit 0".to_string()],
-            cwd: root.clone(),
+            args: vec![
+                "-c".to_string(),
+                "printf '%s\\n' \"$PWD\"; /bin/cat /dev/fd/64".to_string(),
+            ],
+            cwd: staging.path().to_path_buf(),
             activity_dir: None,
             cleanup_paths: Vec::new(),
         };
@@ -16948,8 +17105,8 @@ mv video.original video.m4s || exit 46
         let output = run_command_with_execution_context_and_additional_fds(
             &config,
             &spec,
-            None,
-            &[],
+            Some(&staging.directory),
+            std::slice::from_ref(&request_file),
             vec![inherited],
             None,
             CommandExecutionPolicy::BILIBILI_WORKER,
@@ -16958,6 +17115,13 @@ mv video.original video.m4s || exit 46
         .expect("worker command should start below the low descriptor limit");
 
         assert!(output.status.success());
+        let canonical_staging = fs::canonicalize(staging.path())
+            .expect("bound command cwd should resolve to its canonical path");
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("command output should be UTF-8"),
+            format!("{}\nrequest", canonical_staging.display())
+        );
+        drop(staging);
         let _ = fs::remove_dir_all(root);
     }
 
