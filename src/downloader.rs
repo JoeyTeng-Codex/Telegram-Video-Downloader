@@ -1588,34 +1588,8 @@ impl ReservedMuxOutput {
                 };
             }
         };
-        let file = match root.open_bound_file(&staged_path) {
-            Ok(Some(file)) if file.identity() == identity => file,
-            Ok(Some(_)) => {
-                return Err(with_reserved_mux_cleanup_error(
-                    root,
-                    &staging_dir_entry,
-                    staging_dir_identity,
-                    &staged_entry,
-                    identity,
-                    anyhow!(
-                        "reserved Bilibili mux output identity changed: {}",
-                        staged_path.display()
-                    ),
-                ));
-            }
-            Ok(None) => {
-                return Err(with_reserved_mux_cleanup_error(
-                    root,
-                    &staging_dir_entry,
-                    staging_dir_identity,
-                    &staged_entry,
-                    identity,
-                    anyhow!(
-                        "reserved Bilibili mux output disappeared: {}",
-                        staged_path.display()
-                    ),
-                ));
-            }
+        let file = match root.open_bound_file_read_write_if_identity(&staged_entry, identity) {
+            Ok(file) => file,
             Err(err) => {
                 return Err(with_reserved_mux_cleanup_error(
                     root,
@@ -1667,7 +1641,12 @@ impl ReservedMuxOutput {
         })
     }
 
-    fn command_path(&self) -> &Path {
+    fn bound_file(&self) -> &BoundFile {
+        &self.file
+    }
+
+    #[cfg(test)]
+    fn staged_path(&self) -> &Path {
         self.staged_entry.path()
     }
 
@@ -1679,6 +1658,14 @@ impl ReservedMuxOutput {
     where
         F: FnMut(BilibiliMuxCommitCheckpoint) -> Result<()>,
     {
+        if self.root.entry_identity(self.staging_dir_entry.path())?
+            != Some(self.staging_dir_identity)
+        {
+            bail!(
+                "Bilibili mux staging directory access path changed: {}",
+                self.staging_dir_entry.path().display()
+            );
+        }
         self.file
             .set_mode(0o644)
             .context("failed to set final Bilibili mux output permissions")?;
@@ -2075,7 +2062,7 @@ async fn mux_bilibili_report_media(
             &media_inputs,
             &bound_inputs,
             &entry_dir,
-            output_reservation.command_path(),
+            output_reservation.bound_file(),
         )?;
         let output_result = run_command_with_execution_context(
             config,
@@ -2154,7 +2141,7 @@ fn bilibili_local_mux_command_spec(
     media_inputs: &[BilibiliMediaInput],
     bound_inputs: &[BoundBilibiliMuxInput],
     entry_dir: &Path,
-    output: &Path,
+    output: &BoundFile,
 ) -> Result<BilibiliMuxCommand> {
     if media_inputs.len() != bound_inputs.len()
         || media_inputs
@@ -2169,7 +2156,7 @@ fn bilibili_local_mux_command_spec(
         "-y".to_string(),
         "-nostdin".to_string(),
     ];
-    let (concat_file, inherited_files) = if only_bilibili_flv_segments(media_inputs) {
+    let (concat_file, mut inherited_files) = if only_bilibili_flv_segments(media_inputs) {
         let concat_file = create_bilibili_concat_file(
             root,
             entry_dir,
@@ -2204,12 +2191,19 @@ fn bilibili_local_mux_command_spec(
                 .collect(),
         )
     };
+    let output_index = inherited_files.len();
+    inherited_files.push(output.clone());
+    let output_descriptor = inherited_command_descriptor(output_index)?;
     args.extend([
         "-c".to_string(),
         "copy".to_string(),
         "-movflags".to_string(),
         "+faststart".to_string(),
-        command_path_arg(output),
+        "-f".to_string(),
+        "mp4".to_string(),
+        "-fd".to_string(),
+        output_descriptor.to_string(),
+        "fd:".to_string(),
     ]);
     Ok(BilibiliMuxCommand {
         spec: CommandSpec {
@@ -2340,15 +2334,24 @@ fn ffmpeg_concat_file_list(input_count: usize, inherited_offset: usize) -> Resul
 
 #[cfg(unix)]
 fn inherited_command_path(index: usize) -> Result<String> {
+    Ok(format!("/dev/fd/{}", inherited_command_descriptor(index)?))
+}
+
+#[cfg(unix)]
+fn inherited_command_descriptor(index: usize) -> Result<i32> {
     let index = i32::try_from(index).context("too many inherited Bilibili mux inputs")?;
-    let descriptor = BILIBILI_MUX_FD_BASE
+    BILIBILI_MUX_FD_BASE
         .checked_add(index)
-        .context("too many inherited Bilibili mux inputs")?;
-    Ok(format!("/dev/fd/{descriptor}"))
+        .context("too many inherited Bilibili mux inputs")
 }
 
 #[cfg(not(unix))]
 fn inherited_command_path(_index: usize) -> Result<String> {
+    bail!("descriptor-bound Bilibili muxing requires a Unix platform")
+}
+
+#[cfg(not(unix))]
+fn inherited_command_descriptor(_index: usize) -> Result<i32> {
     bail!("descriptor-bound Bilibili muxing requires a Unix platform")
 }
 
@@ -10601,7 +10604,7 @@ fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Ve
         .context("overwrite recovery directory has no parent")?;
     let target = parent.join(&target_file_name);
 
-    remove_recovery_transition_temp(root, directory)?;
+    remove_authenticated_recovery_transition_temp(root, directory, directory_identity, &manifest)?;
     let entries = root
         .list_bound_directory(&directory_entry, directory_identity)?
         .into_iter()
@@ -10839,11 +10842,30 @@ fn remove_uncommitted_recovery_anchors(
     Ok(())
 }
 
-fn remove_recovery_transition_temp(root: &RootedFs, directory: &Path) -> Result<()> {
+fn remove_authenticated_recovery_transition_temp(
+    root: &RootedFs,
+    directory: &Path,
+    directory_identity: EntryIdentity,
+    current: &OverwriteRecoveryManifest,
+) -> Result<()> {
     let path = directory.join(OVERWRITE_RECOVERY_MANIFEST_TEMP_NAME);
     let Some(file) = root.open_bound_file(&path)? else {
         return Ok(());
     };
+    // Protected property: recovery removes only an application-owned, canonical manifest that
+    // belongs to this exact transaction and is the opposite half of its atomic phase transition.
+    file.validate_private_single_link(0o600)?;
+    let contents = file.read_limited(OVERWRITE_RECOVERY_MANIFEST_LIMIT)?;
+    let transition: OverwriteRecoveryManifest = serde_json::from_slice(&contents)
+        .context("failed to parse interrupted overwrite manifest transition")?;
+    if encode_overwrite_recovery_manifest(&transition)? != contents {
+        bail!(
+            "refused to remove a non-canonical overwrite manifest transition: {}",
+            path.display()
+        );
+    }
+    validate_overwrite_recovery_ownership(root, directory, directory_identity, &transition)?;
+    validate_overwrite_recovery_transition_pair(current, &transition)?;
     let entry = root.bind_entry(&path, false)?;
     root.remove_bound_file_if_identity(&entry, file.identity())
         .with_context(|| {
@@ -10852,6 +10874,57 @@ fn remove_recovery_transition_temp(root: &RootedFs, directory: &Path) -> Result<
                 path.display()
             )
         })
+}
+
+fn validate_overwrite_recovery_transition_pair(
+    current: &OverwriteRecoveryManifest,
+    transition: &OverwriteRecoveryManifest,
+) -> Result<()> {
+    if current.version != OVERWRITE_RECOVERY_MANIFEST_VERSION
+        || transition.version != OVERWRITE_RECOVERY_MANIFEST_VERSION
+        || current.root_device != transition.root_device
+        || current.root_inode != transition.root_inode
+        || current.parent_device != transition.parent_device
+        || current.parent_inode != transition.parent_inode
+        || current.transaction_device != transition.transaction_device
+        || current.transaction_inode != transition.transaction_inode
+        || single_recovery_file_name(&current.target_file_name)?
+            != single_recovery_file_name(&transition.target_file_name)?
+    {
+        bail!("overwrite manifest transition does not match the active transaction");
+    }
+    match (current.phase, transition.phase) {
+        (OverwriteRecoveryPhase::Acquired, OverwriteRecoveryPhase::Committed) => {
+            if !current.committed_files.is_empty() {
+                bail!("acquired overwrite manifest contains committed files");
+            }
+            validate_committed_overwrite_transition(transition)
+        }
+        (OverwriteRecoveryPhase::Committed, OverwriteRecoveryPhase::Acquired) => {
+            if !transition.committed_files.is_empty() {
+                bail!("acquired overwrite manifest transition contains committed files");
+            }
+            Ok(())
+        }
+        _ => bail!("overwrite manifest transition does not change recovery phase"),
+    }
+}
+
+fn validate_committed_overwrite_transition(manifest: &OverwriteRecoveryManifest) -> Result<()> {
+    let target = PathBuf::from(single_recovery_file_name(&manifest.target_file_name)?);
+    let mut files = BTreeSet::new();
+    let mut anchors = BTreeSet::new();
+    for record in &manifest.committed_files {
+        let file = PathBuf::from(single_recovery_file_name(&record.file_name)?);
+        let anchor = committed_recovery_anchor_name(record)?;
+        if !files.insert(file) || !anchors.insert(anchor) {
+            bail!("committed overwrite manifest transition repeats an output binding");
+        }
+    }
+    if !files.contains(&target) {
+        bail!("committed overwrite manifest transition does not bind its target file");
+    }
+    Ok(())
 }
 
 fn committed_recovery_anchor_name(record: &OverwriteCommittedFile) -> Result<std::ffi::OsString> {
@@ -15070,7 +15143,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovery_ignores_an_incomplete_atomic_manifest_temp() {
+    fn startup_recovery_retains_an_unauthenticated_atomic_manifest_temp() {
         let final_dir = temp_test_dir("overwrite-startup-manifest-temp");
         let existing = final_dir.join("Episode.mkv");
         fs::write(&existing, "original-video").expect("existing file should write");
@@ -15096,19 +15169,24 @@ mod tests {
             .join(OVERWRITE_RECOVERY_MANIFEST_TEMP_NAME);
         fs::write(&transition_temp, b"{partial-committed-manifest")
             .expect("interrupted transition temp should write");
+        fs::set_permissions(&transition_temp, fs::Permissions::from_mode(0o600))
+            .expect("transition temp should be private");
+        let transaction = acquired.recovery.backup_dir.clone();
         drop(acquired);
 
         let report = recover_pending_overwrite_transactions(&final_dir)
-            .expect("intact acquired manifest should remain recoverable");
+            .expect("unauthenticated transition should be retained without deletion");
 
-        assert_eq!(fs::read_to_string(&existing).unwrap(), "original-video");
-        assert!(existing.with_extension("nfo").is_file());
-        assert!(overwrite_backup_dirs(&final_dir).is_empty());
-        assert!(
-            report
-                .iter()
-                .any(|line| line.contains("Restored interrupted"))
+        assert!(!existing.exists());
+        assert_eq!(
+            fs::read_to_string(transaction.join("Episode.mkv")).unwrap(),
+            "original-video"
         );
+        assert!(transition_temp.is_file());
+        assert!(report.iter().any(|line| {
+            line.contains("Retained unresolved overwrite transaction")
+                && line.contains("failed to parse interrupted overwrite manifest transition")
+        }));
         let _ = fs::remove_dir_all(final_dir);
     }
 
@@ -15371,14 +15449,17 @@ mod tests {
         )
         .expect("replacement should move into the acquired target");
         let transaction = acquired.recovery.backup_dir.clone();
+        let acquired_manifest = fs::read(&acquired.recovery.manifest_path)
+            .expect("acquired manifest should remain readable");
         let committed = persist_committed_overwrite_manifest(&mut acquired, &[moved], &existing)
             .expect("committed replacement identity should persist");
         assert_eq!(committed.anchors.len(), committed.files.len());
-        fs::write(
-            transaction.join(OVERWRITE_RECOVERY_MANIFEST_TEMP_NAME),
-            b"old-complete-acquired-manifest",
+        root.create_new_bound_file(
+            &transaction.join(OVERWRITE_RECOVERY_MANIFEST_TEMP_NAME),
+            &acquired_manifest,
+            0o600,
         )
-        .expect("displaced manifest temp should write");
+        .expect("authenticated displaced manifest temp should write");
         drop(committed);
         drop(acquired);
 
@@ -15874,7 +15955,7 @@ mod tests {
         let reservation = ReservedMuxOutput::create(&rooted, &output, &bound_inputs)
             .expect("mux transaction should reserve");
         let transaction = reservation.staging_dir_entry.path().to_path_buf();
-        fs::write(reservation.command_path(), "partial-mux")
+        fs::write(reservation.staged_path(), "partial-mux")
             .expect("partial mux output should write");
         std::mem::forget(reservation);
         let mut staging = staging;
@@ -15917,7 +15998,7 @@ mod tests {
         let reservation = ReservedMuxOutput::create(&rooted, &output, &bound_inputs)
             .expect("mux transaction should reserve");
         let transaction = reservation.staging_dir_entry.path().to_path_buf();
-        fs::write(reservation.command_path(), "partial-mux")
+        fs::write(reservation.staged_path(), "partial-mux")
             .expect("partial mux output should write");
         std::mem::forget(reservation);
         drop(staging);
@@ -15963,7 +16044,7 @@ mod tests {
             bind_bilibili_mux_inputs(&rooted, &inputs).expect("raw input should bind");
         let reservation = ReservedMuxOutput::create(&rooted, &output, &bound_inputs)
             .expect("mux transaction should reserve");
-        let staged_output = reservation.command_path().to_path_buf();
+        let staged_output = reservation.staged_path().to_path_buf();
         let transaction = reservation.staging_dir_entry.path().to_path_buf();
         let anchor = transaction.join(BILIBILI_MUX_RECOVERY_ANCHOR_NAME);
         fs::write(&staged_output, "mux-output").expect("mux output should write");
@@ -16041,7 +16122,7 @@ mod tests {
         let reservation = ReservedMuxOutput::create(&rooted, &output, &bound_inputs)
             .expect("mux transaction should reserve");
         let transaction = reservation.staging_dir_entry.path().to_path_buf();
-        fs::write(reservation.command_path(), "mux-output").expect("mux output should write");
+        fs::write(reservation.staged_path(), "mux-output").expect("mux output should write");
         reservation
             .file
             .sync_all()
@@ -16475,6 +16556,12 @@ mod tests {
         let root = RootedFs::new(&entry_dir).expect("entry root should bind");
         let bound_inputs =
             bind_bilibili_mux_inputs(&root, &inputs).expect("mux inputs should bind");
+        let (output_entry, output_identity) = root
+            .create_new_bound_file(&output, b"", 0o600)
+            .expect("mux output should reserve");
+        let output_file = root
+            .open_bound_file_read_write_if_identity(&output_entry, output_identity)
+            .expect("mux output should bind for writing");
 
         let BilibiliMuxCommand {
             spec,
@@ -16486,22 +16573,26 @@ mod tests {
             &inputs,
             &bound_inputs,
             &entry_dir,
-            &output,
+            &output_file,
         )
         .expect("dash mux spec should build");
 
         assert!(concat_file.is_none());
-        assert_eq!(inherited_files.len(), 2);
+        assert_eq!(inherited_files.len(), 3);
         assert_eq!(spec.program, PathBuf::from("/opt/bin/ffmpeg"));
         assert_eq!(spec.cwd, entry_dir);
         assert!(spec.args.contains(&"-nostdin".to_string()));
         assert!(spec.args.contains(&"/dev/fd/64".to_string()));
         assert!(spec.args.contains(&"/dev/fd/65".to_string()));
+        assert!(!spec.args.contains(&"/dev/fd/66".to_string()));
         assert!(!spec.args.iter().any(|arg| arg.ends_with("video.m4s")));
         assert!(!spec.args.iter().any(|arg| arg.ends_with("audio.m4s")));
         assert!(spec.args.windows(2).any(|args| args == ["-map", "0:0"]));
         assert!(spec.args.windows(2).any(|args| args == ["-map", "1:0"]));
         assert!(!spec.args.windows(2).any(|args| args == ["-f", "concat"]));
+        assert!(spec.args.windows(2).any(|args| args == ["-f", "mp4"]));
+        assert!(spec.args.windows(2).any(|args| args == ["-fd", "66"]));
+        assert_eq!(spec.args.last().map(String::as_str), Some("fd:"));
         assert_eq!(
             fs::read_to_string(user_concat).expect("user concat file should remain"),
             "user-owned"
@@ -16519,13 +16610,30 @@ mod tests {
         fs::write(
             &fake_ffmpeg,
             r#"#!/bin/sh
-output=
+output_fd=
+next_is_fd=no
 for arg do
-    output=$arg
+    if test "$next_is_fd" = yes; then
+        output_fd=$arg
+        next_is_fd=no
+    elif test "$arg" = -fd; then
+        next_is_fd=yes
+    fi
 done
-test -f "$output" || exit 42
-rm "$output" || exit 43
-printf replacement > "$output"
+test "$output_fd" = 65 || exit 41
+reserved=
+for candidate in .telegram-video-downloader-mux-*/output.mp4; do
+    if test -f "$candidate"; then
+        reserved=$candidate
+        break
+    fi
+done
+test -n "$reserved" || exit 42
+mv "$reserved" "$reserved.original" || exit 43
+printf replacement > "$reserved" || exit 44
+printf muxed >&65 || exit 45
+test "$(cat "$reserved")" = replacement || exit 46
+printf replacement > leaf-replacement-proof
 "#,
         )
         .expect("fake ffmpeg should write");
@@ -16550,6 +16658,10 @@ printf replacement > "$output"
         let output = root.join("Episode.mp4");
         assert!(format!("{error:#}").contains("reserved Bilibili mux output identity changed"));
         assert!(!output.exists());
+        assert_eq!(
+            fs::read_to_string(root.join("leaf-replacement-proof")).unwrap(),
+            "replacement"
+        );
         assert_eq!(fs::read_to_string(video).unwrap(), "video");
         assert!(report.entries[0].mux.is_none());
         assert!(fs::read_dir(&root).unwrap().all(|entry| {
@@ -16559,6 +16671,99 @@ printf replacement > "$output"
                 .to_string_lossy()
                 .starts_with(BILIBILI_MUX_STAGING_DIR_PREFIX)
         }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bilibili_mux_does_not_truncate_an_ancestor_replacement() {
+        let root = temp_test_dir("bilibili-local-mux-output-parent-replaced");
+        let video = root.join("video.m4s");
+        let fake_ffmpeg = root.join("fake-ffmpeg.sh");
+        fs::write(&video, "video").expect("raw video should write");
+        fs::write(
+            &fake_ffmpeg,
+            r#"#!/bin/sh
+output_fd=
+next_is_fd=no
+for arg do
+    if test "$next_is_fd" = yes; then
+        output_fd=$arg
+        next_is_fd=no
+    elif test "$arg" = -fd; then
+        next_is_fd=yes
+    fi
+done
+test "$output_fd" = 65 || exit 41
+reserved_dir=
+for candidate in .telegram-video-downloader-mux-*; do
+    if test -d "$candidate"; then
+        reserved_dir=$candidate
+        break
+    fi
+done
+test -n "$reserved_dir" || exit 42
+mv "$reserved_dir" "$reserved_dir.original" || exit 43
+mkdir "$reserved_dir" || exit 44
+printf ancestor-replacement > "$reserved_dir/output.mp4" || exit 45
+printf muxed >&65 || exit 46
+test "$(cat "$reserved_dir/output.mp4")" = ancestor-replacement || exit 47
+printf ancestor-replacement > ancestor-replacement-proof
+"#,
+        )
+        .expect("fake ffmpeg should write");
+        fs::set_permissions(&fake_ffmpeg, fs::Permissions::from_mode(0o700))
+            .expect("fake ffmpeg should become executable");
+
+        let mut config = test_config();
+        config.tools.ffmpeg = fake_ffmpeg;
+        config.bot.command_timeout_seconds = 5;
+        config.bot.command_idle_timeout_seconds = 5;
+        let mut report = parse_bilibili_download_report(
+            r#"{"title":"Episode","output_dir":".","entries":[{"index":1,"title":"Episode","files":[{"kind":"video","path":"video.m4s"}]}]}"#,
+        )
+        .expect("download report should parse");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+
+        mux_bilibili_report_media(&config, &rooted, &root, &mut report, UNIX_EPOCH, None)
+            .await
+            .expect_err("a replaced transaction ancestor must retain uncertain recovery state");
+
+        assert_eq!(
+            fs::read_to_string(root.join("ancestor-replacement-proof")).unwrap(),
+            "ancestor-replacement"
+        );
+        assert!(!root.join("Episode.mp4").exists());
+        let transaction_dirs = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(BILIBILI_MUX_STAGING_DIR_PREFIX))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(transaction_dirs.len(), 2);
+        let original_transaction = transaction_dirs
+            .iter()
+            .find(|path| path.to_string_lossy().ends_with(".original"))
+            .expect("renamed original transaction should remain");
+        let replacement_transaction = transaction_dirs
+            .iter()
+            .find(|path| !path.to_string_lossy().ends_with(".original"))
+            .expect("replacement transaction should remain");
+        assert_eq!(
+            fs::read_to_string(original_transaction.join("output.mp4")).unwrap(),
+            "muxed"
+        );
+        assert_eq!(
+            fs::read_to_string(replacement_transaction.join("output.mp4")).unwrap(),
+            "ancestor-replacement"
+        );
+        assert_eq!(fs::read_to_string(video).unwrap(), "video");
+        assert!(report.entries[0].mux.is_none());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -16613,21 +16818,27 @@ printf replacement > "$output"
             &fake_ffmpeg,
             r#"#!/bin/sh
 input=
-output=
+output_fd=
 next_is_input=no
+next_is_fd=no
 for arg do
-    output=$arg
-    if test "$next_is_input" = yes; then
+    if test "$next_is_fd" = yes; then
+        output_fd=$arg
+        next_is_fd=no
+    elif test "$next_is_input" = yes; then
         input=$arg
         next_is_input=no
+    elif test "$arg" = -fd; then
+        next_is_fd=yes
     elif test "$arg" = -i; then
         next_is_input=yes
     fi
 done
 test -n "$input" || exit 41
+test "$output_fd" = 65 || exit 47
 mv video.m4s video.original || exit 42
 printf replacement > video.m4s || exit 43
-cat "$input" > "$output" || exit 44
+cat "$input" >&65 || exit 44
 rm video.m4s || exit 45
 mv video.original video.m4s || exit 46
 "#,
@@ -16681,6 +16892,12 @@ mv video.original video.m4s || exit 46
         let root = RootedFs::new(&entry_dir).expect("entry root should bind");
         let bound_inputs =
             bind_bilibili_mux_inputs(&root, &inputs).expect("mux inputs should bind");
+        let (output_entry, output_identity) = root
+            .create_new_bound_file(&output, b"", 0o600)
+            .expect("mux output should reserve");
+        let output_file = root
+            .open_bound_file_read_write_if_identity(&output_entry, output_identity)
+            .expect("mux output should bind for writing");
 
         let BilibiliMuxCommand {
             spec,
@@ -16692,12 +16909,12 @@ mv video.original video.m4s || exit 46
             &inputs,
             &bound_inputs,
             &entry_dir,
-            &output,
+            &output_file,
         )
         .expect("flv mux spec should build");
 
         let concat_file = concat_file.expect("flv mux should create concat list");
-        assert_eq!(inherited_files.len(), 3);
+        assert_eq!(inherited_files.len(), 4);
         let concat_path = concat_file.path().to_path_buf();
         let concat = fs::read_to_string(&concat_path).expect("concat list should read");
         assert_eq!(concat, "file '/dev/fd/65'\nfile '/dev/fd/66'\n");
@@ -16714,6 +16931,9 @@ mv video.original video.m4s || exit 46
                 .windows(2)
                 .any(|args| args[0] == "-i" && args[1] == "/dev/fd/64")
         );
+        assert!(spec.args.windows(2).any(|args| args == ["-f", "mp4"]));
+        assert!(spec.args.windows(2).any(|args| args == ["-fd", "67"]));
+        assert_eq!(spec.args.last().map(String::as_str), Some("fd:"));
         drop(concat_file);
         assert!(!concat_path.exists());
         assert_eq!(

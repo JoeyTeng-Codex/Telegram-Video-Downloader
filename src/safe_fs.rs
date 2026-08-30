@@ -84,6 +84,12 @@ pub(crate) struct BoundDirectory {
     identity: EntryIdentity,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AtomicBoundFileReplaceCheckpoint {
+    BeforeExchange,
+    AfterExchange,
+}
+
 #[derive(Debug)]
 pub(crate) struct RemoveQuarantineRecoveryReport {
     pub(crate) messages: Vec<String>,
@@ -499,6 +505,50 @@ impl RootedFs {
         }))
     }
 
+    pub(crate) fn open_bound_file_read_write_if_identity(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+    ) -> Result<BoundFile> {
+        // Protected property: the write-capable descriptor must bind the exact regular-file
+        // object selected by the caller while its configured-root access path remains stable.
+        self.validate_parent(&entry.parent)?;
+        if !expected.is_file()
+            || identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected)
+        {
+            bail!(
+                "bound file identity changed before read-write open: {}",
+                entry.path.display()
+            );
+        }
+        let fd = rustix::fs::openat(
+            entry.parent.fd.as_ref(),
+            &entry.leaf,
+            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(errno_to_io)
+        .with_context(|| {
+            format!(
+                "failed to open bound file for writing {}",
+                entry.path.display()
+            )
+        })?;
+        if identity_for_fd(&fd)? != expected
+            || identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected)
+        {
+            bail!(
+                "bound file identity changed during read-write open: {}",
+                entry.path.display()
+            );
+        }
+        self.validate_parent(&entry.parent)?;
+        Ok(BoundFile {
+            fd: Arc::new(fd),
+            identity: expected,
+        })
+    }
+
     pub(crate) fn open_bound_directory(
         &self,
         entry: &BoundEntry,
@@ -592,6 +642,28 @@ impl RootedFs {
         contents: &[u8],
         mode: u16,
     ) -> Result<(BoundEntry, EntryIdentity)> {
+        self.replace_bound_file_atomically_if_identity_with_hook(
+            entry,
+            expected,
+            temp_path,
+            contents,
+            mode,
+            &mut |_| Ok(()),
+        )
+    }
+
+    fn replace_bound_file_atomically_if_identity_with_hook<F>(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+        temp_path: &Path,
+        contents: &[u8],
+        mode: u16,
+        hook: &mut F,
+    ) -> Result<(BoundEntry, EntryIdentity)>
+    where
+        F: FnMut(AtomicBoundFileReplaceCheckpoint) -> Result<()>,
+    {
         self.validate_bound_parent(&entry.parent)?;
         if identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected) {
             bail!(
@@ -608,6 +680,14 @@ impl RootedFs {
                     "atomic replacement requires a temporary file in the destination directory: {}",
                     temp_path.display()
                 ),
+                cleanup,
+                "atomic replacement temp cleanup",
+            ));
+        }
+        if let Err(err) = hook(AtomicBoundFileReplaceCheckpoint::BeforeExchange) {
+            let cleanup = self.remove_bound_file_if_identity(&temp_entry, temp_identity);
+            return Err(with_cleanup_error(
+                err.context("atomic replacement stopped before exchange"),
                 cleanup,
                 "atomic replacement temp cleanup",
             ));
@@ -629,13 +709,57 @@ impl RootedFs {
             ));
         }
 
+        let post_exchange_error = hook(AtomicBoundFileReplaceCheckpoint::AfterExchange).err();
         let destination_identity = identity_at(entry.parent.fd.as_ref(), &entry.leaf)?;
         let displaced_identity = identity_at(temp_entry.parent.fd.as_ref(), &temp_entry.leaf)?;
-        if destination_identity != Some(temp_identity) || displaced_identity != Some(expected) {
-            bail!(
-                "bound file identities changed during atomic replacement: {}",
-                entry.path.display()
-            );
+        if post_exchange_error.is_some()
+            || destination_identity != Some(temp_identity)
+            || displaced_identity != Some(expected)
+        {
+            let failure = post_exchange_error.unwrap_or_else(|| {
+                anyhow!(
+                    "bound file identities changed during atomic replacement: {}",
+                    entry.path.display()
+                )
+            });
+            let still_provable = destination_identity == Some(temp_identity)
+                && displaced_identity.is_some()
+                && identity_at(entry.parent.fd.as_ref(), &entry.leaf)? == destination_identity
+                && identity_at(temp_entry.parent.fd.as_ref(), &temp_entry.leaf)?
+                    == displaced_identity;
+            if !still_provable {
+                bail!(
+                    "{failure:#}; retained both atomic replacement entries because their post-exchange identities could not be proven"
+                );
+            }
+            if let Err(rollback) = renameat_exchange(
+                entry.parent.fd.as_ref(),
+                &entry.leaf,
+                temp_entry.parent.fd.as_ref(),
+                &temp_entry.leaf,
+            ) {
+                bail!(
+                    "{failure:#}; failed to roll back the authenticated atomic exchange: {rollback:#}; retained both entries"
+                );
+            }
+            let restored_destination = identity_at(entry.parent.fd.as_ref(), &entry.leaf)?;
+            let restored_temp = identity_at(temp_entry.parent.fd.as_ref(), &temp_entry.leaf)?;
+            if restored_destination != displaced_identity || restored_temp != Some(temp_identity) {
+                bail!(
+                    "{failure:#}; atomic exchange rollback outcome could not be authenticated; retained both entries"
+                );
+            }
+            if let Err(sync) = sync_directory(entry.parent.fd.as_ref()) {
+                bail!(
+                    "{failure:#}; failed to persist the authenticated atomic exchange rollback: {sync:#}; retained the replacement temp"
+                );
+            }
+            let cleanup = self.remove_bound_file_if_identity(&temp_entry, temp_identity);
+            return Err(with_cleanup_error(
+                failure,
+                cleanup,
+                "rolled-back atomic replacement temp cleanup",
+            ));
         }
         self.validate_bound_parent(&entry.parent)?;
         sync_directory(entry.parent.fd.as_ref())?;
@@ -2897,6 +3021,94 @@ mod tests {
         assert_eq!(
             rooted.entry_identity(&manifest).unwrap(),
             Some(new_identity)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn atomic_bound_file_replacement_restores_a_raced_destination() {
+        let root = temp_dir("atomic-bound-replacement-race");
+        fs::create_dir_all(&root).expect("root should create");
+        let manifest = root.join("manifest.json");
+        let saved_manifest = root.join("manifest.saved.json");
+        let temp = root.join("manifest.next.json");
+        fs::write(&manifest, b"old-complete-manifest").expect("manifest should write");
+        let rooted = RootedFs::new(&root).expect("root should open");
+        let entry = rooted
+            .bind_entry(&manifest, false)
+            .expect("manifest should bind");
+        let old_identity = rooted
+            .bound_entry_identity(&entry)
+            .expect("manifest identity should read")
+            .expect("manifest should exist");
+
+        let error = rooted
+            .replace_bound_file_atomically_if_identity_with_hook(
+                &entry,
+                old_identity,
+                &temp,
+                b"new-complete-manifest",
+                0o600,
+                &mut |checkpoint| {
+                    if checkpoint == AtomicBoundFileReplaceCheckpoint::BeforeExchange {
+                        fs::rename(&manifest, &saved_manifest)
+                            .context("failed to preserve raced manifest")?;
+                        fs::write(&manifest, b"racer-owned-manifest")
+                            .context("failed to install raced manifest")?;
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("a raced destination must reject replacement");
+
+        assert!(
+            format!("{error:#}")
+                .contains("bound file identities changed during atomic replacement")
+        );
+        assert_eq!(fs::read(&manifest).unwrap(), b"racer-owned-manifest");
+        assert_eq!(fs::read(&saved_manifest).unwrap(), b"old-complete-manifest");
+        assert!(!temp.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn atomic_bound_file_replacement_rolls_back_a_post_exchange_failure() {
+        let root = temp_dir("atomic-bound-replacement-post-exchange");
+        fs::create_dir_all(&root).expect("root should create");
+        let manifest = root.join("manifest.json");
+        let temp = root.join("manifest.next.json");
+        fs::write(&manifest, b"old-complete-manifest").expect("manifest should write");
+        let rooted = RootedFs::new(&root).expect("root should open");
+        let entry = rooted
+            .bind_entry(&manifest, false)
+            .expect("manifest should bind");
+        let old_identity = rooted
+            .bound_entry_identity(&entry)
+            .expect("manifest identity should read")
+            .expect("manifest should exist");
+
+        let error = rooted
+            .replace_bound_file_atomically_if_identity_with_hook(
+                &entry,
+                old_identity,
+                &temp,
+                b"new-complete-manifest",
+                0o600,
+                &mut |checkpoint| {
+                    if checkpoint == AtomicBoundFileReplaceCheckpoint::AfterExchange {
+                        bail!("injected post-exchange failure");
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("post-exchange failure must roll the exchange back");
+
+        assert!(format!("{error:#}").contains("injected post-exchange failure"));
+        assert_eq!(fs::read(&manifest).unwrap(), b"old-complete-manifest");
+        assert!(!temp.exists());
+        assert_eq!(
+            rooted.entry_identity(&manifest).unwrap(),
+            Some(old_identity)
         );
         let _ = fs::remove_dir_all(root);
     }
