@@ -82,8 +82,6 @@ const BILIBILI_MUX_FD_BASE: i32 = 64;
 const BILIBILI_WORKER_LIVENESS_FD: i32 = BILIBILI_MUX_FD_BASE - 1;
 #[cfg(unix)]
 const COMMAND_DESCENDANT_FENCE_FD: i32 = BILIBILI_MUX_FD_BASE - 2;
-#[cfg(unix)]
-const COMMAND_INHERITED_SOURCE_FD_MINIMUM: i32 = 256;
 const OVERWRITE_BACKUP_DIR_PREFIX: &str = ".telegram-video-downloader-overwrite";
 const OVERWRITE_RECOVERY_MANIFEST_NAME: &str = ".transaction.json";
 const OVERWRITE_RECOVERY_MANIFEST_TEMP_NAME: &str = ".transaction.next.json";
@@ -1021,6 +1019,24 @@ fn persist_bilibili_worker_completion(
     .context("failed to persist Bilibili worker completion marker")
 }
 
+fn persist_bilibili_core_download_completion(
+    root: &RootedFs,
+    request: Option<&BilibiliWorkerRequest>,
+) -> Result<()> {
+    let Some(request) = request else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    {
+        persist_bilibili_worker_completion(root, request)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, request);
+        bail!("Bilibili worker completion markers require a Unix platform")
+    }
+}
+
 #[cfg(unix)]
 pub async fn run_bilibili_worker() -> Result<()> {
     ensure_current_process_owns_its_group()
@@ -1065,7 +1081,7 @@ pub async fn run_bilibili_worker() -> Result<()> {
             &request.url,
             request.selection,
             request.expected_overwrite_identity.as_ref(),
-            Some(&request.logical_output_dir),
+            Some(&request),
             Some(progress),
         ) => result,
         liveness_result = wait_for_liveness_peer_close(liveness) => {
@@ -1111,7 +1127,7 @@ async fn run_bilibili_job_locked(
     url: &str,
     selection: Option<BilibiliSelection>,
     expected_overwrite_identity: Option<&VideoIdentity>,
-    logical_output_dir: Option<&Path>,
+    worker_request: Option<&BilibiliWorkerRequest>,
     progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
     sync_bilibili_rust_credentials(config).await?;
@@ -1140,6 +1156,7 @@ async fn run_bilibili_job_locked(
         .download_plan_with_progress(&core_plan, options, &progress_reporter)
         .await?;
     let mut report = BilibiliDownloadReport::from(&core_report);
+    persist_bilibili_core_download_completion(root, worker_request)?;
     let output_dir = bilibili_core::output_dir(config);
     if mux_locally {
         mux_bilibili_report_media(
@@ -1154,7 +1171,9 @@ async fn run_bilibili_job_locked(
     }
     cleanup_bilibili_mux_input_files(root, &output_dir, &report)?;
     let primary_videos = bilibili_report_primary_media(&output_dir, &report);
-    let reported_output_dir = logical_output_dir.unwrap_or(output_dir.as_path());
+    let reported_output_dir = worker_request
+        .map(|request| request.logical_output_dir.as_path())
+        .unwrap_or(output_dir.as_path());
     let mut details = vec![format!(
         "BBDown-rust crate: {} entr{}",
         report.entries.len(),
@@ -4926,8 +4945,8 @@ async fn run_command_with_execution_context_and_additional_fds(
             command.process_group(0);
         }
         if bound_cwd_fd.is_some() || !inherited_fds.is_empty() {
-            // The source descriptors are CLOEXEC duplicates above the target range. dup2 clears
-            // CLOEXEC on each fixed child descriptor without allowing an argv pathname lookup.
+            // The source descriptors are collision-free CLOEXEC duplicates. dup2 clears CLOEXEC
+            // on each fixed child descriptor without allowing an argv pathname lookup.
             unsafe {
                 command.pre_exec(move || {
                     if let Some(directory) = &bound_cwd_fd
@@ -5172,11 +5191,8 @@ fn prepare_additional_inherited_command_fd(
     if target <= libc::STDERR_FILENO {
         bail!("refused to replace a standard command descriptor");
     }
-    let source = rustix::io::fcntl_dupfd_cloexec(source, COMMAND_INHERITED_SOURCE_FD_MINIMUM)
-        .context("failed to duplicate inherited command descriptor")?;
-    if source.as_raw_fd() == target {
-        bail!("inherited command descriptor source overlaps its target");
-    }
+    let targets = BTreeSet::from([target]);
+    let source = duplicate_inherited_command_fd_avoiding_targets(source, &targets)?;
     Ok(AdditionalInheritedCommandFd { source, target })
 }
 
@@ -5189,16 +5205,41 @@ fn append_additional_inherited_command_fds(
         .iter()
         .map(|(_, target)| *target)
         .collect::<BTreeSet<_>>();
-    for AdditionalInheritedCommandFd { source, target } in additional {
-        if target <= libc::STDERR_FILENO || !targets.insert(target) {
+    for AdditionalInheritedCommandFd { target, .. } in &additional {
+        if *target <= libc::STDERR_FILENO || !targets.insert(*target) {
             bail!("inherited command descriptor target is invalid or duplicated");
         }
-        if source.as_raw_fd() == target {
-            bail!("inherited command descriptor source overlaps its target");
+    }
+    inherited_fds.extend(
+        additional
+            .into_iter()
+            .map(|inherited| (inherited.source, inherited.target)),
+    );
+    for (source, _) in inherited_fds {
+        if targets.contains(&source.as_raw_fd()) {
+            *source = duplicate_inherited_command_fd_avoiding_targets(source, &targets)?;
         }
-        inherited_fds.push((source, target));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn duplicate_inherited_command_fd_avoiding_targets(
+    source: &impl AsFd,
+    targets: &BTreeSet<i32>,
+) -> Result<OwnedFd> {
+    let mut minimum = libc::STDERR_FILENO + 1;
+    loop {
+        let duplicate = rustix::io::fcntl_dupfd_cloexec(source, minimum)
+            .context("failed to allocate a collision-free inherited command descriptor")?;
+        let descriptor = duplicate.as_raw_fd();
+        if !targets.contains(&descriptor) {
+            return Ok(duplicate);
+        }
+        minimum = descriptor
+            .checked_add(1)
+            .context("inherited command descriptor range is exhausted")?;
+    }
 }
 
 fn file_activity_poll_interval(progress_interval: Duration, idle_timeout: Duration) -> Duration {
@@ -7992,8 +8033,7 @@ fn create_overwrite_recovery_manifest(
         OverwriteRecoveryPhase::Acquired,
         Vec::new(),
     )?;
-    let contents = serde_json::to_vec_pretty(&manifest)
-        .context("failed to encode overwrite recovery manifest")?;
+    let contents = encode_overwrite_recovery_manifest(&manifest)?;
     let manifest_path = backup_dir.join(OVERWRITE_RECOVERY_MANIFEST_NAME);
     let (manifest_entry, manifest_identity) = root
         .create_new_bound_file(&manifest_path, &contents, 0o600)
@@ -8035,6 +8075,15 @@ fn overwrite_recovery_manifest(
         phase,
         committed_files,
     })
+}
+
+fn encode_overwrite_recovery_manifest(manifest: &OverwriteRecoveryManifest) -> Result<Vec<u8>> {
+    let contents = serde_json::to_vec_pretty(manifest)
+        .context("failed to encode overwrite recovery manifest")?;
+    if contents.len() > OVERWRITE_RECOVERY_MANIFEST_LIMIT {
+        bail!("overwrite recovery manifest exceeds its size limit");
+    }
+    Ok(contents)
 }
 
 fn validate_overwrite_recovery_ownership(
@@ -8134,6 +8183,17 @@ where
         );
     }
 
+    let committed_files = committed_overwrite_file_records(&identities);
+    let manifest = overwrite_recovery_manifest(
+        &acquired.root,
+        &acquired.recovery.backup_dir,
+        acquired.recovery.backup_dir_identity,
+        target_file_name,
+        OverwriteRecoveryPhase::Committed,
+        committed_files.clone(),
+    )?;
+    let contents = encode_overwrite_recovery_manifest(&manifest)?;
+
     let mut files = BTreeMap::new();
     for (file_name, identity) in &identities {
         let path = transaction_parent.join(file_name);
@@ -8156,18 +8216,13 @@ where
         })?;
         files.insert(file_name.clone(), file);
     }
-    let (committed_files, anchors) =
-        create_committed_output_anchors(acquired, transaction_parent, &identities, hook)?;
-    let manifest = overwrite_recovery_manifest(
-        &acquired.root,
-        &acquired.recovery.backup_dir,
-        acquired.recovery.backup_dir_identity,
-        target_file_name,
-        OverwriteRecoveryPhase::Committed,
-        committed_files,
+    let anchors = create_committed_output_anchors(
+        acquired,
+        transaction_parent,
+        &identities,
+        &committed_files,
+        hook,
     )?;
-    let contents = serde_json::to_vec_pretty(&manifest)
-        .context("failed to encode committed overwrite recovery manifest")?;
     let temp_path = acquired
         .recovery
         .backup_dir
@@ -8205,21 +8260,50 @@ where
     Ok(committed)
 }
 
+fn committed_overwrite_file_records(
+    identities: &BTreeMap<PathBuf, EntryIdentity>,
+) -> Vec<OverwriteCommittedFile> {
+    identities
+        .iter()
+        .enumerate()
+        .map(|(index, (file_name, identity))| OverwriteCommittedFile {
+            file_name: file_name.clone(),
+            device: identity.device(),
+            inode: identity.inode(),
+            anchor_name: Some(PathBuf::from(format!(
+                "{OVERWRITE_COMMITTED_ANCHOR_PREFIX}{index:04x}"
+            ))),
+        })
+        .collect()
+}
+
 fn create_committed_output_anchors<F>(
     acquired: &AcquiredOverwrite,
     transaction_parent: &Path,
     identities: &BTreeMap<PathBuf, EntryIdentity>,
+    committed_files: &[OverwriteCommittedFile],
     hook: &mut F,
-) -> Result<(Vec<OverwriteCommittedFile>, BTreeMap<PathBuf, BoundFile>)>
+) -> Result<BTreeMap<PathBuf, BoundFile>>
 where
     F: FnMut(OverwriteCommitCheckpoint) -> Result<()>,
 {
-    let mut records = Vec::with_capacity(identities.len());
+    if committed_files.len() != identities.len() {
+        bail!("committed overwrite records do not match the bound outputs");
+    }
     let mut anchors = BTreeMap::new();
-    for (index, (file_name, identity)) in identities.iter().enumerate() {
-        let anchor_name = PathBuf::from(format!("{OVERWRITE_COMMITTED_ANCHOR_PREFIX}{index:04x}"));
-        let source_path = transaction_parent.join(file_name);
-        let anchor_path = acquired.recovery.backup_dir.join(&anchor_name);
+    for committed in committed_files {
+        let identity = identities
+            .get(&committed.file_name)
+            .context("committed overwrite record has no bound output")?;
+        if committed.device != identity.device() || committed.inode != identity.inode() {
+            bail!("committed overwrite record identity changed before anchoring");
+        }
+        let anchor_name = committed
+            .anchor_name
+            .as_ref()
+            .context("committed overwrite record has no anchor name")?;
+        let source_path = transaction_parent.join(&committed.file_name);
+        let anchor_path = acquired.recovery.backup_dir.join(anchor_name);
         let source_entry = acquired.root.bind_entry(&source_path, false)?;
         let anchor_entry = acquired.root.bind_entry(&anchor_path, false)?;
         hook(OverwriteCommitCheckpoint::BeforeAnchorCreation)?;
@@ -8251,15 +8335,9 @@ where
                 anchor_path.display()
             );
         }
-        records.push(OverwriteCommittedFile {
-            file_name: file_name.clone(),
-            device: identity.device(),
-            inode: identity.inode(),
-            anchor_name: Some(anchor_name.clone()),
-        });
-        anchors.insert(anchor_name, anchor_file);
+        anchors.insert(anchor_name.clone(), anchor_file);
     }
-    Ok((records, anchors))
+    Ok(anchors)
 }
 
 fn insert_committed_file_identity(
@@ -14473,6 +14551,99 @@ mod tests {
     }
 
     #[test]
+    fn oversized_committed_overwrite_manifest_stays_in_recoverable_acquired_state() {
+        let final_dir = temp_test_dir("overwrite-oversized-committed-manifest");
+        let existing = final_dir.join("Episode.mkv");
+        fs::write(&existing, "original-video").expect("existing file should write");
+        let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        write_bilibili_identity_nfo(&existing, "cid123");
+        let root = RootedFs::new(&final_dir).expect("output root should bind");
+        let duplicate =
+            bind_test_overwrite_confirmation(&root, VideoDuplicateAction::Overwrite, &duplicate)
+                .expect("overwrite confirmation should bind");
+        let mut acquired =
+            acquire_and_validate_overwrite_target(&root, &duplicate, StagedPrimaryMediaKind::Video)
+                .expect("overwrite target should be acquired");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-oversized");
+        fs::create_dir_all(&staging_dir).expect("staging directory should create");
+        let mut moved = Vec::new();
+        for index in 0..128 {
+            let file_name = if index == 0 {
+                "Episode.mkv".to_string()
+            } else {
+                format!("artifact-{index:03}-{}.json", "x".repeat(160))
+            };
+            let source = staging_dir.join(&file_name);
+            let destination = final_dir.join(&file_name);
+            fs::write(&source, format!("replacement-{index}"))
+                .expect("replacement output should stage");
+            moved.push(
+                move_step_with_bound_parents(
+                    &root,
+                    MoveStep {
+                        source,
+                        destination,
+                        expected_identity: None,
+                    },
+                )
+                .expect("replacement output should publish"),
+            );
+        }
+
+        let error = persist_committed_overwrite_manifest(&mut acquired, &moved, &existing)
+            .expect_err("oversized committed recovery state should be rejected");
+
+        assert!(
+            format!("{error:#}").contains("overwrite recovery manifest exceeds its size limit")
+        );
+        let manifest_file = root
+            .open_bound_file(&acquired.recovery.manifest_path)
+            .expect("acquired manifest should open")
+            .expect("acquired manifest should remain");
+        let manifest: OverwriteRecoveryManifest = serde_json::from_slice(
+            &manifest_file
+                .read_limited(OVERWRITE_RECOVERY_MANIFEST_LIMIT)
+                .expect("acquired manifest should remain readable"),
+        )
+        .expect("acquired manifest should parse");
+        assert_eq!(manifest.phase, OverwriteRecoveryPhase::Acquired);
+        assert!(
+            fs::read_dir(&acquired.recovery.backup_dir)
+                .expect("overwrite transaction should read")
+                .filter_map(|entry| entry.ok())
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(OVERWRITE_COMMITTED_ANCHOR_PREFIX))
+        );
+
+        for output in &moved {
+            fs::remove_file(&output.destination).expect("uncommitted output should remove");
+        }
+        drop(moved);
+        drop(acquired);
+        let report = recover_pending_overwrite_transactions(&final_dir)
+            .expect("acquired overwrite should recover");
+
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "original-video");
+        assert!(existing.with_extension("nfo").is_file());
+        assert!(overwrite_backup_dirs(&final_dir).is_empty());
+        assert!(
+            report
+                .iter()
+                .any(|line| line.contains("Restored interrupted overwrite"))
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
     fn startup_recovery_preserves_backups_when_a_committed_path_is_replaced() {
         let final_dir = temp_test_dir("overwrite-startup-committed-replaced");
         let existing = final_dir.join("Episode.mkv");
@@ -15060,6 +15231,57 @@ mod tests {
                 .as_deref(),
             Some(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)
         );
+        drop(staging);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn completed_bilibili_segments_survive_an_oversized_mux_manifest() {
+        let config = test_config();
+        let video_dir = temp_test_dir("bilibili-worker-oversized-mux-manifest");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+        let staging =
+            create_video_staging_dir(&root).expect("worker staging directory should create");
+        let request = build_bilibili_worker_request(
+            &config,
+            "https://www.bilibili.com/video/BV123",
+            None,
+            None,
+            &staging,
+        );
+        let worker_root =
+            RootedFs::new(staging.path()).expect("worker should bind the staging directory");
+        let mut media_inputs = Vec::new();
+        for index in 0..128 {
+            let path = staging
+                .path()
+                .join(format!("segment-{index:03}-{}.flv", "x".repeat(160)));
+            fs::write(&path, "segment").expect("downloaded segment should write");
+            media_inputs.push(BilibiliMediaInput {
+                kind: "flv_segment".to_string(),
+                path,
+            });
+        }
+        let bound_inputs = bind_bilibili_mux_inputs(&worker_root, &media_inputs)
+            .expect("downloaded segments should bind");
+
+        persist_bilibili_core_download_completion(&worker_root, Some(&request))
+            .expect("completed core download should be retained before mux setup");
+        let error = ReservedMuxOutput::create(
+            &worker_root,
+            &staging.path().join("Episode.mp4"),
+            &bound_inputs,
+        )
+        .expect_err("oversized mux recovery manifest should be rejected");
+
+        assert!(format!("{error:#}").contains("mux recovery manifest exceeds its size limit"));
+        assert_eq!(
+            retained_video_staging_reason(&root, staging.path(), staging.identity)
+                .expect("parent should validate the completion marker")
+                .as_deref(),
+            Some(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)
+        );
+        assert!(media_inputs.iter().all(|input| input.path.is_file()));
         drop(staging);
         let _ = fs::remove_dir_all(video_dir);
     }
@@ -16655,6 +16877,88 @@ mv video.original video.m4s || exit 46
             .await
             .expect("peer closure should wake the monitor")
             .expect("peer closure should be observed without an I/O error");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_worker_descriptors_fit_below_a_low_process_limit() {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new(
+            std::env::current_exe().expect("test binary should resolve"),
+        );
+        command
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("downloader::tests::inherited_worker_descriptors_low_limit_child")
+            .arg("--nocapture")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+                if libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut limits = limits.assume_init();
+                limits.rlim_cur = limits.rlim_cur.min(256 as libc::rlim_t);
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limits) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let output = command.output().expect("low-limit helper should run");
+
+        assert!(
+            output.status.success(),
+            "low-limit helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "spawned by inherited_worker_descriptors_fit_below_a_low_process_limit"]
+    async fn inherited_worker_descriptors_low_limit_child() {
+        let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) };
+        assert_eq!(result, 0, "process file descriptor limit should read");
+        let limits = unsafe { limits.assume_init() };
+        assert!(limits.rlim_cur <= 256 as libc::rlim_t);
+
+        let root = temp_test_dir("inherited-worker-low-fd-limit");
+        let mut config = test_config();
+        config.bot.command_timeout_seconds = 5;
+        config.bot.command_idle_timeout_seconds = 5;
+        let spec = CommandSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".to_string(), "exit 0".to_string()],
+            cwd: root.clone(),
+            activity_dir: None,
+            cleanup_paths: Vec::new(),
+        };
+        let (worker_liveness, _parent_liveness) =
+            command_liveness_pair().expect("worker liveness pair should create");
+        let inherited =
+            prepare_additional_inherited_command_fd(&worker_liveness, BILIBILI_WORKER_LIVENESS_FD)
+                .expect("worker liveness descriptor should fit below the limit");
+
+        let output = run_command_with_execution_context_and_additional_fds(
+            &config,
+            &spec,
+            None,
+            &[],
+            vec![inherited],
+            None,
+            CommandExecutionPolicy::BILIBILI_WORKER,
+        )
+        .await
+        .expect("worker command should start below the low descriptor limit");
+
+        assert!(output.status.success());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
