@@ -568,7 +568,7 @@ impl AuthMutationFileLock {
             .checked_add(1)
             .context("BBDown auth epoch is exhausted")?;
         write_auth_epoch_slot(&self.file, next)?;
-        sync_auth_lock_parent(&self.path)?;
+        sync_auth_lock_parent(&self.path, &self.file)?;
         validate_auth_mutation_lock_identity(&self.file, &self.path)?;
         let persisted = read_auth_epoch(&self.file, &self.path)?;
         if persisted != next {
@@ -807,33 +807,119 @@ fn initialize_auth_lock(file: &File, path: &Path) -> Result<()> {
     writer
         .sync_all()
         .context("failed to persist new BBDown auth lock")?;
-    sync_auth_lock_parent(path)
+    sync_auth_lock_parent(path, file)
 }
 
-fn sync_auth_lock_parent(path: &Path) -> Result<()> {
+#[cfg(unix)]
+fn sync_auth_lock_parent(path: &Path, expected_file: &File) -> Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
-    }
-    let directory = options.open(parent).with_context(|| {
+    let canonical_parent = fs::canonicalize(parent).with_context(|| {
         format!(
-            "failed to open BBDown auth lock directory {}",
+            "failed to resolve BBDown auth lock directory {}",
             parent.display()
         )
     })?;
-    directory.sync_all().with_context(|| {
+    let directory = rustix::fs::open(
+        &canonical_parent,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
+    .with_context(|| {
         format!(
-            "failed to sync BBDown auth lock directory {}",
+            "failed to open resolved BBDown auth lock directory {}",
+            canonical_parent.display()
+        )
+    })?;
+    let leaf = path
+        .file_name()
+        .context("BBDown auth lock path has no file name")?;
+    validate_auth_lock_in_bound_parent(&directory, leaf, expected_file, path)?;
+    rustix::fs::fsync(&directory)
+        .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
+        .with_context(|| {
+            format!(
+                "failed to sync BBDown auth lock directory {}",
+                canonical_parent.display()
+            )
+        })?;
+    validate_auth_lock_in_bound_parent(&directory, leaf, expected_file, path)
+}
+
+#[cfg(unix)]
+fn validate_auth_lock_in_bound_parent(
+    directory: &impl std::os::fd::AsFd,
+    leaf: &std::ffi::OsStr,
+    expected_file: &File,
+    path: &Path,
+) -> Result<()> {
+    // Protected property: the directory sync must cover the exact lock object already held by the
+    // caller. Device/inode bind that object; type, owner, mode, and link count bind its access
+    // policy. Content and timestamps may change while the epoch is intentionally updated.
+    let linked = rustix::fs::openat(
+        directory,
+        leaf,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
+    .with_context(|| format!("failed to open bound BBDown auth lock {}", path.display()))?;
+    let expected = rustix::fs::fstat(expected_file)
+        .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
+        .context("failed to inspect held BBDown auth lock")?;
+    let current = rustix::fs::fstat(&linked)
+        .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
+        .context("failed to inspect bound BBDown auth lock")?;
+    if rustix::fs::FileType::from_raw_mode(expected.st_mode) != rustix::fs::FileType::RegularFile
+        || expected.st_dev != current.st_dev
+        || expected.st_ino != current.st_ino
+        || expected.st_uid != unsafe { libc::geteuid() }
+        || current.st_uid != expected.st_uid
+        || expected.st_mode & 0o777 != 0o600
+        || current.st_mode & 0o777 != 0o600
+        || expected.st_nlink != 1
+        || current.st_nlink != 1
+    {
+        bail!(
+            "BBDown auth lock identity or access policy changed while syncing: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_auth_lock_parent(path: &Path, _expected_file: &File) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = fs::canonicalize(parent).with_context(|| {
+        format!(
+            "failed to resolve BBDown auth lock directory {}",
             parent.display()
         )
-    })
+    })?;
+    File::open(&canonical_parent)
+        .with_context(|| {
+            format!(
+                "failed to open BBDown auth lock directory {}",
+                canonical_parent.display()
+            )
+        })?
+        .sync_all()
+        .with_context(|| {
+            format!(
+                "failed to sync BBDown auth lock directory {}",
+                canonical_parent.display()
+            )
+        })
 }
 
 fn with_auth_mutation_lock<T>(
@@ -1021,7 +1107,7 @@ fn create_initialized_auth_lock(path: &Path) -> Result<Option<File>> {
 
     match install_auth_lock_noreplace(&temp_path, path) {
         Ok(true) => {
-            sync_auth_lock_parent(path)?;
+            sync_auth_lock_parent(path, &file)?;
             Ok(Some(file))
         }
         Ok(false) => {
@@ -2643,6 +2729,38 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_lock_supports_a_symlinked_credential_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let state_path = temp_state_file("symlinked-credential-parent");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let credential_parent = root.join("credential-store");
+        let credential_parent_link = root.join("credential-store-link");
+        fs::create_dir_all(&credential_parent).expect("credential parent should create");
+        symlink(&credential_parent, &credential_parent_link)
+            .expect("credential parent symlink should create");
+        let credential_file = credential_parent_link.join("credentials.json");
+
+        let (_, epoch) = with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+            .expect("auth transaction should support a symlinked credential parent");
+        let reply_lock = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect("auth reply lock should reopen through the symlinked parent");
+
+        assert_eq!(epoch, 1);
+        assert_eq!(reply_lock.current_epoch().unwrap(), epoch);
+        let lock_name = auth_mutation_lock_path(&credential_file)
+            .file_name()
+            .expect("auth lock should have a file name")
+            .to_os_string();
+        assert!(credential_parent.join(lock_name).is_file());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

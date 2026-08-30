@@ -56,7 +56,7 @@ const VIDEO_STAGING_RETENTION_LIMIT: usize = 4096;
 const VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON: &str =
     "download completed; automatic publication has not finished";
 const BILIBILI_WORKER_REQUEST_FILE_NAME: &str = ".bilibili-worker.json";
-const BILIBILI_WORKER_REQUEST_VERSION: u32 = 2;
+const BILIBILI_WORKER_REQUEST_VERSION: u32 = 3;
 const BILIBILI_WORKER_REQUEST_LIMIT: usize = 1024 * 1024;
 const VIDEO_OUTPUT_LOCK_FILE_NAME: &str = ".telegram-video-downloader.lock";
 const VIDEO_CONTROL_DIR_NAME: &str = ".telegram-video-downloader-control";
@@ -83,6 +83,8 @@ const BILIBILI_MUX_FD_BASE: i32 = 64;
 const BILIBILI_WORKER_LIVENESS_FD: i32 = BILIBILI_MUX_FD_BASE - 1;
 #[cfg(unix)]
 const COMMAND_DESCENDANT_FENCE_FD: i32 = BILIBILI_MUX_FD_BASE - 2;
+#[cfg(unix)]
+const BILIBILI_WORKER_OUTPUT_LOCK_FD: i32 = BILIBILI_MUX_FD_BASE - 3;
 const OVERWRITE_BACKUP_DIR_PREFIX: &str = ".telegram-video-downloader-overwrite";
 const OVERWRITE_RECOVERY_MANIFEST_NAME: &str = ".transaction.json";
 const OVERWRITE_RECOVERY_MANIFEST_TEMP_NAME: &str = ".transaction.next.json";
@@ -225,6 +227,8 @@ struct BilibiliWorkerRequest {
     output_root_inode: u64,
     staging_device: u64,
     staging_inode: u64,
+    output_lock_device: u64,
+    output_lock_inode: u64,
 }
 
 pub fn job_progress_channel() -> (JobProgressSender, JobProgressReceiver) {
@@ -954,13 +958,20 @@ async fn run_simple_job(
 async fn run_staged_bilibili_worker(
     config: &AppConfig,
     staging: &BoundStagingDir,
+    output_lock: &BoundFile,
     url: &str,
     selection: Option<BilibiliSelection>,
     expected_overwrite_identity: Option<&VideoIdentity>,
     progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
-    let request =
-        build_bilibili_worker_request(config, url, selection, expected_overwrite_identity, staging);
+    let request = build_bilibili_worker_request(
+        config,
+        url,
+        selection,
+        expected_overwrite_identity,
+        staging,
+        output_lock,
+    );
     let contents =
         serde_json::to_vec(&request).context("failed to encode Bilibili worker request")?;
     if contents.len() > BILIBILI_WORKER_REQUEST_LIMIT {
@@ -979,9 +990,8 @@ async fn run_staged_bilibili_worker(
     let (additional_inherited_fds, _parent_liveness) = {
         let (worker_liveness, parent_liveness) =
             command_liveness_pair().context("failed to create Bilibili worker liveness channel")?;
-        let inherited =
-            prepare_additional_inherited_command_fd(&worker_liveness, BILIBILI_WORKER_LIVENESS_FD)?;
-        (vec![inherited], parent_liveness)
+        let inherited = prepare_bilibili_worker_inherited_fds(&worker_liveness, output_lock)?;
+        (inherited, parent_liveness)
     };
     #[cfg(not(unix))]
     let additional_inherited_fds = Vec::new();
@@ -1049,6 +1059,7 @@ fn build_bilibili_worker_request(
     selection: Option<BilibiliSelection>,
     expected_overwrite_identity: Option<&VideoIdentity>,
     staging: &BoundStagingDir,
+    output_lock: &BoundFile,
 ) -> BilibiliWorkerRequest {
     let mut worker_config = config.clone();
     worker_config.telegram.token = "redacted-worker-token".to_string();
@@ -1067,6 +1078,8 @@ fn build_bilibili_worker_request(
         output_root_inode: staging.root.root_identity().inode(),
         staging_device: staging.identity.device(),
         staging_inode: staging.identity.inode(),
+        output_lock_device: output_lock.identity().device(),
+        output_lock_inode: output_lock.identity().inode(),
     }
 }
 
@@ -1166,6 +1179,8 @@ pub async fn run_bilibili_worker() -> Result<()> {
     {
         bail!("invalid Bilibili worker request");
     }
+    let _output_lock =
+        inherited_worker_output_lock(request.output_lock_device, request.output_lock_inode)?;
     let root = RootedFs::new(Path::new("."))?;
     validate_bilibili_worker_staging(&root, &request)?;
     let (progress, mut progress_receiver) = job_progress_channel();
@@ -3625,6 +3640,7 @@ async fn run_staged_video_job(
             run_staged_bilibili_worker(
                 &staging_config,
                 &staging,
+                guard.output_lock(),
                 url,
                 *selection,
                 expected_identity,
@@ -4442,7 +4458,7 @@ struct VideoOutputGuard {
     root: RootedFs,
     recovery_state: VideoRecoveryState,
     _process_guard: MutexGuard<'static, ()>,
-    _file_guard: BoundFile,
+    file_guard: BoundFile,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -4567,6 +4583,10 @@ impl VideoRecoveryMarker {
 impl VideoOutputGuard {
     fn root(&self) -> &RootedFs {
         &self.root
+    }
+
+    fn output_lock(&self) -> &BoundFile {
+        &self.file_guard
     }
 
     fn begin_operation(&self) {
@@ -4889,7 +4909,7 @@ async fn video_output_lock(
             unresolved_before_operation: unresolved_recovery,
         },
         _process_guard: process_guard,
-        _file_guard: file_guard,
+        file_guard,
     })
 }
 
@@ -5516,6 +5536,66 @@ fn inherited_worker_liveness_stream() -> Result<UnixStream> {
     )
     .context("failed to protect Bilibili worker liveness descriptor from nested commands")?;
     Ok(UnixStream::from(liveness_fd))
+}
+
+#[cfg(unix)]
+fn inherited_worker_output_lock(expected_device: u64, expected_inode: u64) -> Result<OwnedFd> {
+    let output_lock = unsafe { OwnedFd::from_raw_fd(BILIBILI_WORKER_OUTPUT_LOCK_FD) };
+    let descriptor_flags = rustix::io::fcntl_getfd(&output_lock)
+        .context("failed to inspect inherited video output lock descriptor flags")?;
+    rustix::io::fcntl_setfd(
+        &output_lock,
+        descriptor_flags | rustix::io::FdFlags::CLOEXEC,
+    )
+    .context("failed to protect inherited video output lock from nested commands")?;
+    // Protected property: restart recovery cannot overlap this worker. The request binds the exact
+    // lock object identity, private access policy rejects a substituted descriptor, and acquiring
+    // the inherited open description's existing flock proves the lock remains held until drop.
+    let stat =
+        rustix::fs::fstat(&output_lock).context("failed to inspect inherited video output lock")?;
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile
+        || stat.st_dev as u64 != expected_device
+        || stat.st_ino as u64 != expected_inode
+        || stat.st_mode & 0o777 != 0o600
+        || stat.st_uid != unsafe { libc::geteuid() }
+        || stat.st_nlink != 1
+    {
+        bail!("inherited video output lock identity or access policy changed");
+    }
+    rustix::fs::flock(
+        &output_lock,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+    .context("inherited video output lock is not held exclusively")?;
+    let revalidated = rustix::fs::fstat(&output_lock)
+        .context("failed to revalidate inherited video output lock")?;
+    if revalidated.st_dev != stat.st_dev
+        || revalidated.st_ino != stat.st_ino
+        || revalidated.st_mode != stat.st_mode
+        || revalidated.st_uid != stat.st_uid
+        || revalidated.st_nlink != stat.st_nlink
+    {
+        bail!("inherited video output lock changed during validation");
+    }
+    Ok(output_lock)
+}
+
+#[cfg(unix)]
+fn prepare_bilibili_worker_inherited_fds(
+    worker_liveness: &UnixStream,
+    output_lock: &BoundFile,
+) -> Result<Vec<AdditionalInheritedCommandFd>> {
+    output_lock.validate_private_single_link(0o600)?;
+    let output_lock_source = output_lock
+        .duplicate_fd_cloexec_at_least(libc::STDERR_FILENO + 1)
+        .context("failed to duplicate the video output lock for the Bilibili worker")?;
+    Ok(vec![
+        prepare_additional_inherited_command_fd(worker_liveness, BILIBILI_WORKER_LIVENESS_FD)?,
+        prepare_additional_inherited_command_fd(
+            &output_lock_source,
+            BILIBILI_WORKER_OUTPUT_LOCK_FD,
+        )?,
+    ])
 }
 
 #[cfg(unix)]
@@ -16122,6 +16202,7 @@ mod tests {
         };
         let video_dir = temp_test_dir("bilibili-worker-request");
         let root = RootedFs::new(&video_dir).expect("output root should bind");
+        let output_lock = video_output_lock_file(&root).expect("output lock should bind");
         let staging =
             create_video_staging_dir(&root).expect("worker staging directory should create");
         let logical_output_dir = staging.path().to_path_buf();
@@ -16132,6 +16213,7 @@ mod tests {
             Some(BilibiliSelection::Latest),
             Some(&expected_identity),
             &staging,
+            &output_lock,
         );
         let encoded = serde_json::to_vec(&request).expect("worker request should encode");
 
@@ -16148,6 +16230,8 @@ mod tests {
         assert_eq!(request.output_root_inode, root.root_identity().inode());
         assert_eq!(request.staging_device, staging.identity.device());
         assert_eq!(request.staging_inode, staging.identity.inode());
+        assert_eq!(request.output_lock_device, output_lock.identity().device());
+        assert_eq!(request.output_lock_inode, output_lock.identity().inode());
         let request_file = create_unlinked_bilibili_worker_request(&staging, &encoded)
             .expect("worker request descriptor should create");
         assert_eq!(
@@ -16223,6 +16307,7 @@ mod tests {
         let config = test_config();
         let video_dir = temp_test_dir("bilibili-worker-oversized-mux-manifest");
         let root = RootedFs::new(&video_dir).expect("output root should bind");
+        let output_lock = video_output_lock_file(&root).expect("output lock should bind");
         let staging =
             create_video_staging_dir(&root).expect("worker staging directory should create");
         let request = build_bilibili_worker_request(
@@ -16231,6 +16316,7 @@ mod tests {
             None,
             None,
             &staging,
+            &output_lock,
         );
         let worker_root =
             RootedFs::new(staging.path()).expect("worker should bind the staging directory");
@@ -17986,6 +18072,10 @@ mv video.original video.m4s || exit 46
 
         let root = temp_test_dir("inherited-worker-low-fd-limit");
         let rooted = RootedFs::new(&root).expect("output root should bind");
+        let output_lock = video_output_lock_file(&rooted).expect("output lock should bind");
+        output_lock
+            .lock_exclusive()
+            .expect("output lock should lock");
         let staging = create_video_staging_dir(&rooted).expect("bound command cwd should create");
         let request_path = staging.path().join("request.json");
         let (_, request_identity) = rooted
@@ -18016,7 +18106,7 @@ mv video.original video.m4s || exit 46
             program: PathBuf::from("/bin/sh"),
             args: vec![
                 "-c".to_string(),
-                "printf '%s\\n' \"$PWD\"; /bin/cat /dev/fd/64".to_string(),
+                "printf '%s\\n' \"$PWD\"; /bin/cat /dev/fd/64; /bin/test -r /dev/fd/61".to_string(),
             ],
             cwd: staging.path().to_path_buf(),
             activity_dir: None,
@@ -18024,16 +18114,15 @@ mv video.original video.m4s || exit 46
         };
         let (worker_liveness, _parent_liveness) =
             command_liveness_pair().expect("worker liveness pair should create");
-        let inherited =
-            prepare_additional_inherited_command_fd(&worker_liveness, BILIBILI_WORKER_LIVENESS_FD)
-                .expect("worker liveness descriptor should fit below the limit");
+        let inherited = prepare_bilibili_worker_inherited_fds(&worker_liveness, &output_lock)
+            .expect("worker descriptors should fit below the limit");
 
         let output = run_command_with_execution_context_and_additional_fds(
             &config,
             &spec,
             Some(&staging.directory),
             std::slice::from_ref(&request_file),
-            vec![inherited],
+            inherited,
             None,
             CommandExecutionPolicy::BILIBILI_WORKER,
         )
@@ -18049,6 +18138,131 @@ mv video.original video.m4s || exit 46
         );
         drop(staging);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_worker_output_lock_blocks_recovery_until_worker_exits() {
+        use std::os::unix::process::CommandExt;
+
+        let root = temp_test_dir("inherited-worker-output-lock");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+        let output_lock = video_output_lock_file(&rooted).expect("output lock should bind");
+        output_lock
+            .lock_exclusive()
+            .expect("parent output lock should lock");
+        let identity = output_lock.identity();
+        let (worker_liveness, parent_liveness) =
+            command_liveness_pair().expect("worker liveness pair should create");
+        let additional = prepare_bilibili_worker_inherited_fds(&worker_liveness, &output_lock)
+            .expect("worker descriptors should prepare");
+        let PreparedCommandFds { inherited, .. } = prepare_command_inherited_fds(&[], additional)
+            .expect("worker descriptors should avoid target collisions");
+        drop(worker_liveness);
+
+        let ready = root.join("worker.ready");
+        let release = root.join("worker.release");
+        let mut command = std::process::Command::new(
+            std::env::current_exe().expect("test binary should resolve"),
+        );
+        command
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("downloader::tests::inherited_worker_output_lock_child")
+            .arg("--nocapture")
+            .current_dir(&root)
+            .env("TVD_OUTPUT_LOCK_DEVICE", identity.device().to_string())
+            .env("TVD_OUTPUT_LOCK_INODE", identity.inode().to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        unsafe {
+            command.pre_exec(move || {
+                for (source, target) in &inherited {
+                    if libc::dup2(source.as_raw_fd(), *target) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("worker lock helper should start");
+        drop(command);
+        drop(output_lock);
+
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !ready.is_file() {
+            if let Some(status) = child.try_wait().expect("worker helper status should read") {
+                let _ = fs::remove_dir_all(&root);
+                panic!("worker lock helper exited before readiness: {status}");
+            }
+            if std::time::Instant::now() >= ready_deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = fs::remove_dir_all(&root);
+                panic!("worker lock helper did not become ready");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let contender = video_output_lock_file(&rooted).expect("recovery lock should open");
+        assert!(
+            !contender
+                .try_lock_exclusive()
+                .expect("recovery lock contention should be observable"),
+            "the inherited worker descriptor must retain the output lock"
+        );
+        fs::write(&release, b"release").expect("worker release marker should write");
+
+        let exit_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("worker helper status should read") {
+                break status;
+            }
+            if std::time::Instant::now() >= exit_deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = fs::remove_dir_all(&root);
+                panic!("worker lock helper did not exit after release");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        assert!(status.success(), "worker lock helper failed: {status}");
+        assert!(
+            contender
+                .try_lock_exclusive()
+                .expect("recovery lock should acquire after worker exit")
+        );
+        drop(parent_liveness);
+        drop(contender);
+        drop(rooted);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "spawned by inherited_worker_output_lock_blocks_recovery_until_worker_exits"]
+    fn inherited_worker_output_lock_child() {
+        let expected_device = env::var("TVD_OUTPUT_LOCK_DEVICE")
+            .expect("expected output lock device should be provided")
+            .parse()
+            .expect("expected output lock device should parse");
+        let expected_inode = env::var("TVD_OUTPUT_LOCK_INODE")
+            .expect("expected output lock inode should be provided")
+            .parse()
+            .expect("expected output lock inode should parse");
+        let _output_lock = inherited_worker_output_lock(expected_device, expected_inode)
+            .expect("inherited output lock should validate");
+        fs::write("worker.ready", b"ready").expect("worker readiness marker should write");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !Path::new("worker.release").is_file() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker release marker did not arrive"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[cfg(unix)]
