@@ -214,6 +214,10 @@ impl BoundFile {
     }
 
     pub(crate) fn validate_private_single_link(&self, mode: u16) -> Result<()> {
+        self.validate_private_link_count(mode, 1)
+    }
+
+    pub(crate) fn validate_private_link_count(&self, mode: u16, link_count: u16) -> Result<()> {
         self.validate_identity()?;
         let stat = rustix::fs::fstat(self.fd.as_ref())
             .map_err(errno_to_io)
@@ -221,7 +225,7 @@ impl BoundFile {
         if identity_from_stat(&stat) != self.identity
             || stat.st_mode & 0o777 != mode
             || stat.st_uid != unsafe { libc::geteuid() }
-            || stat.st_nlink != 1
+            || stat.st_nlink != link_count
         {
             bail!("private bound file ownership, permissions, or link count changed");
         }
@@ -692,6 +696,17 @@ impl RootedFs {
                 "atomic replacement temp cleanup",
             ));
         }
+        if identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected) {
+            let cleanup = self.remove_bound_file_if_identity(&temp_entry, temp_identity);
+            return Err(with_cleanup_error(
+                anyhow!(
+                    "bound file identities changed during atomic replacement: {}",
+                    entry.path.display()
+                ),
+                cleanup,
+                "atomic replacement temp cleanup",
+            ));
+        }
         if let Err(err) = renameat_exchange(
             entry.parent.fd.as_ref(),
             &entry.leaf,
@@ -723,10 +738,9 @@ impl RootedFs {
                 )
             });
             let still_provable = destination_identity == Some(temp_identity)
-                && displaced_identity.is_some()
-                && identity_at(entry.parent.fd.as_ref(), &entry.leaf)? == destination_identity
-                && identity_at(temp_entry.parent.fd.as_ref(), &temp_entry.leaf)?
-                    == displaced_identity;
+                && displaced_identity == Some(expected)
+                && identity_at(entry.parent.fd.as_ref(), &entry.leaf)? == Some(temp_identity)
+                && identity_at(temp_entry.parent.fd.as_ref(), &temp_entry.leaf)? == Some(expected);
             if !still_provable {
                 bail!(
                     "{failure:#}; retained both atomic replacement entries because their post-exchange identities could not be proven"
@@ -825,6 +839,64 @@ impl RootedFs {
                 cleanup,
                 "bound hard-link cleanup",
             ));
+        }
+        self.validate_bound_parent(&source.parent)?;
+        self.validate_bound_parent(&destination.parent)?;
+        sync_directory(destination.parent.fd.as_ref())
+    }
+
+    pub(crate) fn ensure_hard_link_via_bound_parents_if_identity(
+        &self,
+        source: &BoundEntry,
+        destination: &BoundEntry,
+        expected: EntryIdentity,
+    ) -> Result<()> {
+        self.validate_bound_parent(&source.parent)?;
+        self.validate_bound_parent(&destination.parent)?;
+        if identity_at(source.parent.fd.as_ref(), &source.leaf)? != Some(expected)
+            || !expected.is_file()
+        {
+            bail!(
+                "bound hard-link source identity changed: {}",
+                source.path.display()
+            );
+        }
+
+        match identity_at(destination.parent.fd.as_ref(), &destination.leaf)? {
+            Some(current) if current != expected => {
+                bail!(
+                    "bound hard-link destination has a different identity: {}",
+                    destination.path.display()
+                );
+            }
+            Some(_) => {}
+            None => match rustix::fs::linkat(
+                source.parent.fd.as_ref(),
+                &source.leaf,
+                destination.parent.fd.as_ref(),
+                &destination.leaf,
+                AtFlags::empty(),
+            ) {
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                Err(err) => {
+                    return Err(errno_to_io(err)).with_context(|| {
+                        format!(
+                            "failed to hard-link {} to {} through bound parents",
+                            source.path.display(),
+                            destination.path.display()
+                        )
+                    });
+                }
+            },
+        }
+
+        if identity_at(source.parent.fd.as_ref(), &source.leaf)? != Some(expected)
+            || identity_at(destination.parent.fd.as_ref(), &destination.leaf)? != Some(expected)
+        {
+            bail!(
+                "bound hard-link identities changed while ensuring {}",
+                destination.path.display()
+            );
         }
         self.validate_bound_parent(&source.parent)?;
         self.validate_bound_parent(&destination.parent)?;
@@ -3110,6 +3182,52 @@ mod tests {
             rooted.entry_identity(&manifest).unwrap(),
             Some(old_identity)
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn atomic_bound_file_replacement_never_rolls_a_raced_temp_into_destination() {
+        let root = temp_dir("atomic-bound-replacement-raced-temp");
+        fs::create_dir_all(&root).expect("root should create");
+        let manifest = root.join("manifest.json");
+        let saved_manifest = root.join("manifest.saved.json");
+        let temp = root.join("manifest.next.json");
+        fs::write(&manifest, b"old-complete-manifest").expect("manifest should write");
+        let rooted = RootedFs::new(&root).expect("root should open");
+        let entry = rooted
+            .bind_entry(&manifest, false)
+            .expect("manifest should bind");
+        let old_identity = rooted
+            .bound_entry_identity(&entry)
+            .expect("manifest identity should read")
+            .expect("manifest should exist");
+
+        let error = rooted
+            .replace_bound_file_atomically_if_identity_with_hook(
+                &entry,
+                old_identity,
+                &temp,
+                b"new-complete-manifest",
+                0o600,
+                &mut |checkpoint| {
+                    if checkpoint == AtomicBoundFileReplaceCheckpoint::AfterExchange {
+                        fs::rename(&temp, &saved_manifest)
+                            .context("failed to preserve displaced manifest")?;
+                        fs::write(&temp, b"racer-owned-manifest")
+                            .context("failed to install raced temp")?;
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("a raced temp must prevent exchange rollback");
+
+        assert!(
+            format!("{error:#}")
+                .contains("retained both atomic replacement entries because their post-exchange identities could not be proven")
+        );
+        assert_eq!(fs::read(&manifest).unwrap(), b"new-complete-manifest");
+        assert_eq!(fs::read(&saved_manifest).unwrap(), b"old-complete-manifest");
+        assert_eq!(fs::read(&temp).unwrap(), b"racer-owned-manifest");
         let _ = fs::remove_dir_all(root);
     }
 

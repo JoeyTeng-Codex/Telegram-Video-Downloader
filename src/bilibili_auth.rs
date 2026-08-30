@@ -32,6 +32,7 @@ static AUTH_FILE_LOCK: Mutex<()> = Mutex::new(());
 static ACTIVE_BBDOWN_CONFIG_FILES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const AUTH_MUTATION_LOCK_SUFFIX: &str = ".telegram-video-downloader.auth.lock";
+const AUTH_MUTATION_LOCK_ANCHOR_SUFFIX: &str = ".anchor";
 const AUTH_EPOCH_LOG_LIMIT: u64 = 64 * 1024;
 const AUTH_EPOCH_SLOT_SIZE: usize = 64;
 const AUTH_EPOCH_SLOT_COUNT: usize = 2;
@@ -131,6 +132,7 @@ pub enum LoginPoll {
 struct AuthMutationFileLock {
     file: File,
     path: PathBuf,
+    anchor_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -555,21 +557,21 @@ fn encode_cookie_value_for_bbdown(value: &str) -> String {
 
 impl AuthMutationFileLock {
     fn current_epoch(&self) -> Result<u64> {
-        validate_auth_mutation_lock_identity(&self.file, &self.path)?;
+        validate_auth_mutation_lock_identity(&self.file, &self.path, &self.anchor_path)?;
         let epoch = read_auth_epoch(&self.file, &self.path)?;
-        validate_auth_mutation_lock_identity(&self.file, &self.path)?;
+        validate_auth_mutation_lock_identity(&self.file, &self.path, &self.anchor_path)?;
         Ok(epoch)
     }
 
     fn bump_epoch(&self) -> Result<u64> {
-        validate_auth_mutation_lock_identity(&self.file, &self.path)?;
+        validate_auth_mutation_lock_identity(&self.file, &self.path, &self.anchor_path)?;
         let epoch = read_auth_epoch(&self.file, &self.path)?;
         let next = epoch
             .checked_add(1)
             .context("BBDown auth epoch is exhausted")?;
         write_auth_epoch_slot(&self.file, next)?;
-        sync_auth_lock_parent(&self.path, &self.file)?;
-        validate_auth_mutation_lock_identity(&self.file, &self.path)?;
+        sync_auth_lock_pair_parent(&self.path, &self.anchor_path, &self.file)?;
+        validate_auth_mutation_lock_identity(&self.file, &self.path, &self.anchor_path)?;
         let persisted = read_auth_epoch(&self.file, &self.path)?;
         if persisted != next {
             bail!("BBDown auth epoch changed while persisting it")
@@ -840,7 +842,7 @@ fn sync_auth_lock_parent(path: &Path, expected_file: &File) -> Result<()> {
     let leaf = path
         .file_name()
         .context("BBDown auth lock path has no file name")?;
-    validate_auth_lock_in_bound_parent(&directory, leaf, expected_file, path)?;
+    validate_auth_lock_in_bound_parent(&directory, leaf, expected_file, path, 1)?;
     rustix::fs::fsync(&directory)
         .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
         .with_context(|| {
@@ -849,7 +851,67 @@ fn sync_auth_lock_parent(path: &Path, expected_file: &File) -> Result<()> {
                 canonical_parent.display()
             )
         })?;
-    validate_auth_lock_in_bound_parent(&directory, leaf, expected_file, path)
+    validate_auth_lock_in_bound_parent(&directory, leaf, expected_file, path, 1)
+}
+
+#[cfg(unix)]
+fn sync_auth_lock_pair_parent(path: &Path, anchor_path: &Path, expected_file: &File) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let anchor_parent = anchor_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = fs::canonicalize(parent).with_context(|| {
+        format!(
+            "failed to resolve BBDown auth lock directory {}",
+            parent.display()
+        )
+    })?;
+    let canonical_anchor_parent = fs::canonicalize(anchor_parent).with_context(|| {
+        format!(
+            "failed to resolve BBDown auth lock anchor directory {}",
+            anchor_parent.display()
+        )
+    })?;
+    if canonical_parent != canonical_anchor_parent {
+        bail!("BBDown auth lock aliases resolve to different directories");
+    }
+    let directory = rustix::fs::open(
+        &canonical_parent,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
+    .with_context(|| {
+        format!(
+            "failed to open resolved BBDown auth lock directory {}",
+            canonical_parent.display()
+        )
+    })?;
+    let leaf = path
+        .file_name()
+        .context("BBDown auth lock path has no file name")?;
+    let anchor_leaf = anchor_path
+        .file_name()
+        .context("BBDown auth lock anchor path has no file name")?;
+    validate_auth_lock_in_bound_parent(&directory, leaf, expected_file, path, 2)?;
+    validate_auth_lock_in_bound_parent(&directory, anchor_leaf, expected_file, anchor_path, 2)?;
+    rustix::fs::fsync(&directory)
+        .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
+        .with_context(|| {
+            format!(
+                "failed to sync BBDown auth lock directory {}",
+                canonical_parent.display()
+            )
+        })?;
+    validate_auth_lock_in_bound_parent(&directory, leaf, expected_file, path, 2)?;
+    validate_auth_lock_in_bound_parent(&directory, anchor_leaf, expected_file, anchor_path, 2)
 }
 
 #[cfg(unix)]
@@ -858,6 +920,7 @@ fn validate_auth_lock_in_bound_parent(
     leaf: &std::ffi::OsStr,
     expected_file: &File,
     path: &Path,
+    expected_link_count: u16,
 ) -> Result<()> {
     // Protected property: the directory sync must cover the exact lock object already held by the
     // caller. Device/inode bind that object; type, owner, mode, and link count bind its access
@@ -883,8 +946,8 @@ fn validate_auth_lock_in_bound_parent(
         || current.st_uid != expected.st_uid
         || expected.st_mode & 0o777 != 0o600
         || current.st_mode & 0o777 != 0o600
-        || expected.st_nlink != 1
-        || current.st_nlink != 1
+        || expected.st_nlink != expected_link_count
+        || current.st_nlink != expected_link_count
     {
         bail!(
             "BBDown auth lock identity or access policy changed while syncing: {}",
@@ -920,6 +983,12 @@ fn sync_auth_lock_parent(path: &Path, _expected_file: &File) -> Result<()> {
                 canonical_parent.display()
             )
         })
+}
+
+#[cfg(not(unix))]
+fn sync_auth_lock_pair_parent(path: &Path, anchor_path: &Path, expected_file: &File) -> Result<()> {
+    sync_auth_lock_parent(path, expected_file)?;
+    sync_auth_lock_parent(anchor_path, expected_file)
 }
 
 fn with_auth_mutation_lock<T>(
@@ -1048,10 +1117,15 @@ fn acquire_auth_mutation_file_lock(
     protected_paths: &[&Path],
 ) -> Result<AuthMutationFileLock> {
     let lock_path = auth_mutation_lock_path(credential_file);
-    if protected_paths.iter().any(|path| **path == lock_path) {
+    let anchor_path = auth_mutation_lock_anchor_path(credential_file);
+    if protected_paths
+        .iter()
+        .any(|path| **path == lock_path || **path == anchor_path)
+    {
         bail!(
-            "BBDown auth lock path conflicts with an auth data file: {}",
-            lock_path.display()
+            "BBDown auth lock path conflicts with an auth data file: {} or {}",
+            lock_path.display(),
+            anchor_path.display()
         );
     }
     if let Some(parent) = lock_path
@@ -1066,18 +1140,23 @@ fn acquire_auth_mutation_file_lock(
         })?;
     }
 
-    let file = open_or_create_auth_mutation_lock(&lock_path)?;
+    let file = match open_existing_auth_mutation_lock(&anchor_path)? {
+        Some(file) => file,
+        None => open_or_create_auth_mutation_lock(&lock_path)?,
+    };
     rustix::fs::flock(&file, FlockOperation::LockExclusive)
         .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
         .with_context(|| format!("failed to lock BBDown auth state {}", lock_path.display()))?;
-    validate_auth_mutation_lock_identity(&file, &lock_path)?;
+    validate_auth_mutation_lock_candidate(&file, &lock_path, &anchor_path)?;
     validate_auth_mutation_lock_is_distinct(&file, protected_paths, &lock_path)?;
     validate_existing_auth_lock_format(&file, &lock_path)?;
     set_auth_mutation_lock_private(&file, &lock_path)?;
-    validate_auth_mutation_lock_identity(&file, &lock_path)?;
+    ensure_auth_mutation_lock_aliases(&file, &lock_path, &anchor_path)?;
+    validate_auth_mutation_lock_identity(&file, &lock_path, &anchor_path)?;
     Ok(AuthMutationFileLock {
         file,
         path: lock_path,
+        anchor_path,
     })
 }
 
@@ -1087,27 +1166,31 @@ fn open_or_create_auth_mutation_lock(path: &Path) -> Result<File> {
             return Ok(file);
         }
 
-        let mut existing = OpenOptions::new();
-        existing.read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            existing.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-        }
-        match existing.open(path) {
-            Ok(file) => return Ok(file),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("failed to open BBDown auth lock {}", path.display())
-                });
-            }
+        if let Some(file) = open_existing_auth_mutation_lock(path)? {
+            return Ok(file);
         }
     }
     bail!(
         "BBDown auth lock kept changing while opening: {}",
         path.display()
     )
+}
+
+fn open_existing_auth_mutation_lock(path: &Path) -> Result<Option<File>> {
+    let mut existing = OpenOptions::new();
+    existing.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        existing.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    match existing.open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to open BBDown auth lock {}", path.display()))
+        }
+    }
 }
 
 fn create_initialized_auth_lock(path: &Path) -> Result<Option<File>> {
@@ -1284,40 +1367,212 @@ fn validate_auth_mutation_lock_is_distinct(
 }
 
 #[cfg(unix)]
-fn validate_auth_mutation_lock_identity(file: &File, path: &Path) -> Result<()> {
+fn validate_auth_mutation_lock_candidate(
+    file: &File,
+    path: &Path,
+    anchor_path: &Path,
+) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     let opened = file
         .metadata()
         .with_context(|| format!("failed to inspect BBDown auth lock {}", path.display()))?;
-    let linked = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to revalidate BBDown auth lock {}", path.display()))?;
-    if !opened.is_file()
-        || !linked.file_type().is_file()
-        || opened.dev() != linked.dev()
-        || opened.ino() != linked.ino()
-        || opened.uid() != unsafe { libc::geteuid() }
-        || linked.uid() != unsafe { libc::geteuid() }
-    {
+    if !opened.is_file() || opened.uid() != unsafe { libc::geteuid() } {
         bail!(
             "BBDown auth lock path or ownership changed while locking: {}",
             path.display()
         );
     }
-    if opened.nlink() != 1 || linked.nlink() != 1 {
+    let linked_count = [path, anchor_path]
+        .into_iter()
+        .map(|candidate| auth_mutation_lock_path_matches(&opened, candidate))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|matches| *matches)
+        .count() as u64;
+    if linked_count == 0 {
+        bail!("BBDown auth lock aliases disappeared while locking");
+    }
+    if opened.nlink() != linked_count {
         bail!("BBDown auth lock has hard-link aliases: {}", path.display());
     }
     Ok(())
 }
 
+#[cfg(unix)]
+fn auth_mutation_lock_path_matches(opened: &std::fs::Metadata, candidate: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let linked = match fs::symlink_metadata(candidate) {
+        Ok(linked) => linked,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to revalidate BBDown auth lock alias {}",
+                    candidate.display()
+                )
+            });
+        }
+    };
+    if !linked.file_type().is_file()
+        || opened.dev() != linked.dev()
+        || opened.ino() != linked.ino()
+        || linked.uid() != unsafe { libc::geteuid() }
+    {
+        bail!(
+            "BBDown auth lock path or ownership changed while locking: {}",
+            candidate.display()
+        );
+    }
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn ensure_auth_mutation_lock_aliases(file: &File, path: &Path, anchor_path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    validate_auth_mutation_lock_candidate(file, path, anchor_path)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let anchor_parent = anchor_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = fs::canonicalize(parent).with_context(|| {
+        format!(
+            "failed to resolve BBDown auth lock directory {}",
+            parent.display()
+        )
+    })?;
+    if fs::canonicalize(anchor_parent).with_context(|| {
+        format!(
+            "failed to resolve BBDown auth lock anchor directory {}",
+            anchor_parent.display()
+        )
+    })? != canonical_parent
+    {
+        bail!("BBDown auth lock aliases resolve to different directories");
+    }
+
+    let root = RootedFs::new(&canonical_parent)?;
+    let primary_bound_path = canonical_parent.join(
+        path.file_name()
+            .context("BBDown auth lock path has no file name")?,
+    );
+    let anchor_bound_path = canonical_parent.join(
+        anchor_path
+            .file_name()
+            .context("BBDown auth lock anchor path has no file name")?,
+    );
+    let primary_entry = root.bind_entry(&primary_bound_path, false)?;
+    let anchor_entry = root.bind_entry(&anchor_bound_path, false)?;
+    let primary_identity = root.bound_entry_identity(&primary_entry)?;
+    let anchor_identity = root.bound_entry_identity(&anchor_entry)?;
+    let metadata = file
+        .metadata()
+        .context("failed to inspect held BBDown auth lock")?;
+    let matches_file = |identity: EntryIdentity| {
+        identity.is_file()
+            && identity.device() == metadata.dev()
+            && identity.inode() == metadata.ino()
+    };
+    let expected = primary_identity
+        .or(anchor_identity)
+        .filter(|identity| matches_file(*identity))
+        .context("BBDown auth lock aliases disappeared during anchor validation")?;
+    if primary_identity.is_some_and(|identity| identity != expected)
+        || anchor_identity.is_some_and(|identity| identity != expected)
+    {
+        bail!("BBDown auth lock alias identity changed during anchor validation");
+    }
+
+    match (primary_identity, anchor_identity) {
+        (Some(_), Some(_)) => {}
+        (Some(_), None) => root.ensure_hard_link_via_bound_parents_if_identity(
+            &primary_entry,
+            &anchor_entry,
+            expected,
+        )?,
+        (None, Some(_)) => root.ensure_hard_link_via_bound_parents_if_identity(
+            &anchor_entry,
+            &primary_entry,
+            expected,
+        )?,
+        (None, None) => bail!("BBDown auth lock aliases disappeared during anchor installation"),
+    }
+    validate_auth_mutation_lock_identity(file, path, anchor_path)?;
+    sync_auth_lock_pair_parent(path, anchor_path, file)?;
+    validate_auth_mutation_lock_identity(file, path, anchor_path)
+}
+
+#[cfg(unix)]
+fn validate_auth_mutation_lock_identity(
+    file: &File,
+    path: &Path,
+    anchor_path: &Path,
+) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    validate_auth_mutation_lock_candidate(file, path, anchor_path)?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("failed to inspect BBDown auth lock {}", path.display()))?;
+    if opened.nlink() != 2 || opened.permissions().mode() & 0o777 != 0o600 {
+        bail!("BBDown auth lock anchor or access policy changed");
+    }
+    if !auth_mutation_lock_path_matches(&opened, path)?
+        || !auth_mutation_lock_path_matches(&opened, anchor_path)?
+    {
+        bail!("BBDown auth lock anchor disappeared");
+    }
+    Ok(())
+}
+
 #[cfg(not(unix))]
-fn validate_auth_mutation_lock_identity(file: &File, path: &Path) -> Result<()> {
+fn validate_auth_mutation_lock_candidate(
+    file: &File,
+    path: &Path,
+    anchor_path: &Path,
+) -> Result<()> {
     if !file
         .metadata()
         .with_context(|| format!("failed to inspect BBDown auth lock {}", path.display()))?
         .is_file()
+        || (!path.is_file() && !anchor_path.is_file())
     {
         bail!("BBDown auth lock is not a regular file: {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_auth_mutation_lock_aliases(file: &File, path: &Path, anchor_path: &Path) -> Result<()> {
+    validate_auth_mutation_lock_candidate(file, path, anchor_path)?;
+    match (path.exists(), anchor_path.exists()) {
+        (true, false) => {
+            fs::hard_link(path, anchor_path).context("failed to create BBDown auth lock anchor")?
+        }
+        (false, true) => {
+            fs::hard_link(anchor_path, path).context("failed to restore BBDown auth lock path")?
+        }
+        (true, true) => {}
+        (false, false) => bail!("BBDown auth lock aliases disappeared"),
+    }
+    sync_auth_lock_pair_parent(path, anchor_path, file)
+}
+
+#[cfg(not(unix))]
+fn validate_auth_mutation_lock_identity(
+    file: &File,
+    path: &Path,
+    anchor_path: &Path,
+) -> Result<()> {
+    validate_auth_mutation_lock_candidate(file, path, anchor_path)?;
+    if !path.is_file() || !anchor_path.is_file() {
+        bail!("BBDown auth lock anchor disappeared");
     }
     Ok(())
 }
@@ -1356,6 +1611,12 @@ fn set_auth_mutation_lock_private(_file: &File, _path: &Path) -> Result<()> {
 fn auth_mutation_lock_path(credential_file: &Path) -> PathBuf {
     let mut value = credential_file.as_os_str().to_os_string();
     value.push(AUTH_MUTATION_LOCK_SUFFIX);
+    PathBuf::from(value)
+}
+
+fn auth_mutation_lock_anchor_path(credential_file: &Path) -> PathBuf {
+    let mut value = auth_mutation_lock_path(credential_file).into_os_string();
+    value.push(AUTH_MUTATION_LOCK_ANCHOR_SUFFIX);
     PathBuf::from(value)
 }
 
@@ -2862,7 +3123,12 @@ mod tests {
             .file_name()
             .expect("auth lock should have a file name")
             .to_os_string();
+        let anchor_name = auth_mutation_lock_anchor_path(&credential_file)
+            .file_name()
+            .expect("auth lock anchor should have a file name")
+            .to_os_string();
         assert!(credential_parent.join(lock_name).is_file());
+        assert!(credential_parent.join(anchor_name).is_file());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3153,6 +3419,78 @@ mod tests {
             current.current_epoch().expect("epoch should remain stable"),
             current_epoch
         );
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_epoch_survives_primary_lock_unlink_before_a_stale_login_reply() {
+        use std::cell::Cell;
+        use std::os::unix::fs::MetadataExt;
+
+        let state_path = temp_state_file("auth-epoch-primary-unlink");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let pending_login = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect("pending login should capture the initial epoch");
+        let pending_epoch = pending_login.current_epoch().expect("epoch should read");
+        drop(pending_login);
+        let (_, logout_epoch) =
+            with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+                .expect("logout mutation should advance the epoch");
+        assert_eq!(pending_epoch, 0);
+        assert_eq!(logout_epoch, 1);
+
+        let lock_path = auth_mutation_lock_path(&credential_file);
+        let anchor_path = auth_mutation_lock_anchor_path(&credential_file);
+        fs::remove_file(&lock_path).expect("primary auth lock alias should unlink");
+        let called = Cell::new(false);
+        let error = with_auth_mutation_transaction_at_epoch(
+            &state_path,
+            &credential_file,
+            pending_epoch,
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("a stale pending login must remain rejected after primary unlink");
+
+        assert!(error.to_string().contains("credential state changed"));
+        assert!(!called.get());
+        let primary = fs::symlink_metadata(&lock_path).expect("primary alias should be restored");
+        let anchor = fs::symlink_metadata(&anchor_path).expect("anchor should remain linked");
+        assert_eq!((primary.dev(), primary.ino()), (anchor.dev(), anchor.ino()));
+        assert_eq!(primary.nlink(), 2);
+        let current = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect("auth lock should reopen from the anchored epoch");
+        assert_eq!(current.current_epoch().unwrap(), logout_epoch);
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_lock_rejects_a_replaced_primary_alias_unchanged() {
+        let state_path = temp_state_file("auth-lock-replaced-primary");
+        let credential_file = state_path.with_file_name("credentials.json");
+        drop(
+            acquire_auth_reply_file_lock(&state_path, &credential_file)
+                .expect("auth lock should initialize"),
+        );
+        let lock_path = auth_mutation_lock_path(&credential_file);
+        let anchor_path = auth_mutation_lock_anchor_path(&credential_file);
+        fs::remove_file(&lock_path).expect("primary auth lock alias should unlink");
+        fs::write(&lock_path, b"user-owned replacement").expect("replacement should be written");
+
+        let error = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect_err("a replaced primary auth lock alias must fail closed");
+
+        assert!(format!("{error:#}").contains("path or ownership changed"));
+        assert_eq!(fs::read(&lock_path).unwrap(), b"user-owned replacement");
+        assert!(anchor_path.is_file());
         if let Some(parent) = state_path.parent() {
             let _ = fs::remove_dir_all(parent);
         }

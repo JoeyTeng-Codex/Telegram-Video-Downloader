@@ -60,6 +60,7 @@ const BILIBILI_WORKER_REQUEST_VERSION: u32 = 3;
 const BILIBILI_WORKER_REQUEST_LIMIT: usize = 1024 * 1024;
 const VIDEO_OUTPUT_LOCK_FILE_NAME: &str = ".telegram-video-downloader.lock";
 const VIDEO_CONTROL_DIR_NAME: &str = ".telegram-video-downloader-control";
+const VIDEO_OUTPUT_LOCK_ANCHOR_FILE_NAME: &str = "output-lock";
 const VIDEO_CONTROL_INITIALIZING_DIR_PREFIX: &str =
     ".telegram-video-downloader-control.initializing";
 const VIDEO_CONTROL_OWNER_FILE_NAME: &str = "owner.json";
@@ -4619,11 +4620,86 @@ impl Drop for VideoRecoveryState {
 }
 
 fn video_output_lock_file(root: &RootedFs) -> Result<BoundFile> {
-    root.open_or_create_bound_file(
-        &root.logical_root_path().join(VIDEO_OUTPUT_LOCK_FILE_NAME),
-        0o600,
-    )
-    .context("failed to open the cross-process video output lock")
+    // Protected property: every process must flock the same inode. The authenticated control
+    // directory keeps that inode alive if the legacy root-level path is unlinked.
+    let control_path = root.logical_root_path().join(VIDEO_CONTROL_DIR_NAME);
+    let control_preexisted = root.entry_identity(&control_path)?.is_some();
+    let control = video_control_directory(root)?;
+    root.validate_private_bound_directory(&control.entry, control.identity, 0o700)?;
+
+    let legacy_path = root.logical_root_path().join(VIDEO_OUTPUT_LOCK_FILE_NAME);
+    let anchor_path = control.path.join(VIDEO_OUTPUT_LOCK_ANCHOR_FILE_NAME);
+    let legacy_entry = root.bind_entry(&legacy_path, false)?;
+    let anchor_entry = root.bind_entry(&anchor_path, false)?;
+    let mut legacy_identity = root.bound_entry_identity(&legacy_entry)?;
+    let mut anchor_identity = root.bound_entry_identity(&anchor_entry)?;
+
+    if legacy_identity.is_none() && anchor_identity.is_none() {
+        if control_preexisted {
+            bail!(
+                "cross-process video output lock anchor disappeared from initialized control directory"
+            );
+        }
+        let created = root
+            .open_or_create_bound_file(&anchor_path, 0o600)
+            .context("failed to initialize the cross-process video output lock anchor")?;
+        anchor_identity = root.bound_entry_identity(&anchor_entry)?;
+        legacy_identity = root.bound_entry_identity(&legacy_entry)?;
+        if anchor_identity != Some(created.identity()) {
+            bail!("cross-process video output lock anchor changed during initialization");
+        }
+    }
+
+    let expected = match (anchor_identity, legacy_identity) {
+        (Some(anchor), Some(legacy)) if anchor == legacy => anchor,
+        (Some(_), Some(_)) => {
+            bail!("legacy video output lock path does not match its authenticated anchor");
+        }
+        (Some(anchor), None) => {
+            let file = root
+                .open_bound_file(&anchor_path)?
+                .context("video output lock anchor disappeared while restoring its alias")?;
+            if file.identity() != anchor {
+                bail!("video output lock anchor changed while restoring its alias");
+            }
+            file.validate_private_single_link(0o600)?;
+            root.ensure_hard_link_via_bound_parents_if_identity(
+                &anchor_entry,
+                &legacy_entry,
+                anchor,
+            )?;
+            anchor
+        }
+        (None, Some(legacy)) => {
+            let file = root
+                .open_bound_file(&legacy_path)?
+                .context("legacy video output lock disappeared during anchor migration")?;
+            if file.identity() != legacy {
+                bail!("legacy video output lock changed during anchor migration");
+            }
+            file.validate_private_single_link(0o600)?;
+            root.ensure_hard_link_via_bound_parents_if_identity(
+                &legacy_entry,
+                &anchor_entry,
+                legacy,
+            )?;
+            legacy
+        }
+        (None, None) => bail!("cross-process video output lock disappeared during initialization"),
+    };
+
+    let file = root
+        .open_bound_file(&anchor_path)?
+        .context("cross-process video output lock anchor is missing")?;
+    if file.identity() != expected
+        || root.bound_entry_identity(&anchor_entry)? != Some(expected)
+        || root.bound_entry_identity(&legacy_entry)? != Some(expected)
+    {
+        bail!("cross-process video output lock aliases changed during validation");
+    }
+    file.validate_private_link_count(0o600, 2)?;
+    root.validate_private_bound_directory(&control.entry, control.identity, 0o700)?;
+    Ok(file)
 }
 
 fn video_control_directory(root: &RootedFs) -> Result<VideoControlDirectory> {
@@ -5561,7 +5637,7 @@ fn inherited_worker_output_lock(expected_device: u64, expected_inode: u64) -> Re
         || stat.st_ino as u64 != expected_inode
         || stat.st_mode & 0o777 != 0o600
         || stat.st_uid != unsafe { libc::geteuid() }
-        || stat.st_nlink != 1
+        || stat.st_nlink != 2
     {
         bail!("inherited video output lock identity or access policy changed");
     }
@@ -5588,7 +5664,7 @@ fn prepare_bilibili_worker_inherited_fds(
     worker_liveness: &UnixStream,
     output_lock: &BoundFile,
 ) -> Result<Vec<AdditionalInheritedCommandFd>> {
-    output_lock.validate_private_single_link(0o600)?;
+    output_lock.validate_private_link_count(0o600, 2)?;
     let output_lock_source = output_lock
         .duplicate_fd_cloexec_at_least(libc::STDERR_FILENO + 1)
         .context("failed to duplicate the video output lock for the Bilibili worker")?;
@@ -17825,6 +17901,7 @@ mv video.original video.m4s || exit 46
             existing_videos: vec![existing.clone()],
         };
         let root = RootedFs::new(&video_dir).expect("output root should bind");
+        drop(video_output_lock_file(&root).expect("crashed owner lock should initialize"));
         let duplicate =
             bind_test_overwrite_confirmation(&root, VideoDuplicateAction::Overwrite, &duplicate)
                 .expect("overwrite confirmation should bind");
@@ -17889,6 +17966,7 @@ mv video.original video.m4s || exit 46
         let unresolved = nested.join(format!("{OVERWRITE_BACKUP_DIR_PREFIX}-legacy"));
         fs::create_dir_all(&unresolved).expect("legacy recovery directory should create");
         let root = RootedFs::new(&video_dir).expect("output root should bind");
+        drop(video_output_lock_file(&root).expect("previous owner lock should initialize"));
         video_recovery_state_file(&root)
             .expect("recovery state should open")
             .0
@@ -18029,6 +18107,55 @@ mv video.original video.m4s || exit 46
         );
 
         drop(second);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn video_output_lock_rejects_a_replaced_legacy_alias_unchanged() {
+        let video_dir = temp_test_dir("video-output-lock-replaced-alias");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+        let lock = video_output_lock_file(&root).expect("output lock should initialize");
+        let anchor_identity = lock.identity();
+        drop(lock);
+        let legacy_path = video_dir.join(VIDEO_OUTPUT_LOCK_FILE_NAME);
+        fs::remove_file(&legacy_path).expect("legacy lock alias should unlink");
+        fs::write(&legacy_path, b"user-owned replacement").expect("replacement should be written");
+
+        let error = video_output_lock_file(&root)
+            .expect_err("a replaced legacy lock alias must fail closed");
+
+        assert!(format!("{error:#}").contains("does not match its authenticated anchor"));
+        assert_eq!(fs::read(&legacy_path).unwrap(), b"user-owned replacement");
+        assert_eq!(
+            root.entry_identity(
+                &video_dir
+                    .join(VIDEO_CONTROL_DIR_NAME)
+                    .join(VIDEO_OUTPUT_LOCK_ANCHOR_FILE_NAME)
+            )
+            .unwrap(),
+            Some(anchor_identity)
+        );
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn video_output_lock_does_not_reinitialize_after_both_aliases_disappear() {
+        let video_dir = temp_test_dir("video-output-lock-missing-aliases");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+        drop(video_output_lock_file(&root).expect("output lock should initialize"));
+        let legacy_path = video_dir.join(VIDEO_OUTPUT_LOCK_FILE_NAME);
+        let anchor_path = video_dir
+            .join(VIDEO_CONTROL_DIR_NAME)
+            .join(VIDEO_OUTPUT_LOCK_ANCHOR_FILE_NAME);
+        fs::remove_file(&legacy_path).expect("legacy lock alias should unlink");
+        fs::remove_file(&anchor_path).expect("lock anchor should unlink");
+
+        let error = video_output_lock_file(&root)
+            .expect_err("an initialized lock domain must never reset silently");
+
+        assert!(format!("{error:#}").contains("lock anchor disappeared"));
+        assert!(!legacy_path.exists());
+        assert!(!anchor_path.exists());
         let _ = fs::remove_dir_all(video_dir);
     }
 
@@ -18424,7 +18551,14 @@ mv video.original video.m4s || exit 46
             std::thread::sleep(Duration::from_millis(20));
         }
 
+        let legacy_path = root.join(VIDEO_OUTPUT_LOCK_FILE_NAME);
+        fs::remove_file(&legacy_path).expect("legacy lock alias should unlink");
         let contender = video_output_lock_file(&rooted).expect("recovery lock should open");
+        let anchor_path = root
+            .join(VIDEO_CONTROL_DIR_NAME)
+            .join(VIDEO_OUTPUT_LOCK_ANCHOR_FILE_NAME);
+        assert_eq!(rooted.entry_identity(&legacy_path).unwrap(), Some(identity));
+        assert_eq!(rooted.entry_identity(&anchor_path).unwrap(), Some(identity));
         assert!(
             !contender
                 .try_lock_exclusive()
