@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::OnceLock;
@@ -33,6 +35,8 @@ use crate::safe_fs::{
 };
 
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+#[cfg(unix)]
+static BILIBILI_WORKER_PROCESS: AtomicBool = AtomicBool::new(false);
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static OVERWRITE_BACKUP_COUNTER: AtomicU64 = AtomicU64::new(1);
 const VIDEO_STAGING_DIR_NAME: &str = ".telegram-video-downloader-staging";
@@ -47,8 +51,10 @@ const VIDEO_STAGING_PUBLICATION_MAX_STEPS: usize = 4096;
 const VIDEO_STAGING_RETENTION_FILE_NAME: &str = ".retained.json";
 const VIDEO_STAGING_RETENTION_VERSION: u32 = 1;
 const VIDEO_STAGING_RETENTION_LIMIT: usize = 4096;
+const VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON: &str =
+    "download completed; automatic publication has not finished";
 const BILIBILI_WORKER_REQUEST_FILE_NAME: &str = ".bilibili-worker.json";
-const BILIBILI_WORKER_REQUEST_VERSION: u32 = 1;
+const BILIBILI_WORKER_REQUEST_VERSION: u32 = 2;
 const BILIBILI_WORKER_REQUEST_LIMIT: usize = 1024 * 1024;
 const BILIBILI_STAGING_CONFIG_LIMIT: usize = 1024 * 1024;
 const VIDEO_OUTPUT_LOCK_FILE_NAME: &str = ".telegram-video-downloader.lock";
@@ -72,6 +78,12 @@ const BILIBILI_MUX_RECOVERY_MANIFEST_VERSION: u32 = 1;
 const BILIBILI_MUX_RECOVERY_MANIFEST_LIMIT: usize = 16 * 1024;
 #[cfg(unix)]
 const BILIBILI_MUX_FD_BASE: i32 = 64;
+#[cfg(unix)]
+const BILIBILI_WORKER_LIVENESS_FD: i32 = BILIBILI_MUX_FD_BASE - 1;
+#[cfg(unix)]
+const COMMAND_DESCENDANT_FENCE_FD: i32 = BILIBILI_MUX_FD_BASE - 2;
+#[cfg(unix)]
+const COMMAND_INHERITED_SOURCE_FD_MINIMUM: i32 = 256;
 const OVERWRITE_BACKUP_DIR_PREFIX: &str = ".telegram-video-downloader-overwrite";
 const OVERWRITE_RECOVERY_MANIFEST_NAME: &str = ".transaction.json";
 const OVERWRITE_RECOVERY_MANIFEST_TEMP_NAME: &str = ".transaction.next.json";
@@ -98,10 +110,48 @@ const OUTPUT_ABORT_GRACE: Duration = Duration::from_secs(3);
 const BILIBILI_METADATA_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const BILIBILI_METADATA_PROBE_AFTER_DUPLICATE_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandProcessGroup {
+    #[cfg(unix)]
+    Owned(libc::pid_t),
+    #[cfg(unix)]
+    Inherited(libc::pid_t),
+    None,
+}
+
+impl CommandProcessGroup {
+    #[cfg(unix)]
+    fn id(self) -> Option<libc::pid_t> {
+        match self {
+            Self::Owned(id) | Self::Inherited(id) => Some(id),
+            Self::None => None,
+        }
+    }
+
+    fn is_inherited(self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(self, Self::Inherited(_))
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = self;
+            false
+        }
+    }
+}
+
 #[cfg(unix)]
-type CommandProcessGroup = Option<libc::pid_t>;
+#[derive(Debug)]
+struct AdditionalInheritedCommandFd {
+    source: OwnedFd,
+    target: i32,
+}
+
 #[cfg(not(unix))]
-type CommandProcessGroup = Option<()>;
+#[derive(Debug)]
+struct AdditionalInheritedCommandFd;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandTotalDeadline {
@@ -119,22 +169,26 @@ enum CommandProcessGroupMode {
 struct CommandExecutionPolicy {
     total_deadline: CommandTotalDeadline,
     process_group: CommandProcessGroupMode,
+    descendant_fence: bool,
 }
 
 impl CommandExecutionPolicy {
     const EXTERNAL: Self = Self {
         total_deadline: CommandTotalDeadline::Configured,
         process_group: CommandProcessGroupMode::Owned,
+        descendant_fence: false,
     };
 
     const BILIBILI_WORKER: Self = Self {
         total_deadline: CommandTotalDeadline::Disabled,
         process_group: CommandProcessGroupMode::Owned,
+        descendant_fence: false,
     };
 
     const BILIBILI_MUX: Self = Self {
         total_deadline: CommandTotalDeadline::Configured,
         process_group: CommandProcessGroupMode::Inherited,
+        descendant_fence: true,
     };
 }
 
@@ -161,6 +215,10 @@ struct BilibiliWorkerRequest {
     selection: Option<BilibiliSelection>,
     expected_overwrite_identity: Option<VideoIdentity>,
     logical_output_dir: PathBuf,
+    output_root_device: u64,
+    output_root_inode: u64,
+    staging_device: u64,
+    staging_inode: u64,
 }
 
 pub fn job_progress_channel() -> (JobProgressSender, JobProgressReceiver) {
@@ -821,13 +879,8 @@ async fn run_staged_bilibili_worker(
     expected_overwrite_identity: Option<&VideoIdentity>,
     progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
-    let request = build_bilibili_worker_request(
-        config,
-        url,
-        selection,
-        expected_overwrite_identity,
-        staging.path(),
-    );
+    let request =
+        build_bilibili_worker_request(config, url, selection, expected_overwrite_identity, staging);
     let contents =
         serde_json::to_vec(&request).context("failed to encode Bilibili worker request")?;
     if contents.len() > BILIBILI_WORKER_REQUEST_LIMIT {
@@ -854,11 +907,22 @@ async fn run_staged_bilibili_worker(
         activity_dir: Some(staging.path().to_path_buf()),
         cleanup_paths: Vec::new(),
     };
+    #[cfg(unix)]
+    let (additional_inherited_fds, _parent_liveness) = {
+        let (worker_liveness, parent_liveness) =
+            command_liveness_pair().context("failed to create Bilibili worker liveness channel")?;
+        let inherited =
+            prepare_additional_inherited_command_fd(&worker_liveness, BILIBILI_WORKER_LIVENESS_FD)?;
+        (vec![inherited], parent_liveness)
+    };
+    #[cfg(not(unix))]
+    let additional_inherited_fds = Vec::new();
     let output = run_command_with_bound_cwd_and_inherited_files_with_policy(
         config,
         &spec,
         &staging.directory,
         std::slice::from_ref(&request_file),
+        additional_inherited_fds,
         progress,
         CommandExecutionPolicy::BILIBILI_WORKER,
     )
@@ -882,7 +946,7 @@ fn build_bilibili_worker_request(
     url: &str,
     selection: Option<BilibiliSelection>,
     expected_overwrite_identity: Option<&VideoIdentity>,
-    logical_output_dir: &Path,
+    staging: &BoundStagingDir,
 ) -> BilibiliWorkerRequest {
     let mut worker_config = config.clone();
     worker_config.telegram.token = "redacted-worker-token".to_string();
@@ -896,12 +960,75 @@ fn build_bilibili_worker_request(
         url: url.to_string(),
         selection,
         expected_overwrite_identity: expected_overwrite_identity.cloned(),
-        logical_output_dir: logical_output_dir.to_path_buf(),
+        logical_output_dir: staging.path().to_path_buf(),
+        output_root_device: staging.root.root_identity().device(),
+        output_root_inode: staging.root.root_identity().inode(),
+        staging_device: staging.identity.device(),
+        staging_inode: staging.identity.inode(),
     }
 }
 
 #[cfg(unix)]
+fn validate_bilibili_worker_staging(
+    root: &RootedFs,
+    request: &BilibiliWorkerRequest,
+) -> Result<()> {
+    if root.root_identity().device() != request.staging_device
+        || root.root_identity().inode() != request.staging_inode
+        || !root.root_identity().is_dir()
+    {
+        bail!("Bilibili worker staging directory does not match its request");
+    }
+    let owner_path = root.logical_root_path().join(VIDEO_STAGING_OWNER_FILE_NAME);
+    let owner = root
+        .open_bound_file(&owner_path)?
+        .context("Bilibili worker staging ownership record is missing")?;
+    owner.validate_private_single_link(0o600)?;
+    let actual: VideoStagingOwner =
+        serde_json::from_slice(&owner.read_limited(VIDEO_STAGING_OWNER_LIMIT)?)
+            .context("failed to parse Bilibili worker staging ownership record")?;
+    if actual.version != VIDEO_STAGING_OWNER_VERSION
+        || actual.root_device != request.output_root_device
+        || actual.root_inode != request.output_root_inode
+        || actual.staging_device != request.staging_device
+        || actual.staging_inode != request.staging_inode
+    {
+        bail!("Bilibili worker staging ownership record does not match its request");
+    }
+    if root.entry_identity(&owner_path)? != Some(owner.identity()) {
+        bail!("Bilibili worker staging ownership record changed during validation");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn persist_bilibili_worker_completion(
+    root: &RootedFs,
+    request: &BilibiliWorkerRequest,
+) -> Result<()> {
+    validate_bilibili_worker_staging(root, request)?;
+    persist_video_staging_retention_marker(
+        root,
+        &root
+            .logical_root_path()
+            .join(VIDEO_STAGING_RETENTION_FILE_NAME),
+        request.output_root_device,
+        request.output_root_inode,
+        request.staging_device,
+        request.staging_inode,
+        VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON,
+    )
+    .context("failed to persist Bilibili worker completion marker")
+}
+
+#[cfg(unix)]
 pub async fn run_bilibili_worker() -> Result<()> {
+    ensure_current_process_owns_its_group()
+        .context("Bilibili worker requires a dedicated process group")?;
+    if BILIBILI_WORKER_PROCESS.swap(true, Ordering::AcqRel) {
+        bail!("Bilibili worker mode was initialized more than once");
+    }
+    let liveness = inherited_worker_liveness_stream()?;
     let request_fd = unsafe { OwnedFd::from_raw_fd(BILIBILI_MUX_FD_BASE) };
     let mut reader = std::fs::File::from(request_fd)
         .take((BILIBILI_WORKER_REQUEST_LIMIT as u64).saturating_add(1));
@@ -920,6 +1047,7 @@ pub async fn run_bilibili_worker() -> Result<()> {
         bail!("invalid Bilibili worker request");
     }
     let root = RootedFs::new(Path::new("."))?;
+    validate_bilibili_worker_staging(&root, &request)?;
     let (progress, mut progress_receiver) = job_progress_channel();
     let progress_writer = tokio::spawn(async move {
         while progress_receiver.changed().await.is_ok() {
@@ -930,20 +1058,39 @@ pub async fn run_bilibili_worker() -> Result<()> {
             }
         }
     });
-    let result = run_bilibili_job_locked(
-        &request.config,
-        &root,
-        &request.url,
-        request.selection,
-        request.expected_overwrite_identity.as_ref(),
-        Some(&request.logical_output_dir),
-        Some(progress),
-    )
-    .await;
+    let result = tokio::select! {
+        result = run_bilibili_job_locked(
+            &request.config,
+            &root,
+            &request.url,
+            request.selection,
+            request.expected_overwrite_identity.as_ref(),
+            Some(&request.logical_output_dir),
+            Some(progress),
+        ) => result,
+        liveness_result = wait_for_liveness_peer_close(liveness) => {
+            let reason = match liveness_result {
+                Ok(()) => "Bilibili worker parent exited",
+                Err(_) => "Bilibili worker parent liveness check failed",
+            };
+            terminate_current_process_group(reason);
+        }
+    };
+    let report = match result {
+        Ok(report) => {
+            persist_bilibili_worker_completion(&root, &request)?;
+            report
+        }
+        Err(err) => {
+            progress_writer
+                .await
+                .context("failed to join Bilibili worker progress writer")?;
+            return Err(err);
+        }
+    };
     progress_writer
         .await
         .context("failed to join Bilibili worker progress writer")?;
-    let report = result?;
     println!(
         "{}",
         serde_json::to_string(&report).context("failed to encode Bilibili worker report")?
@@ -3316,8 +3463,29 @@ async fn run_staged_video_job(
     };
 
     let mut report = match result {
-        Ok(report) => report,
-        Err(err) => return Err(err),
+        Ok(report) => {
+            staging
+                .retain_for_manual_recovery(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)
+                .context("failed to persist completed staged download before publication")?;
+            report
+        }
+        Err(err) => {
+            match retained_video_staging_reason(&staging.root, staging.path(), staging.identity) {
+                Ok(Some(reason)) => {
+                    staging.preserve_for_recovery();
+                    return Err(err.context(format!(
+                        "Bilibili worker retained completed outputs for manual recovery: {reason}"
+                    )));
+                }
+                Ok(None) => return Err(err),
+                Err(retention_error) => {
+                    staging.preserve_for_recovery();
+                    return Err(err.context(format!(
+                    "failed to verify the staged download completion marker; staging was retained: {retention_error:#}"
+                )));
+                }
+            }
+        }
     };
 
     staging
@@ -4627,6 +4795,7 @@ async fn run_command_with_bound_cwd_and_inherited_files(
         spec,
         bound_cwd,
         inherited_files,
+        Vec::new(),
         progress,
         CommandExecutionPolicy::EXTERNAL,
     )
@@ -4638,14 +4807,16 @@ async fn run_command_with_bound_cwd_and_inherited_files_with_policy(
     spec: &CommandSpec,
     bound_cwd: &BoundDirectory,
     inherited_files: &[BoundFile],
+    additional_inherited_fds: Vec<AdditionalInheritedCommandFd>,
     progress: Option<JobProgressSender>,
     policy: CommandExecutionPolicy,
 ) -> Result<CommandOutput> {
-    run_command_with_execution_context(
+    run_command_with_execution_context_and_additional_fds(
         config,
         spec,
         Some(bound_cwd),
         inherited_files,
+        additional_inherited_fds,
         progress,
         policy,
     )
@@ -4660,6 +4831,34 @@ async fn run_command_with_execution_context(
     progress: Option<JobProgressSender>,
     policy: CommandExecutionPolicy,
 ) -> Result<CommandOutput> {
+    run_command_with_execution_context_and_additional_fds(
+        config,
+        spec,
+        bound_cwd,
+        inherited_files,
+        Vec::new(),
+        progress,
+        policy,
+    )
+    .await
+}
+
+async fn run_command_with_execution_context_and_additional_fds(
+    config: &AppConfig,
+    spec: &CommandSpec,
+    bound_cwd: Option<&BoundDirectory>,
+    inherited_files: &[BoundFile],
+    mut additional_inherited_fds: Vec<AdditionalInheritedCommandFd>,
+    progress: Option<JobProgressSender>,
+    policy: CommandExecutionPolicy,
+) -> Result<CommandOutput> {
+    #[cfg(unix)]
+    if matches!(policy.process_group, CommandProcessGroupMode::Inherited)
+        && BILIBILI_WORKER_PROCESS.load(Ordering::Acquire)
+    {
+        ensure_current_process_owns_its_group()
+            .context("refused to run Bilibili mux outside its owned worker process group")?;
+    }
     let _cleanup = CommandCleanup::new(spec.cleanup_paths.clone());
     let mut file_activity = match &spec.activity_dir {
         Some(activity_dir) => match FileActivityTracker::new(activity_dir).await {
@@ -4681,13 +4880,31 @@ async fn run_command_with_execution_context(
     };
 
     #[cfg(unix)]
-    let inherited_fds = prepare_inherited_command_fds(inherited_files)?;
+    let descendant_fence = if policy.descendant_fence {
+        let (child_fence, parent_fence) =
+            command_liveness_pair().context("failed to create command descendant fence")?;
+        additional_inherited_fds.push(prepare_additional_inherited_command_fd(
+            &child_fence,
+            COMMAND_DESCENDANT_FENCE_FD,
+        )?);
+        Some(parent_fence)
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    let mut inherited_fds = prepare_inherited_command_fds(inherited_files)?;
+    #[cfg(unix)]
+    append_additional_inherited_command_fds(&mut inherited_fds, additional_inherited_fds)?;
     #[cfg(unix)]
     let bound_cwd_fd = bound_cwd
         .map(|directory| prepare_bound_command_cwd_fd(directory, inherited_files.len()))
         .transpose()?;
     #[cfg(not(unix))]
-    if !inherited_files.is_empty() || bound_cwd.is_some() {
+    if !inherited_files.is_empty()
+        || !additional_inherited_fds.is_empty()
+        || bound_cwd.is_some()
+        || policy.descendant_fence
+    {
         bail!("inherited command files and bound working directories require a Unix platform");
     }
 
@@ -4732,8 +4949,14 @@ async fn run_command_with_execution_context(
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to run {}", spec.program.display()))?;
+    drop(command);
     let process_group = command_process_group(&child, policy.process_group);
     let mut process_group_guard = CommandProcessGroupGuard::new(process_group);
+    #[cfg(unix)]
+    let descendant_fence_handle =
+        descendant_fence.map(|fence| tokio::spawn(wait_for_liveness_peer_close(fence)));
+    #[cfg(not(unix))]
+    let descendant_fence_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>> = None;
 
     let stdout = child
         .stdout
@@ -4789,7 +5012,12 @@ async fn run_command_with_execution_context(
             } => {
                 terminate_command_tree(&mut child, process_group).await;
                 let (stdout, stderr) =
-                    collect_stream_outputs(stdout_handle, stderr_handle, process_group).await;
+                    collect_stream_outputs(
+                        stdout_handle,
+                        stderr_handle,
+                        descendant_fence_handle,
+                        process_group,
+                    ).await;
                 process_group_guard.disarm();
                 bail!(
                     "{} timed out after {}s\n{}",
@@ -4801,7 +5029,12 @@ async fn run_command_with_execution_context(
             _ = sleep_until(idle_deadline) => {
                 terminate_command_tree(&mut child, process_group).await;
                 let (stdout, stderr) =
-                    collect_stream_outputs(stdout_handle, stderr_handle, process_group).await;
+                    collect_stream_outputs(
+                        stdout_handle,
+                        stderr_handle,
+                        descendant_fence_handle,
+                        process_group,
+                    ).await;
                 process_group_guard.disarm();
                 bail!(
                     "{} had no output or file activity for {}s\n{}",
@@ -4834,8 +5067,27 @@ async fn run_command_with_execution_context(
         }
     };
 
-    let (stdout, stderr) =
-        collect_stream_outputs(stdout_handle, stderr_handle, process_group).await;
+    let (stdout, stderr) = collect_stream_outputs(
+        stdout_handle,
+        stderr_handle,
+        descendant_fence_handle,
+        process_group,
+    )
+    .await;
+    if !status.success() && process_group.is_inherited() {
+        let summary = summarize_output(
+            &String::from_utf8_lossy(&stdout),
+            &String::from_utf8_lossy(&stderr),
+        );
+        abort_command_process_group(
+            process_group,
+            &format!(
+                "{} exited with status {}\n{summary}",
+                spec.program.display(),
+                status
+            ),
+        );
+    }
     process_group_guard.disarm();
     if let Some(bound_cwd) = bound_cwd {
         bound_cwd
@@ -4884,6 +5136,71 @@ fn prepare_inherited_command_fds(files: &[BoundFile]) -> Result<Vec<(OwnedFd, i3
         .collect()
 }
 
+#[cfg(unix)]
+fn command_liveness_pair() -> Result<(UnixStream, UnixStream)> {
+    let (first, second) = UnixStream::pair().context("failed to create Unix socket pair")?;
+    for endpoint in [&first, &second] {
+        let flags = rustix::io::fcntl_getfd(endpoint)
+            .context("failed to inspect command liveness descriptor flags")?;
+        rustix::io::fcntl_setfd(endpoint, flags | rustix::io::FdFlags::CLOEXEC)
+            .context("failed to mark command liveness descriptor close-on-exec")?;
+        endpoint
+            .set_nonblocking(true)
+            .context("failed to make command liveness descriptor nonblocking")?;
+    }
+    Ok((first, second))
+}
+
+#[cfg(unix)]
+fn inherited_worker_liveness_stream() -> Result<UnixStream> {
+    let liveness_fd = unsafe { OwnedFd::from_raw_fd(BILIBILI_WORKER_LIVENESS_FD) };
+    let descriptor_flags = rustix::io::fcntl_getfd(&liveness_fd)
+        .context("failed to inspect inherited Bilibili worker liveness descriptor")?;
+    rustix::io::fcntl_setfd(
+        &liveness_fd,
+        descriptor_flags | rustix::io::FdFlags::CLOEXEC,
+    )
+    .context("failed to protect Bilibili worker liveness descriptor from nested commands")?;
+    Ok(UnixStream::from(liveness_fd))
+}
+
+#[cfg(unix)]
+fn prepare_additional_inherited_command_fd(
+    source: &impl AsFd,
+    target: i32,
+) -> Result<AdditionalInheritedCommandFd> {
+    if target <= libc::STDERR_FILENO {
+        bail!("refused to replace a standard command descriptor");
+    }
+    let source = rustix::io::fcntl_dupfd_cloexec(source, COMMAND_INHERITED_SOURCE_FD_MINIMUM)
+        .context("failed to duplicate inherited command descriptor")?;
+    if source.as_raw_fd() == target {
+        bail!("inherited command descriptor source overlaps its target");
+    }
+    Ok(AdditionalInheritedCommandFd { source, target })
+}
+
+#[cfg(unix)]
+fn append_additional_inherited_command_fds(
+    inherited_fds: &mut Vec<(OwnedFd, i32)>,
+    additional: Vec<AdditionalInheritedCommandFd>,
+) -> Result<()> {
+    let mut targets = inherited_fds
+        .iter()
+        .map(|(_, target)| *target)
+        .collect::<BTreeSet<_>>();
+    for AdditionalInheritedCommandFd { source, target } in additional {
+        if target <= libc::STDERR_FILENO || !targets.insert(target) {
+            bail!("inherited command descriptor target is invalid or duplicated");
+        }
+        if source.as_raw_fd() == target {
+            bail!("inherited command descriptor source overlaps its target");
+        }
+        inherited_fds.push((source, target));
+    }
+    Ok(())
+}
+
 fn file_activity_poll_interval(progress_interval: Duration, idle_timeout: Duration) -> Duration {
     let half_idle_timeout = idle_timeout / 2;
     progress_interval.min(if half_idle_timeout.is_zero() {
@@ -4899,16 +5216,40 @@ fn command_process_group(
 ) -> CommandProcessGroup {
     #[cfg(unix)]
     {
-        matches!(mode, CommandProcessGroupMode::Owned)
-            .then(|| child.id().map(|id| id as libc::pid_t))
-            .flatten()
+        match mode {
+            CommandProcessGroupMode::Owned => child
+                .id()
+                .map(|id| CommandProcessGroup::Owned(id as libc::pid_t))
+                .unwrap_or(CommandProcessGroup::None),
+            CommandProcessGroupMode::Inherited => {
+                if !BILIBILI_WORKER_PROCESS.load(Ordering::Acquire) {
+                    return CommandProcessGroup::None;
+                }
+                let process_group = unsafe { libc::getpgrp() };
+                if process_group > 0 && process_group == unsafe { libc::getpid() } {
+                    CommandProcessGroup::Inherited(process_group)
+                } else {
+                    CommandProcessGroup::None
+                }
+            }
+        }
     }
 
     #[cfg(not(unix))]
     {
         let _ = (child, mode);
-        None
+        CommandProcessGroup::None
     }
+}
+
+#[cfg(unix)]
+fn ensure_current_process_owns_its_group() -> Result<()> {
+    let process = unsafe { libc::getpid() };
+    let process_group = unsafe { libc::getpgrp() };
+    if process <= 0 || process_group != process {
+        bail!("current process is not the leader of its process group");
+    }
+    Ok(())
 }
 
 async fn terminate_command_tree(
@@ -4916,7 +5257,7 @@ async fn terminate_command_tree(
     process_group: CommandProcessGroup,
 ) {
     #[cfg(unix)]
-    if let Some(process_group_id) = process_group {
+    if let Some(process_group_id) = process_group.id() {
         signal_process_group(process_group_id, libc::SIGTERM);
         let direct_child_exited = tokio_timeout(Duration::from_secs(5), child.wait())
             .await
@@ -4940,13 +5281,57 @@ fn signal_process_group(process_group_id: libc::pid_t, signal: libc::c_int) {
 
 fn force_terminate_process_group(process_group: CommandProcessGroup) {
     #[cfg(unix)]
-    if let Some(process_group_id) = process_group {
+    if let Some(process_group_id) = process_group.id() {
         signal_process_group(process_group_id, libc::SIGKILL);
     }
 
     #[cfg(not(unix))]
     {
         let _ = process_group;
+    }
+}
+
+fn abort_command_process_group(process_group: CommandProcessGroup, reason: &str) -> ! {
+    eprintln!("{reason}");
+    let _ = std::io::stderr().flush();
+    force_terminate_process_group(process_group);
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(libc::getpid(), libc::SIGKILL);
+        libc::_exit(128 + libc::SIGKILL);
+    }
+
+    #[cfg(not(unix))]
+    std::process::abort();
+}
+
+#[cfg(unix)]
+fn terminate_current_process_group(reason: &str) -> ! {
+    let process_group = unsafe { libc::getpgrp() };
+    let process_group = if process_group > 0 {
+        CommandProcessGroup::Inherited(process_group)
+    } else {
+        CommandProcessGroup::None
+    };
+    abort_command_process_group(process_group, reason)
+}
+
+#[cfg(unix)]
+async fn wait_for_liveness_peer_close(stream: UnixStream) -> std::io::Result<()> {
+    stream.set_nonblocking(true)?;
+    let stream = tokio::io::unix::AsyncFd::new(stream)?;
+    let mut buffer = [0_u8; 64];
+    loop {
+        let mut ready = stream.readable().await?;
+        match ready.try_io(|inner| {
+            let mut inner = inner.get_ref();
+            inner.read(&mut buffer)
+        }) {
+            Ok(Ok(0)) => return Ok(()),
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => return Err(err),
+            Err(_) => continue,
+        }
     }
 }
 
@@ -4975,6 +5360,7 @@ where
 async fn collect_stream_outputs(
     mut stdout_handle: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
     mut stderr_handle: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    mut descendant_fence_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     process_group: CommandProcessGroup,
 ) -> (Vec<u8>, Vec<u8>) {
     let close_deadline = Instant::now() + OUTPUT_CLOSE_GRACE;
@@ -4982,9 +5368,10 @@ async fn collect_stream_outputs(
     let mut did_terminate_group = false;
     let mut stdout = None;
     let mut stderr = None;
+    let mut descendants_closed = descendant_fence_handle.is_none();
 
     loop {
-        if stdout.is_some() && stderr.is_some() {
+        if stdout.is_some() && stderr.is_some() && descendants_closed {
             break;
         }
 
@@ -4994,6 +5381,25 @@ async fn collect_stream_outputs(
             }
             result = &mut stderr_handle, if stderr.is_none() => {
                 stderr = Some(join_stream_output(result));
+            }
+            result = async {
+                match descendant_fence_handle.as_mut() {
+                    Some(handle) => Some(handle.await),
+                    None => std::future::pending().await,
+                }
+            }, if !descendants_closed => {
+                match result {
+                    Some(Ok(Ok(()))) => descendants_closed = true,
+                    Some(Ok(Err(err))) => abort_command_process_group(
+                        process_group,
+                        &format!("command descendant fence failed: {err}"),
+                    ),
+                    Some(Err(err)) => abort_command_process_group(
+                        process_group,
+                        &format!("command descendant fence task failed: {err}"),
+                    ),
+                    None => unreachable!("a pending descendant fence cannot complete"),
+                }
             }
             _ = sleep_until(close_deadline), if !did_terminate_group => {
                 force_terminate_process_group(process_group);
@@ -5008,6 +5414,15 @@ async fn collect_stream_outputs(
                 if stderr.is_none() {
                     stderr_handle.abort();
                     stderr = Some(b"stderr reader did not close after process termination".to_vec());
+                }
+                if !descendants_closed {
+                    if let Some(handle) = descendant_fence_handle.as_mut() {
+                        handle.abort();
+                    }
+                    abort_command_process_group(
+                        process_group,
+                        "command descendants did not exit after process termination",
+                    );
                 }
             }
         }
@@ -6472,7 +6887,26 @@ fn retained_video_staging_reason(
     expected_identity: EntryIdentity,
 ) -> Result<Option<String>> {
     let marker_path = path.join(VIDEO_STAGING_RETENTION_FILE_NAME);
-    let Some(marker) = root.open_bound_file(&marker_path)? else {
+    retained_video_staging_reason_for_identity(
+        root,
+        &marker_path,
+        root.root_identity().device(),
+        root.root_identity().inode(),
+        expected_identity.device(),
+        expected_identity.inode(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retained_video_staging_reason_for_identity(
+    root: &RootedFs,
+    marker_path: &Path,
+    output_root_device: u64,
+    output_root_inode: u64,
+    staging_device: u64,
+    staging_inode: u64,
+) -> Result<Option<String>> {
+    let Some(marker) = root.open_bound_file(marker_path)? else {
         return Ok(None);
     };
     marker.validate_private_single_link(0o600)?;
@@ -6480,18 +6914,69 @@ fn retained_video_staging_reason(
         serde_json::from_slice(&marker.read_limited(VIDEO_STAGING_RETENTION_LIMIT)?)
             .context("failed to parse staged download retention marker")?;
     if retention.version != VIDEO_STAGING_RETENTION_VERSION
-        || retention.root_device != root.root_identity().device()
-        || retention.root_inode != root.root_identity().inode()
-        || retention.staging_device != expected_identity.device()
-        || retention.staging_inode != expected_identity.inode()
+        || retention.root_device != output_root_device
+        || retention.root_inode != output_root_inode
+        || retention.staging_device != staging_device
+        || retention.staging_inode != staging_inode
         || retention.reason.trim().is_empty()
     {
         bail!("staged download retention marker does not match its owned directory");
     }
-    if root.entry_identity(&marker_path)? != Some(marker.identity()) {
+    if root.entry_identity(marker_path)? != Some(marker.identity()) {
         bail!("staged download retention marker identity changed after validation");
     }
     Ok(Some(retention.reason))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_video_staging_retention_marker(
+    root: &RootedFs,
+    marker_path: &Path,
+    output_root_device: u64,
+    output_root_inode: u64,
+    staging_device: u64,
+    staging_inode: u64,
+    reason: &str,
+) -> Result<()> {
+    if reason.trim().is_empty() {
+        bail!("staged download retention reason must not be empty");
+    }
+    if retained_video_staging_reason_for_identity(
+        root,
+        marker_path,
+        output_root_device,
+        output_root_inode,
+        staging_device,
+        staging_inode,
+    )?
+    .is_some()
+    {
+        return Ok(());
+    }
+    let marker = VideoStagingRetention {
+        version: VIDEO_STAGING_RETENTION_VERSION,
+        root_device: output_root_device,
+        root_inode: output_root_inode,
+        staging_device,
+        staging_inode,
+        reason: reason.to_string(),
+    };
+    let contents = serde_json::to_vec_pretty(&marker)
+        .context("failed to encode staged download retention marker")?;
+    if contents.len() > VIDEO_STAGING_RETENTION_LIMIT {
+        bail!("staged download retention marker exceeds its size limit");
+    }
+    let (_, identity) = root
+        .create_new_bound_file(marker_path, &contents, 0o600)
+        .context("failed to persist staged download retention marker")?;
+    let file = root
+        .open_bound_file(marker_path)?
+        .context("staged download retention marker disappeared")?;
+    if file.identity() != identity {
+        bail!("staged download retention marker identity changed after creation");
+    }
+    file.validate_private_single_link(0o600)?;
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -6620,7 +7105,10 @@ where
         let manifest_path = path.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME);
         let Some(manifest_file) = root.open_bound_file(&manifest_path)? else {
             if let Some(reason) = retained_video_staging_reason(root, path, identity)? {
-                bail!("completed download outputs retained for manual recovery: {reason}");
+                return Ok(format!(
+                    "Retained completed staged video job for manual recovery: {} ({reason})",
+                    path.display()
+                ));
             }
             root.remove_bound_tree_durably_if_identity(entry, identity)?;
             return Ok(format!(
@@ -7066,32 +7554,16 @@ impl BoundStagingDir {
     fn retain_for_manual_recovery(&self, reason: &str) -> Result<()> {
         self.preserve_for_recovery();
         self.validate_for_path_access()?;
-        let marker = VideoStagingRetention {
-            version: VIDEO_STAGING_RETENTION_VERSION,
-            root_device: self.root.root_identity().device(),
-            root_inode: self.root.root_identity().inode(),
-            staging_device: self.identity.device(),
-            staging_inode: self.identity.inode(),
-            reason: reason.to_string(),
-        };
-        let contents = serde_json::to_vec_pretty(&marker)
-            .context("failed to encode staged download retention marker")?;
-        if contents.len() > VIDEO_STAGING_RETENTION_LIMIT {
-            bail!("staged download retention marker exceeds its size limit");
-        }
         let marker_path = self.path().join(VIDEO_STAGING_RETENTION_FILE_NAME);
-        let (_, identity) = self
-            .root
-            .create_new_bound_file(&marker_path, &contents, 0o600)
-            .context("failed to persist staged download retention marker")?;
-        let file = self
-            .root
-            .open_bound_file(&marker_path)?
-            .context("staged download retention marker disappeared")?;
-        if file.identity() != identity {
-            bail!("staged download retention marker identity changed after creation");
-        }
-        file.validate_private_single_link(0o600)?;
+        persist_video_staging_retention_marker(
+            &self.root,
+            &marker_path,
+            self.root.root_identity().device(),
+            self.root.root_identity().inode(),
+            self.identity.device(),
+            self.identity.inode(),
+            reason,
+        )?;
         self.validate_for_path_access()
     }
 }
@@ -11249,6 +11721,47 @@ mod tests {
     }
 
     #[test]
+    fn completed_staged_download_is_retained_without_dirtying_global_recovery() {
+        let final_dir = temp_test_dir("completed-staged-download-retention");
+        let root = RootedFs::new(&final_dir).expect("output root should bind");
+        let staging =
+            create_video_staging_dir(&root).expect("production staging directory should create");
+        let staging_dir = staging.path().to_path_buf();
+        let staged_video = staging_dir.join("Episode.mkv");
+        fs::write(&staged_video, "completed-video").expect("completed video should write");
+
+        staging
+            .retain_for_manual_recovery(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)
+            .expect("completion marker should persist");
+        staging
+            .retain_for_manual_recovery("a more specific later retention reason")
+            .expect("completion marker persistence should be idempotent");
+        drop(staging);
+        drop(root);
+
+        let messages = recover_pending_overwrite_transactions(&final_dir)
+            .expect("startup recovery should accept the retained completed download");
+        let root = RootedFs::new(&final_dir).expect("output root should reopen");
+        let (state, _) =
+            video_recovery_state_file(&root).expect("recovery state should reopen cleanly");
+
+        assert!(messages.iter().any(|message| {
+            message.contains("Retained completed staged video job for manual recovery")
+                && message.contains(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)
+        }));
+        assert!(
+            video_recovery_state_is_clean(&state)
+                .expect("manual retention should be a terminal recovery state")
+        );
+        assert_eq!(
+            fs::read_to_string(&staged_video).unwrap(),
+            "completed-video"
+        );
+        assert!(staging_dir.is_dir());
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
     fn oversized_staged_publications_survive_startup_recovery() {
         for (case, max_steps, manifest_limit, expected_reason) in [
             (
@@ -11310,9 +11823,9 @@ mod tests {
             let report = recover_pending_video_staging_directories_locked(&root)
                 .expect("startup recovery should retain completed oversized outputs");
 
-            assert!(report.unresolved);
+            assert!(!report.unresolved);
             assert!(report.messages.iter().any(|message| {
-                message.contains("completed download outputs retained for manual recovery")
+                message.contains("Retained completed staged video job for manual recovery")
             }));
             assert_eq!(fs::read_to_string(&staged_video).unwrap(), "new-video");
             assert_eq!(fs::read_to_string(&staged_nfo).unwrap(), "new-nfo");
@@ -14511,14 +15024,18 @@ mod tests {
             provider: VideoProvider::Bilibili,
             id: "cid123".to_string(),
         };
-        let logical_output_dir = PathBuf::from("/videos/staging/job-1");
+        let video_dir = temp_test_dir("bilibili-worker-request");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+        let staging =
+            create_video_staging_dir(&root).expect("worker staging directory should create");
+        let logical_output_dir = staging.path().to_path_buf();
 
         let request = build_bilibili_worker_request(
             &config,
             "https://www.bilibili.com/video/BV123",
             Some(BilibiliSelection::Latest),
             Some(&expected_identity),
-            &logical_output_dir,
+            &staging,
         );
         let encoded = serde_json::to_string(&request).expect("worker request should encode");
 
@@ -14529,6 +15046,22 @@ mod tests {
         assert_eq!(request.config.downloads.video_dir, Path::new("."));
         assert_eq!(request.expected_overwrite_identity, Some(expected_identity));
         assert_eq!(request.logical_output_dir, logical_output_dir);
+        assert_eq!(request.output_root_device, root.root_identity().device());
+        assert_eq!(request.output_root_inode, root.root_identity().inode());
+        assert_eq!(request.staging_device, staging.identity.device());
+        assert_eq!(request.staging_inode, staging.identity.inode());
+        let worker_root =
+            RootedFs::new(staging.path()).expect("worker should bind the staging directory");
+        persist_bilibili_worker_completion(&worker_root, &request)
+            .expect("worker should persist completion before reporting success");
+        assert_eq!(
+            retained_video_staging_reason(&root, staging.path(), staging.identity)
+                .expect("parent should validate the worker completion marker")
+                .as_deref(),
+            Some(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)
+        );
+        drop(staging);
+        let _ = fs::remove_dir_all(video_dir);
     }
 
     #[test]
@@ -16055,12 +16588,18 @@ mv video.original video.m4s || exit 46
     #[tokio::test]
     async fn bilibili_mux_policy_inherits_the_worker_process_group() {
         let root = temp_test_dir("bilibili-mux-process-group");
+        let process_group_file = root.join("process-group");
         let mut config = test_config();
         config.bot.command_timeout_seconds = 5;
         config.bot.command_idle_timeout_seconds = 5;
         let spec = CommandSpec {
-            program: PathBuf::from("/bin/sh"),
-            args: vec!["-c".to_string(), "/bin/ps -o pgid= -p $$".to_string()],
+            program: std::env::current_exe().expect("test binary should resolve"),
+            args: vec![
+                "--ignored".to_string(),
+                "--exact".to_string(),
+                "downloader::tests::bilibili_mux_process_group_probe_child".to_string(),
+                "--nocapture".to_string(),
+            ],
             cwd: root.clone(),
             activity_dir: None,
             cleanup_paths: Vec::new(),
@@ -16076,8 +16615,9 @@ mv video.original video.m4s || exit 46
         )
         .await
         .expect("mux process-group probe should run");
-        let child_process_group = String::from_utf8(output.stdout)
-            .expect("process group output should be UTF-8")
+        assert!(output.status.success());
+        let child_process_group = fs::read_to_string(&process_group_file)
+            .expect("process group probe should write")
             .trim()
             .parse::<libc::pid_t>()
             .expect("process group output should parse");
@@ -16088,6 +16628,202 @@ mv video.original video.m4s || exit 46
             CommandTotalDeadline::Configured
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "spawned by bilibili_mux_policy_inherits_the_worker_process_group"]
+    fn bilibili_mux_process_group_probe_child() {
+        fs::write("process-group", unsafe { libc::getpgrp() }.to_string())
+            .expect("process group probe should write");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_liveness_monitor_waits_for_its_peer_to_close() {
+        let (monitor, keepalive) = command_liveness_pair().expect("liveness pair should create");
+        let mut wait = Box::pin(wait_for_liveness_peer_close(monitor));
+
+        assert!(
+            tokio_timeout(Duration::from_millis(50), &mut wait)
+                .await
+                .is_err(),
+            "an open peer must keep the monitor pending"
+        );
+        drop(keepalive);
+        tokio_timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("peer closure should wake the monitor")
+            .expect("peer closure should be observed without an I/O error");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closing_the_parent_liveness_channel_terminates_the_worker_group() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let root = temp_test_dir("bilibili-worker-parent-liveness");
+        let ready = root.join("worker.ready");
+        let (worker_liveness, parent_liveness) =
+            command_liveness_pair().expect("worker liveness pair should create");
+        let inherited =
+            prepare_additional_inherited_command_fd(&worker_liveness, BILIBILI_WORKER_LIVENESS_FD)
+                .expect("worker liveness descriptor should duplicate");
+        drop(worker_liveness);
+        let mut config = test_config();
+        config.bot.command_idle_timeout_seconds = 10;
+        let spec = CommandSpec {
+            program: std::env::current_exe().expect("test binary should resolve"),
+            args: vec![
+                "--ignored".to_string(),
+                "--exact".to_string(),
+                "downloader::tests::bilibili_parent_liveness_child".to_string(),
+                "--nocapture".to_string(),
+            ],
+            cwd: root.clone(),
+            activity_dir: None,
+            cleanup_paths: Vec::new(),
+        };
+        let child_root = root.clone();
+        let command = tokio::spawn(async move {
+            run_command_with_execution_context_and_additional_fds(
+                &config,
+                &spec,
+                None,
+                &[],
+                vec![inherited],
+                None,
+                CommandExecutionPolicy::BILIBILI_WORKER,
+            )
+            .await
+        });
+
+        for _ in 0..100 {
+            if ready.is_file() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(ready.is_file(), "worker liveness helper did not start");
+        drop(parent_liveness);
+        let output = tokio_timeout(Duration::from_secs(5), command)
+            .await
+            .expect("worker should terminate after its parent channel closes")
+            .expect("worker command task should join")
+            .expect("worker command runner should return its exit status");
+
+        assert_eq!(output.status.signal(), Some(libc::SIGKILL));
+        let _ = fs::remove_dir_all(child_root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "spawned by closing_the_parent_liveness_channel_terminates_the_worker_group"]
+    async fn bilibili_parent_liveness_child() {
+        let liveness =
+            inherited_worker_liveness_stream().expect("worker liveness descriptor should open");
+        fs::write("worker.ready", b"ready").expect("worker readiness marker should write");
+        let result = wait_for_liveness_peer_close(liveness).await;
+        let reason = match result {
+            Ok(()) => "test worker parent exited",
+            Err(_) => "test worker parent liveness check failed",
+        };
+        terminate_current_process_group(reason);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bilibili_mux_descendant_fence_terminates_the_worker_group() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+        let root = temp_test_dir("bilibili-mux-descendant-fence");
+        let pid_file = root.join("descendant.pid");
+        let mut child = std::process::Command::new(
+            std::env::current_exe().expect("test binary should resolve"),
+        );
+        child
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("downloader::tests::bilibili_mux_descendant_fence_child")
+            .arg("--nocapture")
+            .env("TVD_MUX_FENCE_TEST_ROOT", &root)
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = child.spawn().expect("isolated mux helper should start");
+        let child_process_group = child.id() as libc::pid_t;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("helper status should read") {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                unsafe {
+                    libc::kill(-child_process_group, libc::SIGKILL);
+                }
+                let _ = child.wait();
+                let _ = fs::remove_dir_all(&root);
+                panic!("mux helper did not terminate its inherited process group");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        let descendant = fs::read_to_string(&pid_file)
+            .expect("descendant pid should be written")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("descendant pid should parse");
+        for _ in 0..40 {
+            if !process_exists(descendant) {
+                let _ = fs::remove_dir_all(&root);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        unsafe {
+            libc::kill(descendant, libc::SIGKILL);
+        }
+        let _ = fs::remove_dir_all(&root);
+        panic!("mux descendant {descendant} survived worker-group termination");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "spawned by bilibili_mux_descendant_fence_terminates_the_worker_group"]
+    async fn bilibili_mux_descendant_fence_child() {
+        BILIBILI_WORKER_PROCESS.store(true, Ordering::Release);
+        let root = PathBuf::from(
+            std::env::var_os("TVD_MUX_FENCE_TEST_ROOT")
+                .expect("isolated mux helper root should be provided"),
+        );
+        let pid_file = root.join("descendant.pid");
+        let mut config = test_config();
+        config.bot.command_timeout_seconds = 30;
+        config.bot.command_idle_timeout_seconds = 30;
+        let spec = CommandSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_string(),
+                "sleep 30 & echo $! > \"$0\"; exit 0".to_string(),
+                pid_file.display().to_string(),
+            ],
+            cwd: root,
+            activity_dir: None,
+            cleanup_paths: Vec::new(),
+        };
+
+        let result = run_command_with_execution_context(
+            &config,
+            &spec,
+            None,
+            &[],
+            None,
+            CommandExecutionPolicy::BILIBILI_MUX,
+        )
+        .await;
+        panic!("mux descendant fence returned instead of terminating its group: {result:?}");
     }
 
     #[cfg(unix)]

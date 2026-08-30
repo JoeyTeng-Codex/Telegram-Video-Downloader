@@ -174,10 +174,12 @@ async fn main() -> Result<()> {
         "telegram local downloader started"
     );
 
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
     loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("failed to listen for ctrl-c")?;
+            signal = &mut shutdown => {
+                signal?;
                 info!("shutdown requested");
                 break;
             }
@@ -219,6 +221,33 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("failed to listen for SIGTERM")?;
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("failed to listen for ctrl-c")?;
+            }
+            signal = terminate.recv() => {
+                if signal.is_none() {
+                    bail!("SIGTERM listener closed unexpectedly");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("failed to listen for ctrl-c")
+    }
 }
 
 async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
