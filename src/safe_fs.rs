@@ -3,6 +3,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     Arc,
@@ -17,7 +19,8 @@ use serde::{Deserialize, Serialize};
 const REMOVE_QUARANTINE_PREFIX: &str = ".telegram-video-downloader-remove";
 const REMOVE_QUARANTINE_MANIFEST_NAME: &str = "manifest.json";
 const REMOVE_QUARANTINE_TOMBSTONE_SUFFIX: &str = ".cleanup.json";
-const REMOVE_QUARANTINE_MANIFEST_VERSION: u32 = 2;
+const REMOVE_QUARANTINE_MANIFEST_VERSION: u32 = 3;
+const REMOVE_QUARANTINE_PREVIOUS_MANIFEST_VERSION: u32 = 2;
 const REMOVE_QUARANTINE_LEGACY_MANIFEST_VERSION: u32 = 1;
 const REMOVE_QUARANTINE_MANIFEST_LIMIT: usize = 1024;
 static REMOVE_QUARANTINE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -85,6 +88,7 @@ pub(crate) struct BoundDirectory {
 pub(crate) struct RemoveQuarantineRecoveryReport {
     pub(crate) messages: Vec<String>,
     pub(crate) unresolved: bool,
+    pub(crate) restored: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +107,10 @@ struct RemoveQuarantineManifest {
     entry_is_directory: bool,
     #[serde(default)]
     recursive: bool,
+    #[serde(default)]
+    original_name_hex: Option<String>,
+    #[serde(default)]
+    restore_requires_revalidation: bool,
 }
 
 #[derive(Debug)]
@@ -114,10 +122,16 @@ struct PrivateRemoveQuarantine {
     manifest_identity: EntryIdentity,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum PostQuarantineFailure {
     Retain,
     Restore,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoveQuarantineRecoveryAction {
+    Deleted,
+    Restored,
 }
 
 #[derive(Clone, Copy)]
@@ -365,20 +379,36 @@ impl RootedFs {
     pub(crate) fn reconcile_remove_quarantines_with_status(
         &self,
     ) -> Result<RemoveQuarantineRecoveryReport> {
+        self.reconcile_remove_quarantines_with_status_and_restore_decider(|_| {
+            bail!("interrupted validated removal requires caller revalidation")
+        })
+    }
+
+    pub(crate) fn reconcile_remove_quarantines_with_status_and_restore_decider<F>(
+        &self,
+        mut should_restore: F,
+    ) -> Result<RemoveQuarantineRecoveryReport>
+    where
+        F: FnMut(EntryIdentity) -> Result<bool>,
+    {
         self.validate_root()?;
         let mut reports = Vec::new();
         let mut unresolved = false;
+        let mut restored = false;
         reconcile_remove_quarantines_in_directory(
             self.root_fd.as_ref(),
             self.root_identity,
             &self.logical_root,
             &mut reports,
             &mut unresolved,
+            &mut restored,
+            &mut should_restore,
         )?;
         self.validate_root()?;
         Ok(RemoveQuarantineRecoveryReport {
             messages: reports,
             unresolved,
+            restored,
         })
     }
 
@@ -399,20 +429,6 @@ impl RootedFs {
 
     pub(crate) fn open_bound_file(&self, path: &Path) -> Result<Option<BoundFile>> {
         let entry = self.bind_entry(path, false)?;
-        let file = self.open_file_from_bound_entry(&entry)?;
-        if file.is_some() {
-            self.validate_parent(&entry.parent)?;
-        }
-        Ok(file)
-    }
-
-    pub(crate) fn open_file_from_bound_entry(
-        &self,
-        entry: &BoundEntry,
-    ) -> Result<Option<BoundFile>> {
-        // This variant protects the held parent object rather than reachability through a mutable
-        // configured root path. Callers still revalidate the selected leaf identity after reading.
-        self.validate_bound_parent(&entry.parent)?;
         let fd = match rustix::fs::openat(
             entry.parent.fd.as_ref(),
             &entry.leaf,
@@ -437,7 +453,7 @@ impl RootedFs {
                 entry.path.display()
             );
         }
-        self.validate_bound_parent(&entry.parent)?;
+        self.validate_parent(&entry.parent)?;
         Ok(Some(BoundFile {
             fd: Arc::new(fd),
             identity,
@@ -818,6 +834,36 @@ impl RootedFs {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn leave_validated_file_removal_quarantined_for_test(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+    ) -> Result<()> {
+        self.validate_bound_parent(&entry.parent)?;
+        if self.bound_entry_identity(entry)? != Some(expected) || !expected.is_file() {
+            bail!("test validated-removal target identity changed");
+        }
+        let quarantine = create_private_remove_quarantine(
+            &entry.parent,
+            &entry.leaf,
+            expected,
+            RemoveQuarantinePolicy::restore_file(),
+        )?;
+        renameat_noreplace(
+            entry.parent.fd.as_ref(),
+            &entry.leaf,
+            &quarantine.directory,
+            OsStr::new("entry"),
+        )?;
+        sync_directory(entry.parent.fd.as_ref())?;
+        sync_directory(&quarantine.directory)?;
+        if identity_at(&quarantine.directory, OsStr::new("entry"))? != Some(expected) {
+            bail!("test validated-removal quarantine identity changed");
+        }
+        Ok(())
+    }
+
     pub(crate) fn remove_bound_dir_if_identity(
         &self,
         entry: &BoundEntry,
@@ -1120,7 +1166,7 @@ impl RootedFs {
         }
 
         let quarantine =
-            create_private_remove_quarantine(&entry.parent, expected, policy.recursive)?;
+            create_private_remove_quarantine(&entry.parent, &entry.leaf, expected, policy)?;
         let quarantine_path = entry
             .path
             .parent()
@@ -1455,13 +1501,18 @@ fn openat_directory_cstr(parent: &OwnedFd, name: &CStr) -> Result<OwnedFd, std::
     .map_err(errno_to_io)
 }
 
-fn reconcile_remove_quarantines_in_directory(
+fn reconcile_remove_quarantines_in_directory<F>(
     directory: &OwnedFd,
     expected_directory: EntryIdentity,
     display_path: &Path,
     reports: &mut Vec<String>,
     unresolved: &mut bool,
-) -> Result<()> {
+    restored: &mut bool,
+    should_restore: &mut F,
+) -> Result<()>
+where
+    F: FnMut(EntryIdentity) -> Result<bool>,
+{
     if identity_for_fd(directory)? != expected_directory {
         bail!(
             "remove quarantine scan directory identity changed: {}",
@@ -1541,11 +1592,19 @@ fn reconcile_remove_quarantines_in_directory(
                 &name,
                 &path,
                 identity,
+                should_restore,
             ) {
-                Ok(()) => reports.push(format!(
+                Ok(RemoveQuarantineRecoveryAction::Deleted) => reports.push(format!(
                     "Recovered interrupted bound-path removal: {}",
                     path.display()
                 )),
+                Ok(RemoveQuarantineRecoveryAction::Restored) => {
+                    *restored = true;
+                    reports.push(format!(
+                        "Restored interrupted validated bound-path removal: {}",
+                        path.display()
+                    ));
+                }
                 Err(err) => {
                     *unresolved = true;
                     reports.push(format!(
@@ -1578,9 +1637,15 @@ fn reconcile_remove_quarantines_in_directory(
             ));
             continue;
         }
-        if let Err(err) =
-            reconcile_remove_quarantines_in_directory(&child, identity, &path, reports, unresolved)
-        {
+        if let Err(err) = reconcile_remove_quarantines_in_directory(
+            &child,
+            identity,
+            &path,
+            reports,
+            unresolved,
+            restored,
+            should_restore,
+        ) {
             *unresolved = true;
             reports.push(format!(
                 "Skipped directory during interrupted-removal scan {}: {err:#}",
@@ -1597,13 +1662,17 @@ fn reconcile_remove_quarantines_in_directory(
     Ok(())
 }
 
-fn reconcile_private_remove_quarantine(
+fn reconcile_private_remove_quarantine<F>(
     parent: &OwnedFd,
     expected_parent: EntryIdentity,
     name: &CStr,
     display_path: &Path,
     expected_quarantine: EntryIdentity,
-) -> Result<()> {
+    should_restore: &mut F,
+) -> Result<RemoveQuarantineRecoveryAction>
+where
+    F: FnMut(EntryIdentity) -> Result<bool>,
+{
     if !expected_quarantine.is_dir() {
         bail!("interrupted-removal quarantine is not a directory");
     }
@@ -1667,24 +1736,60 @@ fn reconcile_private_remove_quarantine(
             FileType::RegularFile
         },
     };
+    let original_name = manifest
+        .original_name_hex
+        .as_deref()
+        .map(decode_remove_quarantine_original_name)
+        .transpose()?;
+    let mut action = RemoveQuarantineRecoveryAction::Deleted;
     if let Some(current) = identity_at(&directory, OsStr::new("entry"))? {
         if current != expected_entry {
             bail!("interrupted-removal entry identity does not match its manifest");
         }
-        let flags = if expected_entry.is_dir() {
-            AtFlags::REMOVEDIR
+        if manifest.restore_requires_revalidation
+            && should_restore(expected_entry)
+                .context("failed to revalidate interrupted bound-path removal")?
+        {
+            restore_quarantined_entry(
+                parent,
+                expected_parent,
+                &directory,
+                expected_quarantine,
+                original_name
+                    .as_deref()
+                    .context("validated removal has no original path")?,
+                expected_entry,
+            )?;
+            action = RemoveQuarantineRecoveryAction::Restored;
         } else {
-            AtFlags::empty()
-        };
-        remove_quarantined_entry(
-            &directory,
-            OsStr::new("entry"),
-            expected_entry,
-            flags,
-            manifest.recursive,
-            display_path,
-        )?;
-        sync_directory(&directory)?;
+            let flags = if expected_entry.is_dir() {
+                AtFlags::REMOVEDIR
+            } else {
+                AtFlags::empty()
+            };
+            remove_quarantined_entry(
+                &directory,
+                OsStr::new("entry"),
+                expected_entry,
+                flags,
+                manifest.recursive,
+                display_path,
+            )?;
+            sync_directory(&directory)?;
+        }
+    } else if manifest.restore_requires_revalidation {
+        let original_name = original_name
+            .as_deref()
+            .context("validated removal has no original path")?;
+        match identity_at(parent, original_name)? {
+            Some(current) if current == expected_entry => {
+                action = RemoveQuarantineRecoveryAction::Restored;
+            }
+            Some(_) => {
+                bail!("interrupted validated-removal destination contains a replacement");
+            }
+            None => {}
+        }
     }
     finish_remove_quarantine_cleanup(
         parent,
@@ -1694,7 +1799,55 @@ fn reconcile_private_remove_quarantine(
         expected_quarantine,
         &manifest,
         Some(manifest_identity),
-    )
+    )?;
+    Ok(action)
+}
+
+fn restore_quarantined_entry(
+    parent: &OwnedFd,
+    expected_parent: EntryIdentity,
+    quarantine: &OwnedFd,
+    expected_quarantine: EntryIdentity,
+    original_name: &OsStr,
+    expected_entry: EntryIdentity,
+) -> Result<()> {
+    // Protected property: a crash-interrupted validated removal may restore only the exact selected
+    // file into its persisted original leaf. Parent, quarantine, and entry identities prevent an
+    // occupied replacement or another quarantined object from receiving that authorization.
+    if identity_for_fd(parent)? != expected_parent
+        || identity_for_fd(quarantine)? != expected_quarantine
+        || identity_at(quarantine, OsStr::new("entry"))? != Some(expected_entry)
+    {
+        bail!("interrupted validated-removal identities changed before restoration");
+    }
+    match identity_at(parent, original_name)? {
+        None => {
+            renameat_noreplace(quarantine, OsStr::new("entry"), parent, original_name)
+                .context("failed to restore interrupted validated removal")?;
+            sync_directory(quarantine)?;
+            sync_directory(parent)?;
+        }
+        Some(current) if current == expected_entry => {
+            remove_quarantined_entry(
+                quarantine,
+                OsStr::new("entry"),
+                expected_entry,
+                AtFlags::empty(),
+                false,
+                Path::new(original_name),
+            )?;
+            sync_directory(quarantine)?;
+        }
+        Some(_) => {
+            bail!("interrupted validated-removal destination is occupied by a replacement");
+        }
+    }
+    if identity_at(parent, original_name)? != Some(expected_entry)
+        || identity_at(quarantine, OsStr::new("entry"))?.is_some()
+    {
+        bail!("interrupted validated-removal restoration identity changed");
+    }
+    Ok(())
 }
 
 fn reconcile_private_remove_tombstone(
@@ -1774,19 +1927,22 @@ fn validate_remove_quarantine_manifest(
     quarantine_name: &CStr,
     expected_parent: EntryIdentity,
     expected_quarantine: EntryIdentity,
-    require_current: bool,
+    require_quarantine_identity: bool,
 ) -> Result<()> {
     if !matches!(
         manifest.version,
-        REMOVE_QUARANTINE_LEGACY_MANIFEST_VERSION | REMOVE_QUARANTINE_MANIFEST_VERSION
-    ) || (require_current && manifest.version != REMOVE_QUARANTINE_MANIFEST_VERSION)
+        REMOVE_QUARANTINE_LEGACY_MANIFEST_VERSION
+            | REMOVE_QUARANTINE_PREVIOUS_MANIFEST_VERSION
+            | REMOVE_QUARANTINE_MANIFEST_VERSION
+    ) || (require_quarantine_identity
+        && manifest.version < REMOVE_QUARANTINE_PREVIOUS_MANIFEST_VERSION)
         || manifest.quarantine_name != quarantine_name.to_string_lossy()
         || manifest.parent_device != expected_parent.device
         || manifest.parent_inode != expected_parent.inode
     {
         bail!("interrupted-removal manifest does not describe this quarantine");
     }
-    if manifest.version == REMOVE_QUARANTINE_MANIFEST_VERSION
+    if manifest.version >= REMOVE_QUARANTINE_PREVIOUS_MANIFEST_VERSION
         && (manifest.quarantine_device != Some(expected_quarantine.device)
             || manifest.quarantine_inode != Some(expected_quarantine.inode))
     {
@@ -1794,6 +1950,20 @@ fn validate_remove_quarantine_manifest(
     }
     if manifest.recursive && !manifest.entry_is_directory {
         bail!("interrupted-removal manifest requests recursive non-directory removal");
+    }
+    if manifest.version == REMOVE_QUARANTINE_MANIFEST_VERSION {
+        let original_name = manifest
+            .original_name_hex
+            .as_deref()
+            .context("interrupted-removal manifest has no original name")?;
+        decode_remove_quarantine_original_name(original_name)?;
+        if manifest.restore_requires_revalidation
+            && (manifest.entry_is_directory || manifest.recursive)
+        {
+            bail!("interrupted-removal restore policy is only valid for one regular file");
+        }
+    } else if manifest.original_name_hex.is_some() || manifest.restore_requires_revalidation {
+        bail!("legacy interrupted-removal manifest contains unsupported recovery policy");
     }
     Ok(())
 }
@@ -2020,6 +2190,9 @@ fn complete_remove_quarantine_from_tombstone(
                 || inner_manifest.entry_inode != manifest.entry_inode
                 || inner_manifest.entry_is_directory != manifest.entry_is_directory
                 || inner_manifest.recursive != manifest.recursive
+                || inner_manifest.original_name_hex != manifest.original_name_hex
+                || inner_manifest.restore_requires_revalidation
+                    != manifest.restore_requires_revalidation
             {
                 bail!("interrupted-removal manifest changed before terminal cleanup");
             }
@@ -2073,11 +2246,85 @@ fn complete_remove_quarantine_from_tombstone(
     sync_directory(parent)
 }
 
+fn encode_remove_quarantine_original_name(name: &OsStr) -> Result<String> {
+    validate_remove_quarantine_original_name(name)?;
+    let bytes = remove_quarantine_name_bytes(name)?;
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(encoded)
+}
+
+fn decode_remove_quarantine_original_name(encoded: &str) -> Result<OsString> {
+    if encoded.is_empty() || !encoded.len().is_multiple_of(2) {
+        bail!("interrupted-removal original name has invalid hex framing");
+    }
+    let encoded = encoded.as_bytes();
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.chunks_exact(2) {
+        let high = decode_lower_hex_digit(pair[0])?;
+        let low = decode_lower_hex_digit(pair[1])?;
+        bytes.push((high << 4) | low);
+    }
+    let name = remove_quarantine_os_string_from_bytes(bytes)?;
+    validate_remove_quarantine_original_name(&name)?;
+    Ok(name)
+}
+
+fn decode_lower_hex_digit(value: u8) -> Result<u8> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => bail!("interrupted-removal original name contains non-canonical hex"),
+    }
+}
+
+fn validate_remove_quarantine_original_name(name: &OsStr) -> Result<()> {
+    let mut components = Path::new(name).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        bail!("interrupted-removal original name is not one path component");
+    }
+    if remove_quarantine_name_bytes(name)?.contains(&0) {
+        bail!("interrupted-removal original name contains NUL");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_quarantine_name_bytes(name: &OsStr) -> Result<&[u8]> {
+    Ok(name.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn remove_quarantine_name_bytes(name: &OsStr) -> Result<&[u8]> {
+    Ok(name
+        .to_str()
+        .context("interrupted-removal original name is not UTF-8")?
+        .as_bytes())
+}
+
+#[cfg(unix)]
+fn remove_quarantine_os_string_from_bytes(bytes: Vec<u8>) -> Result<OsString> {
+    Ok(OsString::from_vec(bytes))
+}
+
+#[cfg(not(unix))]
+fn remove_quarantine_os_string_from_bytes(bytes: Vec<u8>) -> Result<OsString> {
+    Ok(OsString::from(String::from_utf8(bytes).context(
+        "interrupted-removal original name is not UTF-8",
+    )?))
+}
+
 fn create_private_remove_quarantine(
     parent: &BoundParent,
+    original_name: &OsStr,
     expected: EntryIdentity,
-    recursive: bool,
+    policy: RemoveQuarantinePolicy,
 ) -> Result<PrivateRemoveQuarantine> {
+    let original_name_hex = encode_remove_quarantine_original_name(original_name)?;
     for _ in 0..128 {
         let counter = REMOVE_QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let name = OsString::from(format!(
@@ -2121,7 +2368,9 @@ fn create_private_remove_quarantine(
             entry_device: expected.device,
             entry_inode: expected.inode,
             entry_is_directory: expected.is_dir(),
-            recursive,
+            recursive: policy.recursive,
+            original_name_hex: Some(original_name_hex.clone()),
+            restore_requires_revalidation: policy.post_failure == PostQuarantineFailure::Restore,
         };
         let manifest_identity = match write_remove_quarantine_manifest(&directory, &manifest) {
             Ok(identity) => identity,
@@ -2929,6 +3178,91 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_validated_removal_requires_an_explicit_recovery_decision() {
+        let root = temp_dir("validated-remove-recovery-decision");
+        fs::create_dir_all(&root).expect("root should create");
+        let owned_path = root.join("owned.txt");
+        fs::write(&owned_path, b"owned").expect("owned file should write");
+        let rooted = RootedFs::new(&root).expect("root should bind");
+        let entry = rooted
+            .bind_entry(&owned_path, false)
+            .expect("owned file should bind");
+        let expected = rooted
+            .bound_entry_identity(&entry)
+            .expect("owned identity should read")
+            .expect("owned file should exist");
+        rooted
+            .leave_validated_file_removal_quarantined_for_test(&entry, expected)
+            .expect("interrupted validated removal should persist");
+
+        let report = rooted
+            .reconcile_remove_quarantines_with_status()
+            .expect("unresolved recovery should be reported");
+
+        assert!(report.unresolved);
+        assert!(!report.restored);
+        assert!(!owned_path.exists());
+        assert!(report.messages.iter().any(|message| {
+            message.contains("interrupted validated removal requires caller revalidation")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interrupted_validated_removal_can_be_restored_or_deleted_after_revalidation() {
+        for should_restore in [true, false] {
+            let root = temp_dir(if should_restore {
+                "validated-remove-recovery-restore"
+            } else {
+                "validated-remove-recovery-delete"
+            });
+            fs::create_dir_all(&root).expect("root should create");
+            let owned_path = root.join("owned.txt");
+            fs::write(&owned_path, b"owned").expect("owned file should write");
+            let rooted = RootedFs::new(&root).expect("root should bind");
+            let entry = rooted
+                .bind_entry(&owned_path, false)
+                .expect("owned file should bind");
+            let expected = rooted
+                .bound_entry_identity(&entry)
+                .expect("owned identity should read")
+                .expect("owned file should exist");
+            rooted
+                .leave_validated_file_removal_quarantined_for_test(&entry, expected)
+                .expect("interrupted validated removal should persist");
+
+            let report = rooted
+                .reconcile_remove_quarantines_with_status_and_restore_decider(|candidate| {
+                    assert_eq!(candidate, expected);
+                    Ok(should_restore)
+                })
+                .expect("validated removal should reconcile");
+
+            assert!(!report.unresolved);
+            assert_eq!(report.restored, should_restore);
+            assert_eq!(owned_path.exists(), should_restore);
+            if should_restore {
+                assert_eq!(fs::read(&owned_path).unwrap(), b"owned");
+                assert!(report.messages.iter().any(|message| {
+                    message.contains("Restored interrupted validated bound-path removal")
+                }));
+            } else {
+                assert!(report.messages.iter().any(|message| {
+                    message.contains("Recovered interrupted bound-path removal")
+                }));
+            }
+            assert!(fs::read_dir(&root).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(REMOVE_QUARANTINE_PREFIX)
+            }));
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
     fn interrupted_identity_bound_removal_is_reconciled_from_its_manifest() {
         let root = temp_dir("bound-remove-recovery");
         let backup = root.join("backup");
@@ -3018,8 +3352,13 @@ mod tests {
                 .bound_entry_identity(&entry)
                 .expect("owned identity should read")
                 .expect("owned file should exist");
-            let quarantine = create_private_remove_quarantine(&entry.parent, expected, false)
-                .expect("quarantine should create");
+            let quarantine = create_private_remove_quarantine(
+                &entry.parent,
+                &entry.leaf,
+                expected,
+                RemoveQuarantinePolicy::retain(false),
+            )
+            .expect("quarantine should create");
             renameat_noreplace(
                 entry.parent.fd.as_ref(),
                 &entry.leaf,
@@ -3068,6 +3407,79 @@ mod tests {
             }));
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn previous_version_remove_tombstone_remains_recoverable() {
+        let root = temp_dir("previous-remove-tombstone");
+        fs::create_dir_all(&root).expect("root should create");
+        let owned_path = root.join("owned.txt");
+        fs::write(&owned_path, b"owned").expect("owned file should write");
+        let rooted = RootedFs::new(&root).expect("root should bind");
+        let entry = rooted
+            .bind_entry(&owned_path, false)
+            .expect("owned file should bind");
+        let expected = rooted
+            .bound_entry_identity(&entry)
+            .expect("owned identity should read")
+            .expect("owned file should exist");
+        let quarantine = create_private_remove_quarantine(
+            &entry.parent,
+            &entry.leaf,
+            expected,
+            RemoveQuarantinePolicy::retain(false),
+        )
+        .expect("quarantine should create");
+        renameat_noreplace(
+            entry.parent.fd.as_ref(),
+            &entry.leaf,
+            &quarantine.directory,
+            OsStr::new("entry"),
+        )
+        .expect("owned file should move into quarantine");
+        rustix::fs::unlinkat(&quarantine.directory, "entry", AtFlags::empty())
+            .expect("quarantined file should remove");
+        sync_directory(&quarantine.directory).expect("quarantine should sync");
+
+        let mut previous_manifest = quarantine.manifest.clone();
+        previous_manifest.version = REMOVE_QUARANTINE_PREVIOUS_MANIFEST_VERSION;
+        previous_manifest.original_name_hex = None;
+        previous_manifest.restore_requires_revalidation = false;
+        let manifest_contents =
+            serde_json::to_vec(&previous_manifest).expect("previous manifest should encode");
+        fs::write(
+            root.join(&quarantine.name)
+                .join(REMOVE_QUARANTINE_MANIFEST_NAME),
+            &manifest_contents,
+        )
+        .expect("previous inner manifest should write");
+        let quarantine_name = CString::new(quarantine.name.to_string_lossy().as_bytes())
+            .expect("generated quarantine name should be valid");
+        let tombstone_name = remove_quarantine_tombstone_name(&quarantine_name);
+        create_or_validate_remove_quarantine_tombstone(
+            entry.parent.fd.as_ref(),
+            &tombstone_name,
+            &previous_manifest,
+        )
+        .expect("previous terminal tombstone should persist");
+
+        let reports = rooted
+            .reconcile_remove_quarantines()
+            .expect("previous terminal tombstone should reconcile");
+
+        assert!(
+            reports
+                .iter()
+                .any(|report| report.contains("Recovered interrupted bound-path cleanup"))
+        );
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(REMOVE_QUARANTINE_PREFIX)
+        }));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

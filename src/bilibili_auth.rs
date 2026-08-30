@@ -848,6 +848,83 @@ fn with_auth_mutation_lock<T>(
     operation(&file_lock)
 }
 
+pub fn recover_interrupted_auth_cleanup(
+    state_path: &Path,
+    credential_file: &Path,
+) -> Result<Vec<String>> {
+    with_auth_mutation_lock(credential_file, &[state_path, credential_file], |lock| {
+        reconcile_interrupted_auth_cleanup_and_bump_epoch(lock, state_path, credential_file)
+    })
+}
+
+fn reconcile_interrupted_auth_cleanup_and_bump_epoch(
+    lock: &AuthMutationFileLock,
+    state_path: &Path,
+    credential_file: &Path,
+) -> Result<Vec<String>> {
+    let messages = reconcile_interrupted_auth_cleanup_unlocked(state_path, credential_file)?;
+    if !messages.is_empty() {
+        lock.bump_epoch()?;
+    }
+    Ok(messages)
+}
+
+fn reconcile_interrupted_auth_cleanup_unlocked(
+    state_path: &Path,
+    credential_file: &Path,
+) -> Result<Vec<String>> {
+    let state_path = absolute_auth_cleanup_path(state_path)?;
+    let parent = state_path
+        .parent()
+        .context("Bilibili auth state path has no parent")?;
+    match fs::metadata(parent) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => bail!(
+            "Bilibili auth cleanup root is not a directory: {}",
+            parent.display()
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to inspect Bilibili auth cleanup root {}",
+                    parent.display()
+                )
+            });
+        }
+    }
+
+    let root = RootedFs::new(parent).with_context(|| {
+        format!(
+            "failed to bind Bilibili auth cleanup root {}",
+            parent.display()
+        )
+    })?;
+    // Protected property: an interrupted cleanup may delete only its persisted selected object.
+    // Rebinding the active credential path for every candidate means exact device/inode identity is
+    // the sole restore signal; an unreadable path or uncertain recovery remains unresolved.
+    let report =
+        root.reconcile_remove_quarantines_with_status_and_restore_decider(|candidate| {
+            let current_credential = bind_cleanup_target(credential_file)?;
+            Ok(current_credential
+                .as_ref()
+                .map(BoundCleanupTarget::identity)
+                == Some(candidate))
+        })?;
+    if report.restored {
+        bail!(
+            "interrupted Bilibili auth cleanup restored a file that now aliases the active credential; resolve the configured auth paths before retrying"
+        );
+    }
+    if report.unresolved {
+        bail!(
+            "interrupted Bilibili auth cleanup could not be verified: {}",
+            report.messages.join("; ")
+        );
+    }
+    Ok(report.messages)
+}
+
 fn acquire_auth_mutation_file_lock(
     credential_file: &Path,
     protected_paths: &[&Path],
@@ -994,9 +1071,9 @@ pub fn acquire_auth_reply_file_lock(
     state_path: &Path,
     credential_file: &Path,
 ) -> Result<AuthReplyFileLock> {
-    Ok(AuthReplyFileLock {
-        lock: acquire_auth_mutation_file_lock(credential_file, &[state_path, credential_file])?,
-    })
+    let lock = acquire_auth_mutation_file_lock(credential_file, &[state_path, credential_file])?;
+    reconcile_interrupted_auth_cleanup_and_bump_epoch(&lock, state_path, credential_file)?;
+    Ok(AuthReplyFileLock { lock })
 }
 
 pub fn with_auth_mutation_transaction<T>(
@@ -1028,6 +1105,7 @@ fn with_auth_mutation_transaction_inner<T>(
     operation: impl for<'a> FnOnce(&LockedAuthMutation<'a>) -> Result<T>,
 ) -> Result<(T, u64)> {
     with_auth_mutation_lock(credential_file, &[state_path, credential_file], |lock| {
+        reconcile_interrupted_auth_cleanup_and_bump_epoch(lock, state_path, credential_file)?;
         if let Some(expected_epoch) = expected_epoch {
             let current_epoch = lock.current_epoch()?;
             if current_epoch != expected_epoch {
@@ -1305,6 +1383,7 @@ fn sync_bbdown_rust_credentials_from_state_with_epoch_and_hook(
     after_legacy_read: impl FnOnce(),
 ) -> Result<(Result<bool>, u64)> {
     with_auth_mutation_lock(credential_file, &[state_path, credential_file], |lock| {
+        reconcile_interrupted_auth_cleanup_and_bump_epoch(lock, state_path, credential_file)?;
         let current_epoch = lock.current_epoch()?;
         let cookie = match legacy_cookie_from_state_unlocked(state_path) {
             Ok(Some(cookie)) => cookie,
@@ -1663,13 +1742,7 @@ where
 }
 
 fn bind_cleanup_target(path: &Path) -> Result<Option<BoundCleanupTarget>> {
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .context("failed to resolve the current directory for auth cleanup")?
-            .join(path)
-    };
+    let path = absolute_auth_cleanup_path(path)?;
     match fs::symlink_metadata(&path) {
         Ok(_) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1697,6 +1770,16 @@ fn bind_cleanup_target(path: &Path) -> Result<Option<BoundCleanupTarget>> {
     };
     let entry = root.bind_entry(&path, false)?;
     Ok(Some(BoundCleanupTarget { root, entry, file }))
+}
+
+fn absolute_auth_cleanup_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .context("failed to resolve the current directory for auth cleanup")?
+            .join(path))
+    }
 }
 
 fn ensure_cleanup_identity_is_not_credential(
@@ -2240,6 +2323,104 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_recovery_deletes_an_interrupted_noncredential_auth_cleanup() {
+        let state_path = temp_state_file("interrupted-auth-cleanup-delete");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        fs::create_dir_all(&root).expect("auth root should create");
+        fs::write(&state_path, b"legacy-state").expect("legacy state should write");
+        fs::write(&credential_file, b"active-credentials")
+            .expect("active credentials should write");
+        let target = bind_cleanup_target(&state_path)
+            .expect("legacy state should bind")
+            .expect("legacy state should exist");
+        target
+            .root
+            .leave_validated_file_removal_quarantined_for_test(&target.entry, target.identity())
+            .expect("interrupted cleanup should persist");
+        drop(target);
+
+        let messages = recover_interrupted_auth_cleanup(&state_path, &credential_file)
+            .expect("noncredential cleanup should recover");
+
+        assert!(!state_path.exists());
+        assert_eq!(
+            fs::read(&credential_file).expect("active credentials should remain"),
+            b"active-credentials"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("Recovered interrupted bound-path removal"))
+        );
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".telegram-video-downloader-remove")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_recovery_restores_an_interrupted_cleanup_that_now_aliases_credentials() {
+        use std::os::unix::fs::MetadataExt;
+
+        let state_path = temp_state_file("interrupted-auth-cleanup-restore");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        fs::create_dir_all(&root).expect("auth root should create");
+        fs::write(&state_path, b"legacy-state").expect("legacy state should write");
+        let target = bind_cleanup_target(&state_path)
+            .expect("legacy state should bind")
+            .expect("legacy state should exist");
+        target
+            .root
+            .leave_validated_file_removal_quarantined_for_test(&target.entry, target.identity())
+            .expect("interrupted cleanup should persist");
+        let quarantine = fs::read_dir(&root)
+            .expect("auth root should read")
+            .map(|entry| entry.expect("auth entry should read").path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with(".telegram-video-downloader-remove")
+                }) && path.is_dir()
+            })
+            .expect("interrupted cleanup quarantine should exist");
+        fs::hard_link(quarantine.join("entry"), &credential_file)
+            .expect("credential alias should create after quarantine");
+        drop(target);
+
+        let error = recover_interrupted_auth_cleanup(&state_path, &credential_file)
+            .expect_err("credential alias must block auth recovery");
+
+        assert!(format!("{error:#}").contains("now aliases the active credential"));
+        assert_eq!(fs::read(&state_path).unwrap(), b"legacy-state");
+        assert_eq!(fs::read(&credential_file).unwrap(), b"legacy-state");
+        let state_metadata = fs::metadata(&state_path).unwrap();
+        let credential_metadata = fs::metadata(&credential_file).unwrap();
+        assert_eq!(state_metadata.dev(), credential_metadata.dev());
+        assert_eq!(state_metadata.ino(), credential_metadata.ino());
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".telegram-video-downloader-remove")
+        }));
         let _ = fs::remove_dir_all(root);
     }
 

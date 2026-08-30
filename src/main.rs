@@ -155,6 +155,12 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("config.toml"));
     let config = Arc::new(AppConfig::load(&config_path)?);
     config.ensure_runtime_dirs()?;
+    for recovery in bilibili_auth::recover_interrupted_auth_cleanup(
+        &config.bilibili.auth.state_path,
+        &config.bilibili.auth.credential_file,
+    )? {
+        warn!(message = %recovery, "recovered interrupted BBDown auth cleanup");
+    }
     for recovery in recover_pending_overwrite_transactions(&config.downloads.video_dir)? {
         warn!(message = %recovery, "recovered interrupted overwrite transaction");
     }
@@ -259,6 +265,12 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
 
     let config = AppConfig::load(&config_path)?;
     config.ensure_runtime_dirs()?;
+    for recovery in bilibili_auth::recover_interrupted_auth_cleanup(
+        &config.bilibili.auth.state_path,
+        &config.bilibili.auth.credential_file,
+    )? {
+        warn!(message = %recovery, "recovered interrupted BBDown auth cleanup");
+    }
     for recovery in recover_pending_overwrite_transactions(&config.downloads.video_dir)? {
         warn!(message = %recovery, "recovered interrupted overwrite transaction");
     }
