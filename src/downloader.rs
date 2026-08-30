@@ -44,6 +44,9 @@ const VIDEO_STAGING_PUBLICATION_MANIFEST_NAME: &str = ".publication.json";
 const VIDEO_STAGING_PUBLICATION_MANIFEST_VERSION: u32 = 1;
 const VIDEO_STAGING_PUBLICATION_MANIFEST_LIMIT: usize = 512 * 1024;
 const VIDEO_STAGING_PUBLICATION_MAX_STEPS: usize = 4096;
+const VIDEO_STAGING_RETENTION_FILE_NAME: &str = ".retained.json";
+const VIDEO_STAGING_RETENTION_VERSION: u32 = 1;
+const VIDEO_STAGING_RETENTION_LIMIT: usize = 4096;
 const BILIBILI_WORKER_REQUEST_FILE_NAME: &str = ".bilibili-worker.json";
 const BILIBILI_WORKER_REQUEST_VERSION: u32 = 1;
 const BILIBILI_WORKER_REQUEST_LIMIT: usize = 1024 * 1024;
@@ -99,6 +102,41 @@ const BILIBILI_METADATA_PROBE_AFTER_DUPLICATE_TIMEOUT: Duration = Duration::from
 type CommandProcessGroup = Option<libc::pid_t>;
 #[cfg(not(unix))]
 type CommandProcessGroup = Option<()>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandTotalDeadline {
+    Configured,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandProcessGroupMode {
+    Owned,
+    Inherited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommandExecutionPolicy {
+    total_deadline: CommandTotalDeadline,
+    process_group: CommandProcessGroupMode,
+}
+
+impl CommandExecutionPolicy {
+    const EXTERNAL: Self = Self {
+        total_deadline: CommandTotalDeadline::Configured,
+        process_group: CommandProcessGroupMode::Owned,
+    };
+
+    const BILIBILI_WORKER: Self = Self {
+        total_deadline: CommandTotalDeadline::Disabled,
+        process_group: CommandProcessGroupMode::Owned,
+    };
+
+    const BILIBILI_MUX: Self = Self {
+        total_deadline: CommandTotalDeadline::Configured,
+        process_group: CommandProcessGroupMode::Inherited,
+    };
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JobReport {
@@ -816,12 +854,13 @@ async fn run_staged_bilibili_worker(
         activity_dir: Some(staging.path().to_path_buf()),
         cleanup_paths: Vec::new(),
     };
-    let output = run_command_with_bound_cwd_and_inherited_files(
+    let output = run_command_with_bound_cwd_and_inherited_files_with_policy(
         config,
         &spec,
         &staging.directory,
         std::slice::from_ref(&request_file),
         progress,
+        CommandExecutionPolicy::BILIBILI_WORKER,
     )
     .await?;
     staging.validate_for_path_access()?;
@@ -1693,9 +1732,15 @@ async fn mux_bilibili_report_media(
             &entry_dir,
             output_reservation.command_path(),
         )?;
-        let output_result =
-            run_command_with_inherited_files(config, &spec, &inherited_files, progress.clone())
-                .await;
+        let output_result = run_command_with_execution_context(
+            config,
+            &spec,
+            None,
+            &inherited_files,
+            progress.clone(),
+            CommandExecutionPolicy::BILIBILI_MUX,
+        )
+        .await;
         drop(concat_file);
         let output_result = match output_result {
             Ok(output_result) => output_result,
@@ -4033,6 +4078,17 @@ struct VideoStagingOwner {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct VideoStagingRetention {
+    version: u32,
+    root_device: u64,
+    root_inode: u64,
+    staging_device: u64,
+    staging_inode: u64,
+    reason: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StagedPublicationManifest {
     version: u32,
     root_device: u64,
@@ -4499,6 +4555,32 @@ struct CommandChunk {
     bytes: Vec<u8>,
 }
 
+struct CommandProcessGroupGuard {
+    process_group: CommandProcessGroup,
+    armed: bool,
+}
+
+impl CommandProcessGroupGuard {
+    fn new(process_group: CommandProcessGroup) -> Self {
+        Self {
+            process_group,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CommandProcessGroupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            force_terminate_process_group(self.process_group);
+        }
+    }
+}
+
 async fn run_command(
     config: &AppConfig,
     spec: &CommandSpec,
@@ -4513,7 +4595,15 @@ async fn run_command_with_inherited_files(
     inherited_files: &[BoundFile],
     progress: Option<JobProgressSender>,
 ) -> Result<CommandOutput> {
-    run_command_with_execution_context(config, spec, None, inherited_files, progress).await
+    run_command_with_execution_context(
+        config,
+        spec,
+        None,
+        inherited_files,
+        progress,
+        CommandExecutionPolicy::EXTERNAL,
+    )
+    .await
 }
 
 async fn run_command_with_bound_cwd(
@@ -4532,8 +4622,34 @@ async fn run_command_with_bound_cwd_and_inherited_files(
     inherited_files: &[BoundFile],
     progress: Option<JobProgressSender>,
 ) -> Result<CommandOutput> {
-    run_command_with_execution_context(config, spec, Some(bound_cwd), inherited_files, progress)
-        .await
+    run_command_with_bound_cwd_and_inherited_files_with_policy(
+        config,
+        spec,
+        bound_cwd,
+        inherited_files,
+        progress,
+        CommandExecutionPolicy::EXTERNAL,
+    )
+    .await
+}
+
+async fn run_command_with_bound_cwd_and_inherited_files_with_policy(
+    config: &AppConfig,
+    spec: &CommandSpec,
+    bound_cwd: &BoundDirectory,
+    inherited_files: &[BoundFile],
+    progress: Option<JobProgressSender>,
+    policy: CommandExecutionPolicy,
+) -> Result<CommandOutput> {
+    run_command_with_execution_context(
+        config,
+        spec,
+        Some(bound_cwd),
+        inherited_files,
+        progress,
+        policy,
+    )
+    .await
 }
 
 async fn run_command_with_execution_context(
@@ -4542,6 +4658,7 @@ async fn run_command_with_execution_context(
     bound_cwd: Option<&BoundDirectory>,
     inherited_files: &[BoundFile],
     progress: Option<JobProgressSender>,
+    policy: CommandExecutionPolicy,
 ) -> Result<CommandOutput> {
     let _cleanup = CommandCleanup::new(spec.cleanup_paths.clone());
     let mut file_activity = match &spec.activity_dir {
@@ -4588,7 +4705,9 @@ async fn run_command_with_execution_context(
         .kill_on_drop(true);
     #[cfg(unix)]
     {
-        command.process_group(0);
+        if matches!(policy.process_group, CommandProcessGroupMode::Owned) {
+            command.process_group(0);
+        }
         if bound_cwd_fd.is_some() || !inherited_fds.is_empty() {
             // The source descriptors are CLOEXEC duplicates above the target range. dup2 clears
             // CLOEXEC on each fixed child descriptor without allowing an argv pathname lookup.
@@ -4613,7 +4732,8 @@ async fn run_command_with_execution_context(
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to run {}", spec.program.display()))?;
-    let process_group = command_process_group(&child);
+    let process_group = command_process_group(&child, policy.process_group);
+    let mut process_group_guard = CommandProcessGroupGuard::new(process_group);
 
     let stdout = child
         .stdout
@@ -4635,7 +4755,8 @@ async fn run_command_with_execution_context(
     let total_timeout = Duration::from_secs(config.bot.command_timeout_seconds);
     let idle_timeout = Duration::from_secs(config.bot.command_idle_timeout_seconds);
     let started_at = Instant::now();
-    let total_deadline = started_at + total_timeout;
+    let total_deadline = matches!(policy.total_deadline, CommandTotalDeadline::Configured)
+        .then_some(started_at + total_timeout);
     let mut last_activity_at = started_at;
     let progress_interval = Duration::from_secs(config.bot.progress_update_seconds);
     let activity_poll_interval = file_activity_poll_interval(progress_interval, idle_timeout);
@@ -4660,10 +4781,16 @@ async fn run_command_with_execution_context(
                 break wait_result
                     .with_context(|| format!("failed to wait for {}", spec.program.display()))?;
             }
-            _ = sleep_until(total_deadline) => {
+            _ = async {
+                match total_deadline {
+                    Some(deadline) => sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
                 terminate_command_tree(&mut child, process_group).await;
                 let (stdout, stderr) =
                     collect_stream_outputs(stdout_handle, stderr_handle, process_group).await;
+                process_group_guard.disarm();
                 bail!(
                     "{} timed out after {}s\n{}",
                     spec.program.display(),
@@ -4675,6 +4802,7 @@ async fn run_command_with_execution_context(
                 terminate_command_tree(&mut child, process_group).await;
                 let (stdout, stderr) =
                     collect_stream_outputs(stdout_handle, stderr_handle, process_group).await;
+                process_group_guard.disarm();
                 bail!(
                     "{} had no output or file activity for {}s\n{}",
                     spec.program.display(),
@@ -4708,6 +4836,7 @@ async fn run_command_with_execution_context(
 
     let (stdout, stderr) =
         collect_stream_outputs(stdout_handle, stderr_handle, process_group).await;
+    process_group_guard.disarm();
     if let Some(bound_cwd) = bound_cwd {
         bound_cwd
             .validate_identity()
@@ -4764,15 +4893,20 @@ fn file_activity_poll_interval(progress_interval: Duration, idle_timeout: Durati
     })
 }
 
-fn command_process_group(child: &tokio::process::Child) -> CommandProcessGroup {
+fn command_process_group(
+    child: &tokio::process::Child,
+    mode: CommandProcessGroupMode,
+) -> CommandProcessGroup {
     #[cfg(unix)]
     {
-        child.id().map(|id| id as libc::pid_t)
+        matches!(mode, CommandProcessGroupMode::Owned)
+            .then(|| child.id().map(|id| id as libc::pid_t))
+            .flatten()
     }
 
     #[cfg(not(unix))]
     {
-        let _ = child;
+        let _ = (child, mode);
         None
     }
 }
@@ -6288,6 +6422,7 @@ fn is_staging_support_file(staging_dir: &Path, path: &Path) -> bool {
     path == staging_dir.join("BBDown.config")
         || path == staging_dir.join(VIDEO_STAGING_OWNER_FILE_NAME)
         || path == staging_dir.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME)
+        || path == staging_dir.join(VIDEO_STAGING_RETENTION_FILE_NAME)
         || path == staging_dir.join(BILIBILI_WORKER_REQUEST_FILE_NAME)
 }
 
@@ -6329,6 +6464,34 @@ fn validate_video_staging_directory(
     }
     root.validate_private_bound_directory(&entry, expected_identity, 0o700)?;
     Ok(entry)
+}
+
+fn retained_video_staging_reason(
+    root: &RootedFs,
+    path: &Path,
+    expected_identity: EntryIdentity,
+) -> Result<Option<String>> {
+    let marker_path = path.join(VIDEO_STAGING_RETENTION_FILE_NAME);
+    let Some(marker) = root.open_bound_file(&marker_path)? else {
+        return Ok(None);
+    };
+    marker.validate_private_single_link(0o600)?;
+    let retention: VideoStagingRetention =
+        serde_json::from_slice(&marker.read_limited(VIDEO_STAGING_RETENTION_LIMIT)?)
+            .context("failed to parse staged download retention marker")?;
+    if retention.version != VIDEO_STAGING_RETENTION_VERSION
+        || retention.root_device != root.root_identity().device()
+        || retention.root_inode != root.root_identity().inode()
+        || retention.staging_device != expected_identity.device()
+        || retention.staging_inode != expected_identity.inode()
+        || retention.reason.trim().is_empty()
+    {
+        bail!("staged download retention marker does not match its owned directory");
+    }
+    if root.entry_identity(&marker_path)? != Some(marker.identity()) {
+        bail!("staged download retention marker identity changed after validation");
+    }
+    Ok(Some(retention.reason))
 }
 
 #[derive(Debug, Default)]
@@ -6456,6 +6619,9 @@ where
     let result = (|| -> Result<String> {
         let manifest_path = path.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME);
         let Some(manifest_file) = root.open_bound_file(&manifest_path)? else {
+            if let Some(reason) = retained_video_staging_reason(root, path, identity)? {
+                bail!("completed download outputs retained for manual recovery: {reason}");
+            }
             root.remove_bound_tree_durably_if_identity(entry, identity)?;
             return Ok(format!(
                 "Discarded interrupted staged video job: {}",
@@ -6896,6 +7062,38 @@ impl BoundStagingDir {
     fn preserve_for_recovery(&self) {
         self.preserve_on_drop.store(true, Ordering::Release);
     }
+
+    fn retain_for_manual_recovery(&self, reason: &str) -> Result<()> {
+        self.preserve_for_recovery();
+        self.validate_for_path_access()?;
+        let marker = VideoStagingRetention {
+            version: VIDEO_STAGING_RETENTION_VERSION,
+            root_device: self.root.root_identity().device(),
+            root_inode: self.root.root_identity().inode(),
+            staging_device: self.identity.device(),
+            staging_inode: self.identity.inode(),
+            reason: reason.to_string(),
+        };
+        let contents = serde_json::to_vec_pretty(&marker)
+            .context("failed to encode staged download retention marker")?;
+        if contents.len() > VIDEO_STAGING_RETENTION_LIMIT {
+            bail!("staged download retention marker exceeds its size limit");
+        }
+        let marker_path = self.path().join(VIDEO_STAGING_RETENTION_FILE_NAME);
+        let (_, identity) = self
+            .root
+            .create_new_bound_file(&marker_path, &contents, 0o600)
+            .context("failed to persist staged download retention marker")?;
+        let file = self
+            .root
+            .open_bound_file(&marker_path)?
+            .context("staged download retention marker disappeared")?;
+        if file.identity() != identity {
+            bail!("staged download retention marker identity changed after creation");
+        }
+        file.validate_private_single_link(0o600)?;
+        self.validate_for_path_access()
+    }
 }
 
 impl Drop for BoundStagingDir {
@@ -6922,13 +7120,46 @@ fn prepare_staged_publication(
     plan: &mut [MoveStep],
     overwrite: Option<&AcquiredOverwrite>,
 ) -> Result<()> {
-    if plan.is_empty() || plan.len() > VIDEO_STAGING_PUBLICATION_MAX_STEPS {
+    prepare_staged_publication_with_limits_and_sync(
+        root,
+        staging,
+        plan,
+        overwrite,
+        VIDEO_STAGING_PUBLICATION_MAX_STEPS,
+        VIDEO_STAGING_PUBLICATION_MANIFEST_LIMIT,
+        &mut |path, directory| {
+            directory.sync_all().with_context(|| {
+                format!(
+                    "failed to persist staged publication source directory {}",
+                    path.display()
+                )
+            })
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_staged_publication_with_limits_and_sync<F>(
+    root: &RootedFs,
+    staging: &BoundStagingDir,
+    plan: &mut [MoveStep],
+    overwrite: Option<&AcquiredOverwrite>,
+    max_steps: usize,
+    manifest_limit: usize,
+    sync_source_directory: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&Path, &BoundDirectory) -> Result<()>,
+{
+    if plan.is_empty() {
         bail!("staged publication has an invalid number of move steps");
     }
     staging.validate_for_path_access()?;
+    let plan_len = plan.len();
     let mut sources = BTreeSet::new();
     let mut destinations = BTreeSet::new();
-    let mut records = Vec::with_capacity(plan.len());
+    let mut source_directories = BTreeSet::new();
+    let mut records = Vec::with_capacity(plan.len().min(max_steps.saturating_add(1)));
     for step in plan {
         let source_relative = publication_relative_path(root, &step.source)?;
         let destination_relative = publication_relative_path(root, &step.destination)?;
@@ -6939,6 +7170,7 @@ fn prepare_staged_publication(
             )
         })?;
         validate_relative_publication_path(staged_relative)?;
+        collect_staged_source_directories(staging.path(), &step.source, &mut source_directories)?;
         if step.destination.starts_with(staging.path()) {
             bail!(
                 "staged publication destination remains inside staging: {}",
@@ -6950,7 +7182,8 @@ fn prepare_staged_publication(
         {
             bail!("staged publication repeats a source or destination path");
         }
-        if root.entry_identity(&step.destination)?.is_some() {
+        let destination = root.bind_entry(&step.destination, true)?;
+        if root.bound_entry_identity(&destination)?.is_some() {
             bail!(
                 "staged publication destination is already occupied: {}",
                 step.destination.display()
@@ -6970,12 +7203,25 @@ fn prepare_staged_publication(
         })?;
         let identity = source.identity();
         step.expected_identity = Some(identity);
-        records.push(StagedPublicationStep {
-            source_path: source_relative,
-            destination_path: destination_relative,
-            device: identity.device(),
-            inode: identity.inode(),
-        });
+        if plan_len <= max_steps {
+            records.push(StagedPublicationStep {
+                source_path: source_relative,
+                destination_path: destination_relative,
+                device: identity.device(),
+                inode: identity.inode(),
+            });
+        }
+    }
+
+    sync_staged_source_directories(root, staging, source_directories, sync_source_directory)?;
+    if plan_len > max_steps {
+        return Err(retain_oversized_staged_publication(
+            staging,
+            format!(
+                "publication requires {} files, exceeding the {}-file recovery limit",
+                plan_len, max_steps
+            ),
+        ));
     }
 
     let overwrite = overwrite
@@ -7001,8 +7247,15 @@ fn prepare_staged_publication(
     };
     let contents = serde_json::to_vec_pretty(&manifest)
         .context("failed to encode staged publication manifest")?;
-    if contents.len() > VIDEO_STAGING_PUBLICATION_MANIFEST_LIMIT {
-        bail!("staged publication manifest exceeds its size limit");
+    if contents.len() > manifest_limit {
+        return Err(retain_oversized_staged_publication(
+            staging,
+            format!(
+                "publication recovery manifest requires {} bytes, exceeding the {}-byte limit",
+                contents.len(),
+                manifest_limit
+            ),
+        ));
     }
     let manifest_path = staging.path().join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME);
     let (_, identity) = root
@@ -7016,6 +7269,82 @@ fn prepare_staged_publication(
     }
     file.validate_private_single_link(0o600)?;
     staging.validate_for_path_access()
+}
+
+fn collect_staged_source_directories(
+    staging_path: &Path,
+    source_path: &Path,
+    directories: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let mut current = source_path
+        .parent()
+        .context("staged publication source has no parent directory")?;
+    loop {
+        if !current.starts_with(staging_path) {
+            bail!(
+                "staged publication source directory is outside its owned job directory: {}",
+                current.display()
+            );
+        }
+        directories.insert(current.to_path_buf());
+        if current == staging_path {
+            return Ok(());
+        }
+        current = current
+            .parent()
+            .context("staged publication source directory has no staging ancestor")?;
+    }
+}
+
+fn sync_staged_source_directories<F>(
+    root: &RootedFs,
+    staging: &BoundStagingDir,
+    directories: BTreeSet<PathBuf>,
+    sync_source_directory: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&Path, &BoundDirectory) -> Result<()>,
+{
+    let mut directories = directories.into_iter().collect::<Vec<_>>();
+    directories.sort_by(|left, right| {
+        right
+            .components()
+            .count()
+            .cmp(&left.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    for path in directories {
+        if path == staging.path() {
+            sync_source_directory(&path, &staging.directory)?;
+            continue;
+        }
+        let entry = root.bind_entry(&path, false)?;
+        let identity = root
+            .bound_entry_identity(&entry)?
+            .with_context(|| format!("staged source directory is missing: {}", path.display()))?;
+        if !identity.is_dir() {
+            bail!(
+                "staged source directory is not a directory: {}",
+                path.display()
+            );
+        }
+        let directory = root.open_bound_directory(&entry, identity)?;
+        sync_source_directory(&path, &directory)?;
+    }
+    staging.validate_for_path_access()
+}
+
+fn retain_oversized_staged_publication(staging: &BoundStagingDir, reason: String) -> anyhow::Error {
+    match staging.retain_for_manual_recovery(&reason) {
+        Ok(()) => anyhow!(
+            "{reason}; completed outputs were retained at {} for manual recovery",
+            staging.path().display()
+        ),
+        Err(retention_error) => anyhow!(
+            "{reason}; failed to persist the manual-recovery marker at {}: {retention_error:#}",
+            staging.path().display()
+        ),
+    }
 }
 
 fn publication_relative_path(root: &RootedFs, path: &Path) -> Result<PathBuf> {
@@ -10870,6 +11199,126 @@ mod tests {
             })
         );
         let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn staged_publication_syncs_nested_source_directories_before_the_manifest() {
+        let final_dir = temp_test_dir("staged-publication-directory-sync");
+        let root = RootedFs::new(&final_dir).expect("output root should bind");
+        let staging =
+            create_video_staging_dir(&root).expect("production staging directory should create");
+        let staging_dir = staging.path().to_path_buf();
+        let first_dir = staging_dir.join("series");
+        let second_dir = first_dir.join("episode");
+        fs::create_dir_all(&second_dir).expect("nested staging directories should create");
+        let staged_video = second_dir.join("Episode.mkv");
+        let staged_nfo = first_dir.join("Episode.nfo");
+        fs::write(&staged_video, "new-video").expect("staged video should write");
+        fs::write(&staged_nfo, "new-nfo").expect("staged NFO should write");
+        let mut plan = staged_move_plan(
+            &staging_dir,
+            &final_dir,
+            &[staged_video, staged_nfo],
+            None,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("nested move plan should build");
+        let manifest = staging_dir.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME);
+        let mut synced = Vec::new();
+
+        prepare_staged_publication_with_limits_and_sync(
+            &root,
+            &staging,
+            &mut plan,
+            None,
+            VIDEO_STAGING_PUBLICATION_MAX_STEPS,
+            VIDEO_STAGING_PUBLICATION_MANIFEST_LIMIT,
+            &mut |path, directory| {
+                assert!(!manifest.exists(), "manifest must follow directory fsync");
+                directory.sync_all()?;
+                synced.push(path.to_path_buf());
+                Ok(())
+            },
+        )
+        .expect("publication preparation should persist directories and manifest");
+
+        assert_eq!(synced, vec![second_dir, first_dir, staging_dir.clone()]);
+        assert!(manifest.is_file());
+        drop(staging);
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn oversized_staged_publications_survive_startup_recovery() {
+        for (case, max_steps, manifest_limit, expected_reason) in [
+            (
+                "steps",
+                1,
+                VIDEO_STAGING_PUBLICATION_MANIFEST_LIMIT,
+                "file recovery limit",
+            ),
+            (
+                "bytes",
+                VIDEO_STAGING_PUBLICATION_MAX_STEPS,
+                1,
+                "byte limit",
+            ),
+        ] {
+            let final_dir = temp_test_dir(&format!("staged-publication-retained-{case}"));
+            let root = RootedFs::new(&final_dir).expect("output root should bind");
+            let staging = create_video_staging_dir(&root)
+                .expect("production staging directory should create");
+            let staging_dir = staging.path().to_path_buf();
+            let nested = staging_dir.join("series").join("episode");
+            fs::create_dir_all(&nested).expect("nested staging directory should create");
+            let staged_video = nested.join("Episode.mkv");
+            let staged_nfo = nested.join("Episode.nfo");
+            fs::write(&staged_video, "new-video").expect("staged video should write");
+            fs::write(&staged_nfo, "new-nfo").expect("staged NFO should write");
+            let mut plan = staged_move_plan(
+                &staging_dir,
+                &final_dir,
+                &[staged_video.clone(), staged_nfo.clone()],
+                None,
+                StagedPrimaryMediaKind::Video,
+            )
+            .expect("move plan should build");
+
+            let error = prepare_staged_publication_with_limits_and_sync(
+                &root,
+                &staging,
+                &mut plan,
+                None,
+                max_steps,
+                manifest_limit,
+                &mut |_, directory| directory.sync_all(),
+            )
+            .expect_err("oversized publication should stop before moving outputs");
+
+            assert!(format!("{error:#}").contains(expected_reason));
+            assert!(
+                staging_dir
+                    .join(VIDEO_STAGING_RETENTION_FILE_NAME)
+                    .is_file()
+            );
+            assert!(
+                !staging_dir
+                    .join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME)
+                    .exists()
+            );
+            drop(staging);
+            let report = recover_pending_video_staging_directories_locked(&root)
+                .expect("startup recovery should retain completed oversized outputs");
+
+            assert!(report.unresolved);
+            assert!(report.messages.iter().any(|message| {
+                message.contains("completed download outputs retained for manual recovery")
+            }));
+            assert_eq!(fs::read_to_string(&staged_video).unwrap(), "new-video");
+            assert_eq!(fs::read_to_string(&staged_nfo).unwrap(), "new-nfo");
+            assert!(staging_dir.is_dir());
+            let _ = fs::remove_dir_all(final_dir);
+        }
     }
 
     #[test]
@@ -15569,6 +16018,80 @@ mv video.original video.m4s || exit 46
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn bilibili_worker_policy_disables_only_the_total_deadline() {
+        let root = temp_test_dir("bilibili-worker-total-deadline");
+        let mut config = test_config();
+        config.bot.command_timeout_seconds = 1;
+        config.bot.command_idle_timeout_seconds = 5;
+        let spec = CommandSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".to_string(), "sleep 2; printf finished".to_string()],
+            cwd: root.clone(),
+            activity_dir: None,
+            cleanup_paths: Vec::new(),
+        };
+
+        let output = tokio_timeout(
+            Duration::from_secs(5),
+            run_command_with_execution_context(
+                &config,
+                &spec,
+                None,
+                &[],
+                None,
+                CommandExecutionPolicy::BILIBILI_WORKER,
+            ),
+        )
+        .await
+        .expect("deadline-free worker command should finish")
+        .expect("deadline-free worker command should succeed");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"finished");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bilibili_mux_policy_inherits_the_worker_process_group() {
+        let root = temp_test_dir("bilibili-mux-process-group");
+        let mut config = test_config();
+        config.bot.command_timeout_seconds = 5;
+        config.bot.command_idle_timeout_seconds = 5;
+        let spec = CommandSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".to_string(), "/bin/ps -o pgid= -p $$".to_string()],
+            cwd: root.clone(),
+            activity_dir: None,
+            cleanup_paths: Vec::new(),
+        };
+
+        let output = run_command_with_execution_context(
+            &config,
+            &spec,
+            None,
+            &[],
+            None,
+            CommandExecutionPolicy::BILIBILI_MUX,
+        )
+        .await
+        .expect("mux process-group probe should run");
+        let child_process_group = String::from_utf8(output.stdout)
+            .expect("process group output should be UTF-8")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("process group output should parse");
+
+        assert_eq!(child_process_group, unsafe { libc::getpgrp() });
+        assert_eq!(
+            CommandExecutionPolicy::BILIBILI_MUX.total_deadline,
+            CommandTotalDeadline::Configured
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn timeout_terminates_descendant_processes() {
         let root = temp_test_dir("process-group");
         let pid_file = root.join("child.pid");
@@ -15609,6 +16132,55 @@ mv video.original video.m4s || exit 46
         }
         let _ = fs::remove_dir_all(&root);
         panic!("descendant process {pid} survived command timeout");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_command_future_terminates_its_process_group() {
+        let root = temp_test_dir("process-group-cancellation");
+        let pid_file = root.join("child.pid");
+        let mut config = test_config();
+        config.bot.command_timeout_seconds = 30;
+        config.bot.command_idle_timeout_seconds = 30;
+        let spec = CommandSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_string(),
+                "sleep 30 & echo $! > \"$0\"; wait".to_string(),
+                pid_file.display().to_string(),
+            ],
+            cwd: root.clone(),
+            activity_dir: Some(root.clone()),
+            cleanup_paths: Vec::new(),
+        };
+        let task = tokio::spawn(async move { run_command(&config, &spec, None).await });
+        for _ in 0..50 {
+            if pid_file.is_file() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid = fs::read_to_string(&pid_file)
+            .expect("child pid should be written before cancellation")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("child pid should parse");
+
+        task.abort();
+        let _ = task.await;
+        for _ in 0..20 {
+            if !process_exists(pid) {
+                let _ = fs::remove_dir_all(&root);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = fs::remove_dir_all(&root);
+        panic!("descendant process {pid} survived command cancellation");
     }
 
     #[cfg(unix)]

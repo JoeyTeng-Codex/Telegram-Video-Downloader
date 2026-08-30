@@ -240,6 +240,12 @@ impl BoundDirectory {
         Ok(())
     }
 
+    pub(crate) fn sync_all(&self) -> Result<()> {
+        self.validate_identity()?;
+        sync_directory(self.fd.as_ref())?;
+        self.validate_identity()
+    }
+
     #[cfg(unix)]
     pub(crate) fn duplicate_fd_cloexec_at_least(&self, minimum: RawFd) -> Result<OwnedFd> {
         self.validate_identity()?;
