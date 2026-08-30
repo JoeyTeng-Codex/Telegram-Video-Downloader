@@ -1403,7 +1403,13 @@ pub fn clear_auth_state_and_credentials_with_epoch(
 ) -> Result<(AuthCleanupResult, u64)> {
     with_auth_mutation_transaction(state_path, credential_file, |transaction| {
         let legacy_state = transaction.delete_legacy_state();
-        let credential_state = clear_credentials();
+        let credential_state = if legacy_state.is_ok() {
+            clear_credentials()
+        } else {
+            Err(anyhow!(
+                "BBDown credential cleanup skipped because legacy login state cleanup failed"
+            ))
+        };
         Ok((legacy_state, credential_state))
     })
 }
@@ -2189,6 +2195,52 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logout_keeps_credentials_when_symlinked_legacy_state_cannot_be_removed() {
+        use std::os::unix::fs::symlink;
+
+        let state_path = temp_state_file("logout-symlinked-legacy-state");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        fs::create_dir_all(&root).expect("auth root should create");
+        let legacy_target = root.join("legacy-auth-target.json");
+        let credential_file = root.join("credentials.json");
+        save_auth_state(&legacy_target, &test_state()).expect("legacy state should save");
+        symlink(&legacy_target, &state_path).expect("legacy state symlink should create");
+        fs::write(&credential_file, b"active-credentials")
+            .expect("active credentials should write");
+        let credential_cleanup_called = std::cell::Cell::new(false);
+
+        let (legacy_state, credential_state) =
+            clear_auth_state_and_credentials(&state_path, &credential_file, || {
+                credential_cleanup_called.set(true);
+                fs::remove_file(&credential_file).context("failed to clear active credentials")
+            })
+            .expect("logout transaction should complete");
+
+        assert!(legacy_state.is_err());
+        assert!(credential_state.is_err());
+        assert!(!credential_cleanup_called.get());
+        assert_eq!(
+            fs::read(&credential_file).expect("active credentials should remain"),
+            b"active-credentials"
+        );
+        assert_eq!(
+            load_auth_state(&legacy_target).expect("legacy target should load"),
+            Some(test_state())
+        );
+        assert!(
+            fs::symlink_metadata(&state_path)
+                .expect("legacy symlink should remain")
+                .file_type()
+                .is_symlink()
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

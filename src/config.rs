@@ -254,6 +254,7 @@ impl AppConfig {
         {
             bail!("bilibili.auth.credential_profile must not be empty when set");
         }
+        ensure_auth_state_path_is_not_symlink(&self.bilibili.auth.state_path)?;
         ensure_distinct_auth_paths(
             &self.bilibili.auth.state_path,
             &self.bilibili.auth.credential_file,
@@ -277,6 +278,23 @@ impl AppConfig {
             }
         }
         Ok(())
+    }
+}
+
+fn ensure_auth_state_path_is_not_symlink(state_path: &Path) -> Result<()> {
+    match fs::symlink_metadata(state_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => bail!(
+            "bilibili.auth.state_path must not be a symbolic link: {}",
+            state_path.display()
+        ),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed to inspect bilibili.auth.state_path: {}",
+                state_path.display()
+            )
+        }),
     }
 }
 
@@ -976,6 +994,43 @@ mod tests {
             config.bilibili.auth.state_path,
             PathBuf::from("/tmp/project/state/bilibili-auth.json")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_bilibili_auth_state_path_leaf_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_test_dir("auth-state-leaf-symlink");
+        fs::create_dir_all(&root).expect("auth root should create");
+        let target = root.join("legacy-auth-target.json");
+        let state = root.join("bilibili-auth.json");
+        fs::write(&target, b"legacy-auth").expect("legacy auth target should write");
+        symlink(&target, &state).expect("legacy auth symlink should create");
+        let config = format!(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [bilibili.auth]
+            state_path = "{}"
+            credential_file = "{}"
+            "#,
+            state.display(),
+            root.join("credentials.json").display()
+        );
+
+        let error = AppConfig::from_toml_str(&config, root.clone())
+            .expect_err("leaf symlink auth state should fail validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("bilibili.auth.state_path must not be a symbolic link")
+        );
+        assert!(target.is_file());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
