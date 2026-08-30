@@ -980,35 +980,67 @@ fn reconcile_interrupted_auth_cleanup_unlocked(
         }
     }
 
-    let root = RootedFs::new(parent).with_context(|| {
-        format!(
-            "failed to bind Bilibili auth cleanup root {}",
-            parent.display()
-        )
-    })?;
-    // Protected property: an interrupted cleanup may delete only its persisted selected object.
-    // Rebinding the active credential path for every candidate means exact device/inode identity is
-    // the sole restore signal; an unreadable path or uncertain recovery remains unresolved.
-    let report =
-        root.reconcile_remove_quarantines_with_status_and_restore_decider(|candidate| {
-            let current_credential = bind_cleanup_target(credential_file)?;
-            Ok(current_credential
-                .as_ref()
-                .map(BoundCleanupTarget::identity)
-                == Some(candidate))
+    let stale_config_dir = bbdown_config_dir(&state_path);
+    let mut cleanup_directories = vec![parent.to_path_buf()];
+    match fs::metadata(&stale_config_dir) {
+        Ok(metadata) if metadata.is_dir() => cleanup_directories.push(stale_config_dir),
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to inspect Bilibili stale auth cleanup directory {}",
+                    stale_config_dir.display()
+                )
+            });
+        }
+    }
+
+    let mut messages = Vec::new();
+    let mut unresolved = false;
+    let mut restored = false;
+    let mut scanned_directories = HashSet::new();
+    for cleanup_directory in cleanup_directories {
+        let root = RootedFs::new(&cleanup_directory).with_context(|| {
+            format!(
+                "failed to bind Bilibili auth cleanup directory {}",
+                cleanup_directory.display()
+            )
         })?;
-    if report.restored {
+        let root_identity = root.root_identity();
+        if !scanned_directories.insert((root_identity.device(), root_identity.inode())) {
+            continue;
+        }
+        // Protected property: auth recovery considers managed quarantine entries only in the
+        // exact directories where legacy state/config cleanup can create them. Rebinding the
+        // active credential for every candidate makes object identity the sole restore signal;
+        // unrelated sibling subtrees are outside this recovery authority.
+        let report = root
+            .reconcile_remove_quarantines_in_current_directory_with_status_and_restore_decider(
+                |candidate| {
+                    let current_credential = bind_cleanup_target(credential_file)?;
+                    Ok(current_credential
+                        .as_ref()
+                        .map(BoundCleanupTarget::identity)
+                        == Some(candidate))
+                },
+            )?;
+        messages.extend(report.messages);
+        unresolved |= report.unresolved;
+        restored |= report.restored;
+    }
+    if restored {
         bail!(
             "interrupted Bilibili auth cleanup restored a file that now aliases the active credential; resolve the configured auth paths before retrying"
         );
     }
-    if report.unresolved {
+    if unresolved {
         bail!(
             "interrupted Bilibili auth cleanup could not be verified: {}",
-            report.messages.join("; ")
+            messages.join("; ")
         );
     }
-    Ok(report.messages)
+    Ok(messages)
 }
 
 fn acquire_auth_mutation_file_lock(
@@ -2447,6 +2479,77 @@ mod tests {
                 .any(|message| message.contains("Recovered interrupted bound-path removal"))
         );
         assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".telegram-video-downloader-remove")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_auth_recovery_ignores_unrelated_unreadable_subdirectories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_path = temp_state_file("auth-recovery-unrelated-directory");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        let unrelated = root.join("unrelated-private-data");
+        fs::create_dir_all(&unrelated).expect("unrelated directory should create");
+        fs::write(unrelated.join("sentinel"), b"unrelated")
+            .expect("unrelated sentinel should write");
+        fs::write(&credential_file, b"active-credentials")
+            .expect("active credentials should write");
+        fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o000))
+            .expect("unrelated directory should become unreadable");
+
+        let result = recover_interrupted_auth_cleanup(&state_path, &credential_file);
+
+        fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o700))
+            .expect("unrelated directory permissions should restore");
+        let messages = result.expect("unrelated subtree must not block auth recovery");
+        assert!(messages.is_empty());
+        assert_eq!(fs::read(unrelated.join("sentinel")).unwrap(), b"unrelated");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_auth_recovery_scans_the_known_stale_config_directory() {
+        let state_path = temp_state_file("auth-recovery-stale-config-directory");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        let stale_config_dir = bbdown_config_dir(&state_path);
+        let stale_config = stale_config_dir.join("stale.config");
+        fs::create_dir_all(&stale_config_dir).expect("stale config directory should create");
+        fs::write(&stale_config, b"legacy-cookie").expect("stale config should write");
+        fs::write(&credential_file, b"active-credentials")
+            .expect("active credentials should write");
+        let target = bind_cleanup_target(&stale_config)
+            .expect("stale config should bind")
+            .expect("stale config should exist");
+        target
+            .root
+            .leave_validated_file_removal_quarantined_for_test(&target.entry, target.identity())
+            .expect("interrupted stale config cleanup should persist");
+        drop(target);
+
+        let messages = recover_interrupted_auth_cleanup(&state_path, &credential_file)
+            .expect("known stale config cleanup should recover");
+
+        assert!(!stale_config.exists());
+        assert!(messages.iter().any(|message| {
+            message.contains("Recovered interrupted bound-path removal")
+                && message.contains(".bbdown.config.d")
+        }));
+        assert!(fs::read_dir(&stale_config_dir).unwrap().all(|entry| {
             !entry
                 .unwrap()
                 .file_name()

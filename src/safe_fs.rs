@@ -134,6 +134,19 @@ enum RemoveQuarantineRecoveryAction {
     Restored,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RemoveQuarantineScanDepth {
+    CurrentDirectory,
+    Recursive,
+}
+
+#[derive(Default)]
+struct RemoveQuarantineScanState {
+    messages: Vec<String>,
+    unresolved: bool,
+    restored: bool,
+}
+
 #[derive(Clone, Copy)]
 struct RemoveQuarantinePolicy {
     recursive: bool,
@@ -386,29 +399,55 @@ impl RootedFs {
 
     pub(crate) fn reconcile_remove_quarantines_with_status_and_restore_decider<F>(
         &self,
+        should_restore: F,
+    ) -> Result<RemoveQuarantineRecoveryReport>
+    where
+        F: FnMut(EntryIdentity) -> Result<bool>,
+    {
+        self.reconcile_remove_quarantines_with_status_and_restore_decider_at_depth(
+            should_restore,
+            RemoveQuarantineScanDepth::Recursive,
+        )
+    }
+
+    pub(crate) fn reconcile_remove_quarantines_in_current_directory_with_status_and_restore_decider<
+        F,
+    >(
+        &self,
+        should_restore: F,
+    ) -> Result<RemoveQuarantineRecoveryReport>
+    where
+        F: FnMut(EntryIdentity) -> Result<bool>,
+    {
+        self.reconcile_remove_quarantines_with_status_and_restore_decider_at_depth(
+            should_restore,
+            RemoveQuarantineScanDepth::CurrentDirectory,
+        )
+    }
+
+    fn reconcile_remove_quarantines_with_status_and_restore_decider_at_depth<F>(
+        &self,
         mut should_restore: F,
+        scan_depth: RemoveQuarantineScanDepth,
     ) -> Result<RemoveQuarantineRecoveryReport>
     where
         F: FnMut(EntryIdentity) -> Result<bool>,
     {
         self.validate_root()?;
-        let mut reports = Vec::new();
-        let mut unresolved = false;
-        let mut restored = false;
+        let mut state = RemoveQuarantineScanState::default();
         reconcile_remove_quarantines_in_directory(
             self.root_fd.as_ref(),
             self.root_identity,
             &self.logical_root,
-            &mut reports,
-            &mut unresolved,
-            &mut restored,
+            &mut state,
             &mut should_restore,
+            scan_depth,
         )?;
         self.validate_root()?;
         Ok(RemoveQuarantineRecoveryReport {
-            messages: reports,
-            unresolved,
-            restored,
+            messages: state.messages,
+            unresolved: state.unresolved,
+            restored: state.restored,
         })
     }
 
@@ -1505,10 +1544,9 @@ fn reconcile_remove_quarantines_in_directory<F>(
     directory: &OwnedFd,
     expected_directory: EntryIdentity,
     display_path: &Path,
-    reports: &mut Vec<String>,
-    unresolved: &mut bool,
-    restored: &mut bool,
+    state: &mut RemoveQuarantineScanState,
     should_restore: &mut F,
+    scan_depth: RemoveQuarantineScanDepth,
 ) -> Result<()>
 where
     F: FnMut(EntryIdentity) -> Result<bool>,
@@ -1545,16 +1583,19 @@ where
         if matches!(name.as_bytes(), b"." | b"..") {
             continue;
         }
+        let is_managed_name = name
+            .as_bytes()
+            .starts_with(REMOVE_QUARANTINE_PREFIX.as_bytes());
+        if scan_depth == RemoveQuarantineScanDepth::CurrentDirectory && !is_managed_name {
+            continue;
+        }
         let path = display_path.join(name.to_string_lossy().as_ref());
         let Some(identity) = identity_at_cstr(directory, &name)? else {
-            if name
-                .as_bytes()
-                .starts_with(REMOVE_QUARANTINE_PREFIX.as_bytes())
-            {
+            if is_managed_name {
                 continue;
             }
-            *unresolved = true;
-            reports.push(format!(
+            state.unresolved = true;
+            state.messages.push(format!(
                 "Skipped disappearing entry during interrupted-removal scan: {}",
                 path.display()
             ));
@@ -1568,13 +1609,13 @@ where
                 &path,
                 identity,
             ) {
-                Ok(()) => reports.push(format!(
+                Ok(()) => state.messages.push(format!(
                     "Recovered interrupted bound-path cleanup: {}",
                     path.display()
                 )),
                 Err(err) => {
-                    *unresolved = true;
-                    reports.push(format!(
+                    state.unresolved = true;
+                    state.messages.push(format!(
                         "Retained unresolved interrupted-removal tombstone {}: {err:#}",
                         path.display()
                     ));
@@ -1594,20 +1635,20 @@ where
                 identity,
                 should_restore,
             ) {
-                Ok(RemoveQuarantineRecoveryAction::Deleted) => reports.push(format!(
+                Ok(RemoveQuarantineRecoveryAction::Deleted) => state.messages.push(format!(
                     "Recovered interrupted bound-path removal: {}",
                     path.display()
                 )),
                 Ok(RemoveQuarantineRecoveryAction::Restored) => {
-                    *restored = true;
-                    reports.push(format!(
+                    state.restored = true;
+                    state.messages.push(format!(
                         "Restored interrupted validated bound-path removal: {}",
                         path.display()
                     ));
                 }
                 Err(err) => {
-                    *unresolved = true;
-                    reports.push(format!(
+                    state.unresolved = true;
+                    state.messages.push(format!(
                         "Retained unresolved interrupted-removal quarantine {}: {err:#}",
                         path.display()
                     ));
@@ -1615,14 +1656,14 @@ where
             }
             continue;
         }
-        if !identity.is_dir() {
+        if scan_depth == RemoveQuarantineScanDepth::CurrentDirectory || !identity.is_dir() {
             continue;
         }
         let child = match openat_directory_cstr(directory, &name) {
             Ok(child) => child,
             Err(err) => {
-                *unresolved = true;
-                reports.push(format!(
+                state.unresolved = true;
+                state.messages.push(format!(
                     "Skipped unreadable directory during interrupted-removal scan {}: {err}",
                     path.display()
                 ));
@@ -1630,8 +1671,8 @@ where
             }
         };
         if identity_for_fd(&child)? != identity {
-            *unresolved = true;
-            reports.push(format!(
+            state.unresolved = true;
+            state.messages.push(format!(
                 "Skipped replaced directory during interrupted-removal scan: {}",
                 path.display()
             ));
@@ -1641,13 +1682,12 @@ where
             &child,
             identity,
             &path,
-            reports,
-            unresolved,
-            restored,
+            state,
             should_restore,
+            RemoveQuarantineScanDepth::Recursive,
         ) {
-            *unresolved = true;
-            reports.push(format!(
+            state.unresolved = true;
+            state.messages.push(format!(
                 "Skipped directory during interrupted-removal scan {}: {err:#}",
                 path.display()
             ));
@@ -2067,10 +2107,8 @@ fn finish_remove_quarantine_cleanup(
         bail!("remove quarantine manifest changed before terminal cleanup");
     }
 
-    let mut tombstone_manifest = manifest.clone();
-    tombstone_manifest.version = REMOVE_QUARANTINE_MANIFEST_VERSION;
-    tombstone_manifest.quarantine_device = Some(expected_quarantine.device);
-    tombstone_manifest.quarantine_inode = Some(expected_quarantine.inode);
+    let tombstone_manifest =
+        build_terminal_remove_quarantine_manifest(manifest, expected_quarantine);
     let tombstone_name = remove_quarantine_tombstone_name(quarantine_name);
     let tombstone_identity = create_or_validate_remove_quarantine_tombstone(
         parent,
@@ -2087,6 +2125,24 @@ fn finish_remove_quarantine_cleanup(
         tombstone_identity,
         Path::new(&tombstone_manifest.quarantine_name),
     )
+}
+
+fn build_terminal_remove_quarantine_manifest(
+    manifest: &RemoveQuarantineManifest,
+    expected_quarantine: EntryIdentity,
+) -> RemoveQuarantineManifest {
+    let mut terminal = manifest.clone();
+    // A v1 quarantine needs the v2 identity fields to become a standalone tombstone. Neither v1
+    // nor v2 persisted the original leaf required by v3, so upgrading either schema would create
+    // an invalid terminal record after the quarantine directory disappears.
+    terminal.version = if manifest.version == REMOVE_QUARANTINE_MANIFEST_VERSION {
+        REMOVE_QUARANTINE_MANIFEST_VERSION
+    } else {
+        REMOVE_QUARANTINE_PREVIOUS_MANIFEST_VERSION
+    };
+    terminal.quarantine_device = Some(expected_quarantine.device);
+    terminal.quarantine_inode = Some(expected_quarantine.inode);
+    terminal
 }
 
 fn create_or_validate_remove_quarantine_tombstone(
@@ -3480,6 +3536,116 @@ mod tests {
                 .starts_with(REMOVE_QUARANTINE_PREFIX)
         }));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_quarantine_tombstones_survive_a_restart_after_directory_removal() {
+        for legacy_version in [
+            REMOVE_QUARANTINE_LEGACY_MANIFEST_VERSION,
+            REMOVE_QUARANTINE_PREVIOUS_MANIFEST_VERSION,
+        ] {
+            let root = temp_dir(&format!("legacy-remove-tombstone-v{legacy_version}"));
+            fs::create_dir_all(&root).expect("root should create");
+            let owned_path = root.join("owned.txt");
+            fs::write(&owned_path, b"owned").expect("owned file should write");
+            let rooted = RootedFs::new(&root).expect("root should bind");
+            let entry = rooted
+                .bind_entry(&owned_path, false)
+                .expect("owned file should bind");
+            let expected = rooted
+                .bound_entry_identity(&entry)
+                .expect("owned identity should read")
+                .expect("owned file should exist");
+            let quarantine = create_private_remove_quarantine(
+                &entry.parent,
+                &entry.leaf,
+                expected,
+                RemoveQuarantinePolicy::retain(false),
+            )
+            .expect("quarantine should create");
+            renameat_noreplace(
+                entry.parent.fd.as_ref(),
+                &entry.leaf,
+                &quarantine.directory,
+                OsStr::new("entry"),
+            )
+            .expect("owned file should move into quarantine");
+
+            let mut legacy_manifest = quarantine.manifest.clone();
+            legacy_manifest.version = legacy_version;
+            legacy_manifest.original_name_hex = None;
+            legacy_manifest.restore_requires_revalidation = false;
+            if legacy_version == REMOVE_QUARANTINE_LEGACY_MANIFEST_VERSION {
+                legacy_manifest.quarantine_device = None;
+                legacy_manifest.quarantine_inode = None;
+            }
+            let inner_manifest_path = root
+                .join(&quarantine.name)
+                .join(REMOVE_QUARANTINE_MANIFEST_NAME);
+            fs::write(
+                &inner_manifest_path,
+                serde_json::to_vec(&legacy_manifest).expect("legacy manifest should encode"),
+            )
+            .expect("legacy manifest should replace current contents");
+            File::open(&inner_manifest_path)
+                .expect("legacy manifest should reopen")
+                .sync_all()
+                .expect("legacy manifest should sync");
+            rustix::fs::unlinkat(&quarantine.directory, "entry", AtFlags::empty())
+                .expect("quarantined file should remove");
+            sync_directory(&quarantine.directory).expect("quarantine should sync");
+
+            let quarantine_name = CString::new(quarantine.name.to_string_lossy().as_bytes())
+                .expect("generated quarantine name should be valid");
+            let terminal_manifest =
+                build_terminal_remove_quarantine_manifest(&legacy_manifest, quarantine.identity);
+            assert_eq!(
+                terminal_manifest.version,
+                REMOVE_QUARANTINE_PREVIOUS_MANIFEST_VERSION
+            );
+            assert!(terminal_manifest.original_name_hex.is_none());
+            let tombstone_name = remove_quarantine_tombstone_name(&quarantine_name);
+            create_or_validate_remove_quarantine_tombstone(
+                entry.parent.fd.as_ref(),
+                &tombstone_name,
+                &terminal_manifest,
+            )
+            .expect("legacy terminal tombstone should persist");
+
+            rustix::fs::unlinkat(
+                &quarantine.directory,
+                REMOVE_QUARANTINE_MANIFEST_NAME,
+                AtFlags::empty(),
+            )
+            .expect("inner legacy manifest should remove");
+            sync_directory(&quarantine.directory).expect("quarantine should sync");
+            rustix::fs::unlinkat(
+                entry.parent.fd.as_ref(),
+                &quarantine.name,
+                AtFlags::REMOVEDIR,
+            )
+            .expect("empty quarantine directory should remove");
+            sync_directory(entry.parent.fd.as_ref()).expect("quarantine parent should sync");
+            drop(quarantine);
+
+            let reports = rooted
+                .reconcile_remove_quarantines()
+                .expect("standalone legacy tombstone should recover after restart");
+
+            assert!(
+                reports
+                    .iter()
+                    .any(|report| report.contains("Recovered interrupted bound-path cleanup"))
+            );
+            assert!(fs::read_dir(&root).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(REMOVE_QUARANTINE_PREFIX)
+            }));
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
