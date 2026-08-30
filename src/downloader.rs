@@ -4934,6 +4934,109 @@ struct CommandChunk {
     bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SensitiveProgressContinuation {
+    BilibiliCookie,
+    BbdownCredential,
+}
+
+impl SensitiveProgressContinuation {
+    fn replacement(self) -> &'static str {
+        match self {
+            Self::BilibiliCookie => "<redacted Bilibili cookie>",
+            Self::BbdownCredential => "<redacted BBDown credential>",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CommandProgressSanitizer {
+    pending: Vec<u8>,
+    continuation: Option<SensitiveProgressContinuation>,
+}
+
+impl CommandProgressSanitizer {
+    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.pending.extend_from_slice(bytes);
+        let mut records = Vec::new();
+        while let Some(end) = complete_progress_record_end(&self.pending) {
+            let record = self.pending.drain(..end).collect::<Vec<_>>();
+            records.push(self.sanitize_record(&record));
+        }
+        records
+    }
+
+    fn finish(&mut self) -> Vec<String> {
+        let mut records = Vec::new();
+        if !self.pending.is_empty() {
+            let record = std::mem::take(&mut self.pending);
+            records.push(self.sanitize_record(&record));
+        }
+        self.continuation = None;
+        records
+    }
+
+    fn sanitize_record(&mut self, record: &[u8]) -> String {
+        let raw = String::from_utf8_lossy(record);
+        let next_continuation = sensitive_progress_continuation(&raw);
+        let sanitized = match self.continuation.take() {
+            Some(continuation) => {
+                let line_ending = raw.trim_end_matches(['\r', '\n']).len();
+                format!("{}{}", continuation.replacement(), &raw[line_ending..])
+            }
+            None => redact_sensitive_output(&raw),
+        };
+        self.continuation = next_continuation;
+        sanitized
+    }
+}
+
+fn complete_progress_record_end(bytes: &[u8]) -> Option<usize> {
+    for (index, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'\n' => return Some(index + 1),
+            b'\r' if index + 1 == bytes.len() => return None,
+            b'\r' if bytes[index + 1] == b'\n' => return Some(index + 2),
+            b'\r' => return Some(index + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn sensitive_progress_continuation(text: &str) -> Option<SensitiveProgressContinuation> {
+    let line = text.trim_end_matches(['\r', '\n']).trim_end();
+    let lowercase = line.to_ascii_lowercase();
+    if progress_marker_has_no_value(&lowercase, "--cookie") || lowercase.ends_with("cookie:") {
+        return Some(SensitiveProgressContinuation::BilibiliCookie);
+    }
+    if ["--access-key", "--access-token", "--refresh-token"]
+        .iter()
+        .any(|marker| progress_marker_has_no_value(&lowercase, marker))
+        || ["access_key", "access_token", "refresh_token"]
+            .iter()
+            .any(|name| {
+                lowercase.ends_with(&format!("\"{name}\":"))
+                    || lowercase.ends_with(&format!("{name}="))
+            })
+        || lowercase.ends_with("authorization:")
+    {
+        return Some(SensitiveProgressContinuation::BbdownCredential);
+    }
+    None
+}
+
+fn progress_marker_has_no_value(line: &str, marker: &str) -> bool {
+    let Some(index) = line.rfind(marker) else {
+        return false;
+    };
+    let before = line[..index].chars().next_back();
+    if before.is_some_and(|ch| !ch.is_ascii_whitespace()) {
+        return false;
+    }
+    matches!(line[index + marker.len()..].trim(), "" | "=")
+}
+
 struct CommandProcessGroupGuard {
     process_group: CommandProcessGroup,
     armed: bool,
@@ -5286,6 +5389,10 @@ async fn run_command_with_execution_context_and_additional_fds(
         process_group,
     )
     .await;
+    while let Ok(chunk) = chunk_rx.try_recv() {
+        progress_tracker.observe(chunk.stream, &chunk.bytes);
+    }
+    progress_tracker.finish();
     if !status.success() && process_group.is_inherited() {
         let summary = summarize_output(
             &String::from_utf8_lossy(&stdout),
@@ -6026,6 +6133,8 @@ struct ProgressTracker {
     last_output: Option<String>,
     last_file_activity: Option<FileActivityReport>,
     stage: ProgressStage,
+    stdout_sanitizer: CommandProgressSanitizer,
+    stderr_sanitizer: CommandProgressSanitizer,
 }
 
 impl ProgressTracker {
@@ -6043,6 +6152,8 @@ impl ProgressTracker {
             last_message: None,
             last_output: None,
             last_file_activity: None,
+            stdout_sanitizer: CommandProgressSanitizer::default(),
+            stderr_sanitizer: CommandProgressSanitizer::default(),
         }
     }
 
@@ -6051,7 +6162,31 @@ impl ProgressTracker {
             return;
         }
 
-        let text = normalize_terminal_text(&String::from_utf8_lossy(bytes));
+        let records = match stream {
+            CommandStream::Stdout => self.stdout_sanitizer.push(bytes),
+            CommandStream::Stderr => self.stderr_sanitizer.push(bytes),
+        };
+        for text in records {
+            self.observe_sanitized(stream, &text);
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.progress.is_none() {
+            return;
+        }
+        let stdout = self.stdout_sanitizer.finish();
+        let stderr = self.stderr_sanitizer.finish();
+        for text in stdout {
+            self.observe_sanitized(CommandStream::Stdout, &text);
+        }
+        for text in stderr {
+            self.observe_sanitized(CommandStream::Stderr, &text);
+        }
+    }
+
+    fn observe_sanitized(&mut self, stream: CommandStream, text: &str) {
+        let text = normalize_terminal_text(text);
         self.stage = self.stage.update_from_text(&self.command_name, &text);
         let Some(message) = summarize_progress_chunk(&self.command_name, stream, &text) else {
             return;
@@ -8883,6 +9018,14 @@ fn rollback_acquired_overwrite(
         }
         return error;
     }
+    if let Some(staging) = staging
+        && let Err(retirement_error) = retire_staged_publication_after_move_rollback(staging)
+    {
+        staging.preserve_for_recovery();
+        return anyhow!(
+            "{error:#}\nfailed to retire rolled-back staged publication: {retirement_error:#}"
+        );
+    }
     match acquired.restore() {
         Ok(()) => error,
         Err(restore_error) => {
@@ -8892,6 +9035,31 @@ fn rollback_acquired_overwrite(
             anyhow!("{error:#}\nfailed to restore acquired overwrite files: {restore_error:#}")
         }
     }
+}
+
+fn retire_staged_publication_after_move_rollback(staging: &BoundStagingDir) -> Result<()> {
+    staging.validate_for_path_access()?;
+    let manifest_path = staging.path().join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME);
+    let Some(manifest_file) = staging.root.open_bound_file(&manifest_path)? else {
+        return Ok(());
+    };
+    manifest_file.validate_private_single_link(0o600)?;
+    let manifest: StagedPublicationManifest = serde_json::from_slice(
+        &manifest_file.read_limited(VIDEO_STAGING_PUBLICATION_MANIFEST_LIMIT)?,
+    )
+    .context("failed to parse rolled-back staged publication manifest")?;
+    validate_staged_publication_manifest(
+        &staging.root,
+        staging.path(),
+        staging.identity,
+        &manifest,
+    )?;
+    let manifest_entry = staging.root.bind_entry(&manifest_path, false)?;
+    staging
+        .root
+        .remove_bound_file_if_identity(&manifest_entry, manifest_file.identity())
+        .context("failed to durably retire rolled-back staged publication manifest")?;
+    staging.validate_for_path_access()
 }
 
 fn finish_failed_staged_move(
@@ -12427,6 +12595,93 @@ mod tests {
                 line.contains("Rolled forward interrupted staged video publication")
             })
         );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn completed_move_rollback_retires_publication_before_overwrite_restore() {
+        let final_dir = temp_test_dir("staged-publication-completed-move-rollback");
+        let existing = final_dir.join("Episode.mkv");
+        fs::write(&existing, "original-video").expect("existing video should write");
+        write_bilibili_identity_nfo(&existing, "cid123");
+        let root = RootedFs::new(&final_dir).expect("output root should bind");
+        let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        let duplicate =
+            bind_test_overwrite_confirmation(&root, VideoDuplicateAction::Overwrite, &duplicate)
+                .expect("overwrite confirmation should bind");
+        let acquired =
+            acquire_and_validate_overwrite_target(&root, &duplicate, StagedPrimaryMediaKind::Video)
+                .expect("overwrite target should be acquired");
+        let staging =
+            create_video_staging_dir(&root).expect("production staging directory should create");
+        let staging_dir = staging.path().to_path_buf();
+        let staged_video = staging_dir.join("Episode.mkv");
+        fs::write(&staged_video, "replacement-video").expect("replacement should stage");
+        staging
+            .retain_for_manual_recovery(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)
+            .expect("completed download should be retained until publication finishes");
+        let mut plan = staged_move_plan(
+            &staging_dir,
+            &final_dir,
+            std::slice::from_ref(&staged_video),
+            Some(&existing),
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("overwrite move plan should build");
+        prepare_staged_publication(
+            &root,
+            &staging,
+            &mut plan,
+            StagedOverwriteCommit::ReplacePrimary {
+                acquired: &acquired,
+                primary_media_kind: StagedPrimaryMediaKind::Video,
+            },
+        )
+        .expect("overwrite publication manifest should persist");
+
+        let error =
+            execute_move_plan_with_hook(&root, plan, StagedPrimaryMediaKind::Video, &mut |_| {
+                bail!("injected failure after publication move")
+            })
+            .expect_err("injected publication failure should roll the move back");
+        assert!(!incomplete_move_rollback(&error));
+        let error = finish_failed_staged_move(error, Some(acquired), Some(&staging));
+        assert!(format!("{error:#}").contains("injected failure after publication move"));
+
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "original-video");
+        assert_eq!(
+            fs::read_to_string(&staged_video).unwrap(),
+            "replacement-video"
+        );
+        assert!(existing.with_extension("nfo").is_file());
+        assert!(overwrite_backup_dirs(&final_dir).is_empty());
+        assert!(
+            !staging_dir
+                .join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME)
+                .exists()
+        );
+        drop(staging);
+        drop(root);
+
+        let report = recover_pending_overwrite_transactions(&final_dir)
+            .expect("restart recovery should accept the completed rollback");
+
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "original-video");
+        assert_eq!(
+            fs::read_to_string(&staged_video).unwrap(),
+            "replacement-video"
+        );
+        assert!(overwrite_backup_dirs(&final_dir).is_empty());
+        assert!(report.iter().any(|message| {
+            message.contains("Retained completed staged video job for manual recovery")
+        }));
         let _ = fs::remove_dir_all(final_dir);
     }
 
@@ -16867,7 +17122,7 @@ mv video.original video.m4s || exit 46
 
         tracker.observe(
             CommandStream::Stdout,
-            b"Debug: --cookie SESSDATA=secret; bili_jct=csrf; ac_time_value=token",
+            b"Debug: --cookie SESSDATA=secret; bili_jct=csrf; ac_time_value=token\n",
         );
 
         let message = take_latest_progress(&mut rx).message;
@@ -16875,6 +17130,62 @@ mv video.original video.m4s || exit 46
         assert!(!message.contains("csrf"));
         assert!(!message.contains("token"));
         assert!(message.contains("--cookie <redacted Bilibili cookie>"));
+    }
+
+    #[test]
+    fn sanitizes_sensitive_progress_across_every_read_boundary() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "credentials={\"access_token\":\"TV_ACCESS\",\"refresh_token\":\"REFRESH_SECRET\"}\nsafe\n",
+                &["TV_ACCESS", "REFRESH_SECRET"],
+            ),
+            (
+                "--access-key\nCLI_ACCESS_SECRET\nsafe\n",
+                &["CLI_ACCESS_SECRET"],
+            ),
+            (
+                "--cookie\r\nSESSDATA=COOKIE_SECRET; bili_jct=CSRF_SECRET; unknown_cookie=UNKNOWN_SECRET\r\nsafe\r\n",
+                &["COOKIE_SECRET", "CSRF_SECRET", "UNKNOWN_SECRET"],
+            ),
+            (
+                "Authorization: Bearer AUTH_SECRET\nsafe\n",
+                &["AUTH_SECRET"],
+            ),
+            (
+                "proxy https://PROXY_USER:PROXY_SECRET@example.test:8443/path\nsafe\n",
+                &["PROXY_USER", "PROXY_SECRET"],
+            ),
+        ];
+
+        for (input, secrets) in cases {
+            for split in 0..=input.len() {
+                let mut sanitizer = CommandProgressSanitizer::default();
+                let mut output = sanitizer.push(&input.as_bytes()[..split]);
+                output.extend(sanitizer.push(&input.as_bytes()[split..]));
+                output.extend(sanitizer.finish());
+                let output = output.join("");
+
+                for secret in *secrets {
+                    assert!(
+                        !output.contains(secret),
+                        "secret leaked at split {split}: {secret} in {output:?}"
+                    );
+                }
+                assert!(output.contains("safe"));
+            }
+
+            let mut sanitizer = CommandProgressSanitizer::default();
+            let mut output = Vec::new();
+            for byte in input.as_bytes() {
+                output.extend(sanitizer.push(std::slice::from_ref(byte)));
+            }
+            output.extend(sanitizer.finish());
+            let output = output.join("");
+            for secret in *secrets {
+                assert!(!output.contains(secret));
+            }
+            assert!(output.contains("safe"));
+        }
     }
 
     #[test]
@@ -16979,18 +17290,18 @@ mv video.original video.m4s || exit 46
         let mut tracker =
             ProgressTracker::new("yt-dlp".to_string(), Duration::from_secs(30), Some(tx));
 
-        tracker.observe(CommandStream::Stdout, b"[download] 1.0%");
+        tracker.observe(CommandStream::Stdout, b"[download] 1.0%\n");
         let first = take_latest_progress(&mut rx).message;
         assert!(first.contains("yt-dlp: downloading media"));
         assert!(first.contains("Done: resolve"));
         assert!(first.contains("Todo: metadata, embed, move"));
         assert!(first.contains("Last output: yt-dlp: 1%"));
 
-        tracker.observe(CommandStream::Stdout, b"[download] 2.0%");
+        tracker.observe(CommandStream::Stdout, b"[download] 2.0%\n");
         assert_no_progress(&rx);
 
         tracker.next_send_at = Instant::now() - Duration::from_secs(1);
-        tracker.observe(CommandStream::Stdout, b"[download] 2.0%");
+        tracker.observe(CommandStream::Stdout, b"[download] 2.0%\n");
         let second = take_latest_progress(&mut rx).message;
         assert!(second.contains("Last output: yt-dlp: 2%"));
     }
@@ -17005,7 +17316,7 @@ mv video.original video.m4s || exit 46
         let (tx, mut rx) = job_progress_channel();
         let mut tracker = ProgressTracker::new(command_name, Duration::from_secs(30), Some(tx));
 
-        tracker.observe(CommandStream::Stdout, b"[download] 1.0%");
+        tracker.observe(CommandStream::Stdout, b"[download] 1.0%\n");
         let first = take_latest_progress(&mut rx).message;
         assert!(first.contains("yt-dlp metadata: resolving metadata"));
         assert!(first.contains("Done: -"));
