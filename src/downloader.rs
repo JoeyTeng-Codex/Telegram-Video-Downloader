@@ -3023,7 +3023,9 @@ fn write_bilibili_nfos(
                 unique_id: ids.primary_unique_id.as_str(),
                 alternate_unique_ids,
                 source_url,
-                studio: plan_entry.and_then(|entry| entry.uploader.as_deref()),
+                studio: plan_entry
+                    .and_then(|entry| entry.uploader.as_deref())
+                    .or(Some("Bilibili")),
                 premiered: plan_entry.and_then(|entry| entry.publish_date.as_deref()),
             },
         )?;
@@ -11963,6 +11965,132 @@ mod tests {
         assert!(nfo.contains("<studio>Example Uploader</studio>"));
         assert!(nfo.contains("<premiered>2026-05-05</premiered>"));
         assert!(nfo.contains("<year>2026</year>"));
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn writes_bilibili_season_nfo_with_service_studio_and_publication_date() {
+        let video_dir = temp_test_dir("bilibili-season-nfo-metadata");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        let video_path = video_dir.join("Episode One.mkv");
+        fs::write(&video_path, "video").expect("video file should write");
+        let mut plan = BilibiliDownloadPlan {
+            title: "Bangumi".to_string(),
+            entries: vec![BilibiliDownloadEntry {
+                index: 1,
+                aid: 123,
+                bvid: Some("BV123".to_string()),
+                cid: 456,
+                epid: Some(789),
+                title: "Episode One".to_string(),
+                uploader: None,
+                publish_date: None,
+            }],
+        };
+        let episode = bbdown_core::EpisodeMetadata {
+            index: 1,
+            aid: 123,
+            bvid: Some("BV123".to_string()),
+            cid: 456,
+            epid: 789,
+            title: "Episode One".to_string(),
+            long_title: None,
+            pub_time: Some(1_709_164_800),
+        };
+        plan.apply_resolved_metadata(&ResolvedContent::Season(bbdown_core::SeasonResolution {
+            season: bbdown_core::SeasonMetadata {
+                season_id: Some(10),
+                media_id: Some(20),
+                title: "Bangumi".to_string(),
+                description: String::new(),
+                cover_url: None,
+                main_episode_count: 1,
+                areas: Vec::new(),
+                tags: Vec::new(),
+                episodes: vec![episode.clone()],
+            },
+            selected_episodes: vec![episode],
+        }));
+        let report = BilibiliDownloadReport {
+            title: "Bangumi".to_string(),
+            output_dir: video_dir.clone(),
+            entries: vec![BilibiliEntryDownloadReport {
+                index: 1,
+                title: "Episode One".to_string(),
+                files: Vec::new(),
+                mux: Some(BilibiliMuxReport {
+                    output_path: PathBuf::from("Episode One.mkv"),
+                    bound_output: None,
+                    bound_inputs: Vec::new(),
+                    recovery: None,
+                }),
+            }],
+        };
+
+        write_bilibili_nfos(
+            &video_dir,
+            "https://www.bilibili.com/bangumi/play/ep789",
+            &plan,
+            &report,
+        )
+        .expect("season nfo should write");
+        let nfo =
+            fs::read_to_string(video_path.with_extension("nfo")).expect("season nfo should exist");
+
+        assert!(nfo.contains("<studio>Bilibili</studio>"));
+        assert!(nfo.contains("<premiered>2024-02-29</premiered>"));
+        assert!(nfo.contains("<year>2024</year>"));
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn writes_bilibili_service_studio_when_resolved_metadata_is_unavailable() {
+        let video_dir = temp_test_dir("bilibili-nfo-metadata-fallback");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        let video_path = video_dir.join("Example.mkv");
+        fs::write(&video_path, "video").expect("video file should write");
+        let plan = BilibiliDownloadPlan {
+            title: "Example".to_string(),
+            entries: vec![BilibiliDownloadEntry {
+                index: 1,
+                aid: 123,
+                bvid: Some("BV123".to_string()),
+                cid: 456,
+                epid: None,
+                title: "Example".to_string(),
+                uploader: None,
+                publish_date: None,
+            }],
+        };
+        let report = BilibiliDownloadReport {
+            title: "Example".to_string(),
+            output_dir: video_dir.clone(),
+            entries: vec![BilibiliEntryDownloadReport {
+                index: 1,
+                title: "Example".to_string(),
+                files: Vec::new(),
+                mux: Some(BilibiliMuxReport {
+                    output_path: PathBuf::from("Example.mkv"),
+                    bound_output: None,
+                    bound_inputs: Vec::new(),
+                    recovery: None,
+                }),
+            }],
+        };
+
+        write_bilibili_nfos(
+            &video_dir,
+            "https://www.bilibili.com/video/BV123",
+            &plan,
+            &report,
+        )
+        .expect("fallback nfo should write");
+        let nfo = fs::read_to_string(video_path.with_extension("nfo"))
+            .expect("fallback nfo should exist");
+
+        assert!(nfo.contains("<studio>Bilibili</studio>"));
+        assert!(!nfo.contains("<premiered>"));
+        assert!(!nfo.contains("<year>"));
         let _ = fs::remove_dir_all(video_dir);
     }
 
