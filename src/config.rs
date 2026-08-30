@@ -3,6 +3,8 @@ use std::{env, fs};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
@@ -437,11 +439,22 @@ fn auth_path_components_equal(
         return true;
     }
 
-    // Case-only separation is unsafe when the same config is used on a case-insensitive volume.
     match (first.as_os_str().to_str(), second.as_os_str().to_str()) {
-        (Some(first), Some(second)) => first.to_lowercase() == second.to_lowercase(),
+        (Some(first), Some(second)) => {
+            auth_path_component_comparison_key(first) == auth_path_component_comparison_key(second)
+        }
         _ => false,
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn auth_path_component_comparison_key(value: &str) -> String {
+    value.nfd().flat_map(char::to_lowercase).collect()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn auth_path_component_comparison_key(value: &str) -> String {
+    value.to_lowercase()
 }
 
 fn existing_paths_share_identity(first: &Path, second: &Path) -> Result<bool> {
@@ -999,6 +1012,23 @@ mod tests {
 
         let error = ensure_distinct_auth_paths(&state, &credential)
             .expect_err("case-only auth paths should fail validation");
+
+        assert!(error.to_string().contains("must refer to distinct files"));
+        assert!(!state.exists());
+        assert!(!credential.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rejects_unicode_normalization_equivalent_missing_auth_paths() {
+        let root = temp_test_dir("auth-unicode-normalization-alias");
+        fs::create_dir_all(&root).expect("auth root should create");
+        let state = root.join("caf\u{e9}.json");
+        let credential = root.join("cafe\u{301}.json");
+
+        let error = ensure_distinct_auth_paths(&state, &credential)
+            .expect_err("normalization-equivalent auth paths should fail validation");
 
         assert!(error.to_string().contains("must refer to distinct files"));
         assert!(!state.exists());

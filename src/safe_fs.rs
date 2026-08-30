@@ -175,6 +175,20 @@ impl BoundFile {
         self.validate_identity()
     }
 
+    pub(crate) fn set_mode(&self, mode: u16) -> Result<()> {
+        self.validate_identity()?;
+        rustix::fs::fchmod(self.fd.as_ref(), Mode::from_raw_mode(mode))
+            .map_err(errno_to_io)
+            .context("failed to set bound file permissions")?;
+        let stat = rustix::fs::fstat(self.fd.as_ref())
+            .map_err(errno_to_io)
+            .context("failed to revalidate bound file permissions")?;
+        if identity_from_stat(&stat) != self.identity || stat.st_mode & 0o777 != mode {
+            bail!("bound file identity or permissions changed");
+        }
+        Ok(())
+    }
+
     pub(crate) fn byte_len(&self) -> Result<u64> {
         self.validate_identity()?;
         let stat = rustix::fs::fstat(self.fd.as_ref())

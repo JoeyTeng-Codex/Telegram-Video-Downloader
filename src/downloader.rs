@@ -30,6 +30,7 @@ use tracing::info;
 use crate::bilibili_auth;
 use crate::bilibili_core;
 use crate::config::AppConfig;
+use crate::redaction::redact_sensitive_text;
 use crate::router::{BilibiliSelection, JobRequest};
 use crate::safe_fs::{
     BoundDirectory, BoundEntry, BoundFile, EntryIdentity, RootedFs, identity_for_open_file,
@@ -718,9 +719,10 @@ pub async fn find_video_duplicate_with_probe(
                 });
             }
             Err(err) => {
+                let error = redact_sensitive_text(&format!("{err:#}"));
                 info!(
                     url = %url,
-                    error = %err,
+                    error = %error,
                     "Bilibili plan probe skipped during duplicate check"
                 );
             }
@@ -1641,6 +1643,9 @@ impl ReservedMuxOutput {
     where
         F: FnMut(BilibiliMuxCommitCheckpoint) -> Result<()>,
     {
+        self.file
+            .set_mode(0o644)
+            .context("failed to set final Bilibili mux output permissions")?;
         self.file
             .sync_all()
             .context("failed to persist private Bilibili mux output")?;
@@ -3849,6 +3854,7 @@ pub fn bilibili_metadata_command_spec(config: &AppConfig, url: &str) -> Result<C
     let safe_config_lines = filter_bilibili_metadata_config_lines(&base_config_lines);
     let config_path = bilibili_auth::ensure_isolated_bbdown_config_file_with_lines(
         &config.bilibili.auth.state_path,
+        &config.bilibili.auth.credential_file,
         &safe_config_lines,
     )?;
     let mut args = vec![url.to_string(), "--only-show-info".to_string()];
@@ -4865,7 +4871,9 @@ fn warn_recovered_overwrite(recovery: &str) {
 
 fn send_progress(progress: Option<&JobProgressSender>, message: String) {
     if let Some(progress) = progress {
-        progress.send_replace(Some(JobProgress { message }));
+        progress.send_replace(Some(JobProgress {
+            message: redact_sensitive_text(&message),
+        }));
     }
 }
 
@@ -10889,128 +10897,7 @@ fn tail_lines(text: &str, max_lines: usize) -> String {
 }
 
 fn redact_sensitive_output(text: &str) -> String {
-    let mut redacted = redact_flag_line_values(text, "--cookie", "<redacted Bilibili cookie>");
-    redacted = redact_bilibili_cookie_lines(&redacted);
-    for name in BILIBILI_COOKIE_NAMES {
-        redacted = redact_cookie_pair_values(&redacted, name, "<redacted>");
-    }
-    redact_bilibili_qrcode_urls(&redacted)
-}
-
-const BILIBILI_COOKIE_NAMES: &[&str] = &[
-    "SESSDATA",
-    "bili_jct",
-    "DedeUserID",
-    "DedeUserID__ckMd5",
-    "sid",
-    "buvid3",
-    "buvid4",
-    "b_nut",
-    "ac_time_value",
-];
-
-fn redact_flag_line_values(text: &str, flag: &str, replacement: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(index) = rest.find(flag) {
-        let absolute_start = text.len() - rest.len() + index;
-        let before = text[..absolute_start].chars().next_back();
-        let after_index = index + flag.len();
-        let after = rest[after_index..].chars().next();
-        let is_token_start = before.is_none_or(char::is_whitespace);
-        let is_flag = after.is_some_and(|ch| ch == '=' || ch.is_whitespace());
-        if !is_token_start || !is_flag {
-            output.push_str(&rest[..after_index]);
-            rest = &rest[after_index..];
-            continue;
-        }
-
-        output.push_str(&rest[..index]);
-        output.push_str(flag);
-        let separator = after.expect("is_flag requires a separator");
-        if separator == '=' {
-            output.push('=');
-            output.push_str(replacement);
-            let value_start = after_index + 1;
-            let value_end = rest[value_start..]
-                .find(['\r', '\n'])
-                .map_or(rest.len(), |offset| value_start + offset);
-            rest = &rest[value_end..];
-        } else {
-            output.push_str(&rest[after_index..after_index + separator.len_utf8()]);
-            output.push_str(replacement);
-            let value_start = after_index + separator.len_utf8();
-            let value_end = rest[value_start..]
-                .find(['\r', '\n'])
-                .map_or(rest.len(), |offset| value_start + offset);
-            rest = &rest[value_end..];
-        }
-    }
-    output.push_str(rest);
-    output
-}
-
-fn redact_cookie_pair_values(text: &str, name: &str, replacement: &str) -> String {
-    let mut redacted = String::with_capacity(text.len());
-    let mut rest = text;
-    let prefix = format!("{name}=");
-    while let Some(index) = rest.find(&prefix) {
-        redacted.push_str(&rest[..index]);
-        redacted.push_str(&prefix);
-        redacted.push_str(replacement);
-        let value_start = index + prefix.len();
-        let value_end = rest[value_start..]
-            .find(|ch: char| {
-                ch == ';' || ch == '&' || ch.is_ascii_whitespace() || ch == '"' || ch == '\''
-            })
-            .map_or(rest.len(), |offset| value_start + offset);
-        rest = &rest[value_end..];
-    }
-    redacted.push_str(rest);
-    redacted
-}
-
-fn redact_bilibili_cookie_lines(text: &str) -> String {
-    text.lines()
-        .map(|line| {
-            if is_bilibili_cookie_line(line) {
-                "<redacted Bilibili cookie line>"
-            } else {
-                line
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn is_bilibili_cookie_line(line: &str) -> bool {
-    if !line.contains(';') {
-        return false;
-    }
-    let has_known_cookie = BILIBILI_COOKIE_NAMES
-        .iter()
-        .any(|name| line.contains(&format!("{name}=")));
-    if !has_known_cookie {
-        return false;
-    }
-    line.split(';')
-        .filter(|part| part.trim().contains('='))
-        .take(2)
-        .count()
-        >= 2
-}
-
-fn redact_bilibili_qrcode_urls(text: &str) -> String {
-    text.lines()
-        .map(|line| {
-            if line.contains("passport.bilibili.com") && line.contains("qrcode_key=") {
-                "<redacted Bilibili login QR URL>"
-            } else {
-                line
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    redact_sensitive_text(text)
 }
 
 fn nonempty_join(lines: Vec<String>) -> String {
@@ -15679,6 +15566,15 @@ mod tests {
             })
             .expect("mux output should commit");
         assert!(observed_anchor_before_publication);
+        assert_eq!(
+            fs::metadata(&output)
+                .expect("published mux output should exist")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        fs::remove_file(&output).expect("published mux output should unlink before recovery");
         drop(bound_output);
         drop(recovery);
         drop(bound_inputs);
@@ -15688,6 +15584,14 @@ mod tests {
             .expect("retained staging should finish nested mux cleanup");
 
         assert_eq!(fs::read_to_string(&output).unwrap(), "mux-output");
+        assert_eq!(
+            fs::metadata(&output)
+                .expect("recovered mux output should exist")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
         assert!(!raw.exists());
         assert!(!transaction.exists());
         assert!(staging_path.is_dir());
@@ -16899,6 +16803,23 @@ mv video.original video.m4s || exit 46
 
         assert_eq!(take_latest_progress(&mut rx).message, "event 999");
         assert_no_progress(&rx);
+    }
+
+    #[test]
+    fn progress_channel_redacts_worker_credentials() {
+        let (tx, mut rx) = job_progress_channel();
+
+        send_progress(
+            Some(&tx),
+            "preflight failed: access_key=APP_ACCESS credentials={\"access_token\":\"TV_ACCESS\",\"refresh_token\":\"REFRESH\"}"
+                .to_string(),
+        );
+
+        let message = take_latest_progress(&mut rx).message;
+        for secret in ["APP_ACCESS", "TV_ACCESS", "REFRESH"] {
+            assert!(!message.contains(secret));
+        }
+        assert!(message.contains("<redacted BBDown access-key callback message>"));
     }
 
     #[test]

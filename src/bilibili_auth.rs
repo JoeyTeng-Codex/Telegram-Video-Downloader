@@ -161,7 +161,7 @@ impl LockedAuthMutation<'_> {
     }
 
     pub fn delete_legacy_state(&self) -> Result<bool> {
-        delete_auth_state_unlocked(self.state_path)
+        delete_auth_state_unlocked(self.state_path, self.credential_file)
     }
 
     pub fn epoch(&self) -> u64 {
@@ -1230,32 +1230,24 @@ pub fn delete_auth_state(path: &Path, credential_file: &Path) -> Result<bool> {
     .map(|(removed, _)| removed)
 }
 
-fn delete_auth_state_unlocked(path: &Path) -> Result<bool> {
+fn delete_auth_state_unlocked(path: &Path, credential_file: &Path) -> Result<bool> {
     let config_path = bbdown_config_path(path);
     let legacy_config_path = legacy_bbdown_config_path(path);
     let mut removed = false;
-    match fs::remove_file(path) {
-        Ok(()) => removed = true,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!("failed to delete Bilibili auth state {}", path.display())
-            });
-        }
+    if remove_legacy_file_if_exists(path, credential_file)
+        .with_context(|| format!("failed to delete Bilibili auth state {}", path.display()))?
+    {
+        removed = true;
     }
 
     for path in [config_path, legacy_config_path] {
-        match fs::remove_file(&path) {
-            Ok(()) => removed = true,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("failed to delete BBDown auth config {}", path.display())
-                });
-            }
+        if remove_legacy_file_if_exists(&path, credential_file)
+            .with_context(|| format!("failed to delete BBDown auth config {}", path.display()))?
+        {
+            removed = true;
         }
     }
-    if cleanup_stale_bbdown_config_files_unlocked(path)? {
+    if cleanup_stale_bbdown_config_files_unlocked(path, credential_file)? {
         removed = true;
     }
 
@@ -1461,6 +1453,7 @@ fn bbdown_rust_profile_selection(
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn ensure_bbdown_config_file(
     path: &Path,
+    credential_file: &Path,
     base_config_path: Option<&Path>,
 ) -> Result<Option<PathBuf>> {
     let _guard = AUTH_FILE_LOCK
@@ -1473,7 +1466,7 @@ pub fn ensure_bbdown_config_file(
         return Ok(None);
     }
 
-    cleanup_stale_bbdown_config_files_unlocked(path)?;
+    cleanup_stale_bbdown_config_files_unlocked(path, credential_file)?;
     let config_path = temp_state_path(&bbdown_config_dir(path).join("cookie.config"));
     write_bbdown_config(&config_path, &state.cookie, base_config_path)?;
     active_bbdown_config_files()
@@ -1486,6 +1479,7 @@ pub fn ensure_bbdown_config_file(
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn ensure_isolated_bbdown_config_file_with_lines(
     path: &Path,
+    credential_file: &Path,
     base_lines: &[String],
 ) -> Result<PathBuf> {
     let _guard = AUTH_FILE_LOCK
@@ -1493,7 +1487,7 @@ pub fn ensure_isolated_bbdown_config_file_with_lines(
         .expect("auth file lock should not poison");
     let state = load_auth_state_unlocked(path)?;
 
-    cleanup_stale_bbdown_config_files_unlocked(path)?;
+    cleanup_stale_bbdown_config_files_unlocked(path, credential_file)?;
     let config_path = temp_state_path(&bbdown_config_dir(path).join("probe.config"));
     let mut content = Vec::new();
     for line in base_lines {
@@ -1611,7 +1605,7 @@ fn remove_file_if_exists(path: &Path) -> Result<bool> {
     }
 }
 
-fn cleanup_stale_bbdown_config_files_unlocked(path: &Path) -> Result<bool> {
+fn cleanup_stale_bbdown_config_files_unlocked(path: &Path, credential_file: &Path) -> Result<bool> {
     let config_dir = bbdown_config_dir(path);
     let entries = match fs::read_dir(&config_dir) {
         Ok(entries) => entries,
@@ -1637,6 +1631,7 @@ fn cleanup_stale_bbdown_config_files_unlocked(path: &Path) -> Result<bool> {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => return Err(err.into()),
         }
+        ensure_cleanup_target_is_not_credential(&path, credential_file)?;
         match fs::remove_file(&path) {
             Ok(()) => removed = true,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -1650,8 +1645,67 @@ fn cleanup_stale_bbdown_config_files_unlocked(path: &Path) -> Result<bool> {
             }
         }
     }
+    ensure_cleanup_target_is_not_credential(&config_dir, credential_file)?;
     let _ = fs::remove_dir(&config_dir);
     Ok(removed)
+}
+
+fn remove_legacy_file_if_exists(path: &Path, credential_file: &Path) -> Result<bool> {
+    ensure_cleanup_target_is_not_credential(path, credential_file)?;
+    remove_file_if_exists(path)
+}
+
+fn ensure_cleanup_target_is_not_credential(path: &Path, credential_file: &Path) -> Result<()> {
+    let target = metadata_if_present_for_cleanup(path)?;
+    let credential = metadata_if_present_for_cleanup(credential_file)?;
+    let (Some(target), Some(credential)) = (target, credential) else {
+        return Ok(());
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if target.dev() == credential.dev() && target.ino() == credential.ino() {
+            bail!(
+                "legacy Bilibili auth cleanup target aliases the active credential file: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(not(unix))]
+    if fs::canonicalize(path).with_context(|| {
+        format!(
+            "failed to resolve legacy auth cleanup target {}",
+            path.display()
+        )
+    })? == fs::canonicalize(credential_file).with_context(|| {
+        format!(
+            "failed to resolve active BBDown credential file {}",
+            credential_file.display()
+        )
+    })? {
+        bail!(
+            "legacy Bilibili auth cleanup target aliases the active credential file: {}",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn metadata_if_present_for_cleanup(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed to inspect Bilibili auth cleanup path {}",
+                path.display()
+            )
+        }),
+    }
 }
 
 fn active_bbdown_config_files() -> &'static Mutex<HashSet<PathBuf>> {
@@ -1904,6 +1958,99 @@ mod tests {
         assert_eq!(state.cookie, "SESSDATA=secret");
         assert_eq!(state.mid, 123);
         assert_eq!(state.uname, "Joey");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logout_refuses_to_unlink_a_hard_link_to_the_active_credential_file() {
+        let state_path = temp_state_file("logout-credential-hard-link");
+        let credential_file = state_path.with_file_name("credentials.json");
+        fs::create_dir_all(state_path.parent().expect("state should have a parent"))
+            .expect("auth directory should create");
+        fs::write(&credential_file, b"active-credentials").expect("credential file should write");
+        fs::hard_link(&credential_file, &state_path).expect("state hard link should create");
+
+        let error = delete_auth_state(&state_path, &credential_file)
+            .expect_err("logout must preserve the active credential object");
+
+        assert!(format!("{error:#}").contains("aliases the active credential file"));
+        assert_eq!(fs::read(&credential_file).unwrap(), b"active-credentials");
+        assert_eq!(fs::read(&state_path).unwrap(), b"active-credentials");
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logout_refuses_to_unlink_a_stale_config_hard_link_to_credentials() {
+        let state_path = temp_state_file("logout-stale-config-hard-link");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let stale_config = bbdown_config_dir(&state_path).join("stale.config.tmp");
+        save_auth_state(&state_path, &test_state()).expect("state should save");
+        fs::write(&credential_file, b"active-credentials").expect("credential file should write");
+        fs::create_dir_all(stale_config.parent().expect("config should have a parent"))
+            .expect("config directory should create");
+        fs::hard_link(&credential_file, &stale_config)
+            .expect("stale config hard link should create");
+
+        let error = delete_auth_state(&state_path, &credential_file)
+            .expect_err("stale cleanup must preserve the active credential object");
+
+        assert!(format!("{error:#}").contains("aliases the active credential file"));
+        assert_eq!(fs::read(&credential_file).unwrap(), b"active-credentials");
+        assert_eq!(fs::read(&stale_config).unwrap(), b"active-credentials");
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_config_cleanup_refuses_a_stale_hard_link_to_credentials() {
+        let state_path = temp_state_file("isolated-config-stale-hard-link");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let stale_config = bbdown_config_dir(&state_path).join("stale.config.tmp");
+        fs::create_dir_all(stale_config.parent().expect("config should have a parent"))
+            .expect("config directory should create");
+        fs::write(&credential_file, b"active-credentials").expect("credential file should write");
+        fs::hard_link(&credential_file, &stale_config)
+            .expect("stale config hard link should create");
+
+        let error =
+            ensure_isolated_bbdown_config_file_with_lines(&state_path, &credential_file, &[])
+                .expect_err("config cleanup must preserve the active credential object");
+
+        assert!(format!("{error:#}").contains("aliases the active credential file"));
+        assert_eq!(fs::read(&credential_file).unwrap(), b"active-credentials");
+        assert_eq!(fs::read(&stale_config).unwrap(), b"active-credentials");
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn logout_refuses_unicode_normalization_alias_of_credentials() {
+        let root = temp_state_file("logout-unicode-normalization")
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        fs::create_dir_all(&root).expect("auth directory should create");
+        let state_path = root.join("caf\u{e9}.json");
+        let credential_file = root.join("cafe\u{301}.json");
+        fs::write(&credential_file, b"active-credentials").expect("credential file should write");
+        assert!(
+            state_path.exists(),
+            "test filesystem must normalize Unicode names"
+        );
+
+        let error = delete_auth_state(&state_path, &credential_file)
+            .expect_err("logout must preserve a normalization-aliased credential object");
+
+        assert!(format!("{error:#}").contains("aliases the active credential file"));
+        assert_eq!(fs::read(&credential_file).unwrap(), b"active-credentials");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2316,7 +2463,8 @@ mod tests {
         let path = temp_state_file("bbdown-config");
         save_auth_state(&path, &test_state()).expect("state should save");
 
-        let config_path = ensure_bbdown_config_file(&path, None)
+        let credential_file = path.with_file_name("credentials.json");
+        let config_path = ensure_bbdown_config_file(&path, &credential_file, None)
             .expect("BBDown config should save")
             .expect("BBDown config should be present");
         assert!(
@@ -2329,7 +2477,6 @@ mod tests {
         fs::write(&legacy_config_path, "--cookie legacy\n").expect("legacy config should write");
         let content = fs::read_to_string(&config_path).expect("BBDown config should be readable");
         assert_eq!(content, "--cookie\nSESSDATA=secret; bili_jct=csrf\n");
-        let credential_file = path.with_file_name("credentials.json");
         assert!(delete_auth_state(&path, &credential_file).expect("auth delete should succeed"));
         assert!(!path.exists());
         assert!(config_path.exists());
@@ -2359,9 +2506,11 @@ mod tests {
         .expect("base config parent should be created");
         fs::write(&base_config_path, "--dfn-priority\n1080P\n").expect("base config should write");
 
-        let config_path = ensure_bbdown_config_file(&path, Some(&base_config_path))
-            .expect("BBDown config should save")
-            .expect("BBDown config should be present");
+        let credential_file = path.with_file_name("credentials.json");
+        let config_path =
+            ensure_bbdown_config_file(&path, &credential_file, Some(&base_config_path))
+                .expect("BBDown config should save")
+                .expect("BBDown config should be present");
         let content = fs::read_to_string(&config_path).expect("BBDown config should be readable");
 
         assert_eq!(

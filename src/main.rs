@@ -2,6 +2,7 @@ mod bilibili_auth;
 mod bilibili_core;
 mod config;
 mod downloader;
+mod redaction;
 mod router;
 mod safe_fs;
 mod telegram;
@@ -30,6 +31,7 @@ use crate::downloader::{
     find_video_duplicate_with_probe, job_progress_channel, recover_pending_overwrite_transactions,
     run_bilibili_worker, run_job, run_job_with_duplicate_action, run_video_job_staged_keep_both,
 };
+use crate::redaction::redact_sensitive_text;
 use crate::router::{
     BilibiliAuthCommand, BilibiliAuthLoginMode, BilibiliSelection, JobRequest, RouteResult,
     route_message,
@@ -299,11 +301,15 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
                             report.saved_location
                         );
                         if !report.details.is_empty() {
-                            println!("{}", report.details);
+                            println!("{}", redact_sensitive_text(&report.details));
                         }
                     }
                     Err(err) => {
-                        println!("Failed replay job #{job_id}: {}\n{err}", job.label());
+                        println!(
+                            "Failed replay job #{job_id}: {}\n{}",
+                            job.label(),
+                            redact_sensitive_text(&format!("{err:#}"))
+                        );
                         failed_jobs.push(format!("#{job_id} {}", job.label()));
                     }
                 }
@@ -1056,7 +1062,7 @@ async fn send_bbdown_auth_ticket(
     };
     if matches!(mode, BilibiliAuthLoginMode::AccessKey) {
         let link_delivered = match telegram
-            .send_message(chat_id, format!("Authorization link:\n{url}"))
+            .send_auth_secret_message(chat_id, format!("Authorization link:\n{url}"))
             .await
         {
             Ok(_) => true,
@@ -2353,7 +2359,7 @@ async fn run_queued_job(
             )
         }
         Err(err) => {
-            let error_chain = format!("{err:#}");
+            let error_chain = redact_sensitive_text(&format!("{err:#}"));
             error!(job_id, error = %error_chain, "job failed");
             failed_job_message(job_id, job.label(), &error_chain)
         }
@@ -2369,7 +2375,7 @@ async fn run_queued_job(
 fn failed_job_message(job_id: u64, job_label: &str, error_chain: &str) -> String {
     format!(
         "Failed job #{job_id}: {job_label}\n{}",
-        truncate(error_chain)
+        truncate(&redact_sensitive_text(error_chain))
     )
 }
 
@@ -2565,33 +2571,7 @@ fn summarize_bbdown_auth_error(error: &anyhow::Error) -> String {
 }
 
 fn redact_bbdown_auth_secrets(text: &str) -> String {
-    text.lines()
-        .map(|line| {
-            if line.contains("passport.bilibili.com") && line.contains("qrcode_key=") {
-                "<redacted Bilibili login QR URL>"
-            } else if line.contains("biliplus.com/login") && line.contains("balh_auth=") {
-                "<redacted BBDown access-key authorization URL>"
-            } else if line.contains("balh-login-credentials:")
-                || contains_bbdown_access_key_json_secret(line)
-            {
-                "<redacted BBDown access-key callback message>"
-            } else if line.contains("access_token=")
-                || line.contains("access_key=")
-                || line.contains("refresh_token=")
-            {
-                "<redacted BBDown access-key callback URL>"
-            } else {
-                line
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn contains_bbdown_access_key_json_secret(line: &str) -> bool {
-    line.contains("\"access_key\"")
-        || line.contains("\"access_token\"")
-        || line.contains("\"refresh_token\"")
+    redact_sensitive_text(text)
 }
 
 #[cfg(test)]
@@ -3065,6 +3045,20 @@ mod tests {
         assert!(message.contains("failed to move staged files"));
         assert!(message.contains("retained backup"));
         assert!(message.contains("/tmp/library/.transaction/Episode.mkv"));
+    }
+
+    #[test]
+    fn failed_job_message_redacts_worker_credentials() {
+        let message = failed_job_message(
+            10,
+            "Bilibili download",
+            "worker preflight failed: access_key=APP_ACCESS credentials={\"access_token\":\"TV_ACCESS\",\"refresh_token\":\"REFRESH\"}",
+        );
+
+        for secret in ["APP_ACCESS", "TV_ACCESS", "REFRESH"] {
+            assert!(!message.contains(secret));
+        }
+        assert!(message.contains("<redacted BBDown access-key callback message>"));
     }
 
     #[test]
