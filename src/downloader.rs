@@ -58,7 +58,6 @@ const VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON: &str =
 const BILIBILI_WORKER_REQUEST_FILE_NAME: &str = ".bilibili-worker.json";
 const BILIBILI_WORKER_REQUEST_VERSION: u32 = 2;
 const BILIBILI_WORKER_REQUEST_LIMIT: usize = 1024 * 1024;
-const BILIBILI_STAGING_CONFIG_LIMIT: usize = 1024 * 1024;
 const VIDEO_OUTPUT_LOCK_FILE_NAME: &str = ".telegram-video-downloader.lock";
 const VIDEO_CONTROL_DIR_NAME: &str = ".telegram-video-downloader-control";
 const VIDEO_CONTROL_INITIALIZING_DIR_PREFIX: &str =
@@ -967,19 +966,7 @@ async fn run_staged_bilibili_worker(
     if contents.len() > BILIBILI_WORKER_REQUEST_LIMIT {
         bail!("Bilibili worker request exceeds its size limit");
     }
-    let request_path = staging.path().join(BILIBILI_WORKER_REQUEST_FILE_NAME);
-    let (_, request_identity) = staging
-        .root
-        .create_new_bound_file(&request_path, &contents, 0o600)
-        .context("failed to persist Bilibili worker request")?;
-    let request_file = staging
-        .root
-        .open_bound_file(&request_path)?
-        .context("Bilibili worker request disappeared")?;
-    if request_file.identity() != request_identity {
-        bail!("Bilibili worker request identity changed after creation");
-    }
-    request_file.validate_private_single_link(0o600)?;
+    let request_file = create_unlinked_bilibili_worker_request(staging, &contents)?;
     let executable = std::env::current_exe().context("failed to resolve downloader executable")?;
     let spec = CommandSpec {
         program: executable,
@@ -1020,6 +1007,40 @@ async fn run_staged_bilibili_worker(
     }
     let report = last_nonempty_line(&stdout).context("Bilibili worker returned no report")?;
     serde_json::from_str(report).context("failed to parse Bilibili worker report")
+}
+
+fn create_unlinked_bilibili_worker_request(
+    staging: &BoundStagingDir,
+    contents: &[u8],
+) -> Result<BoundFile> {
+    staging.validate_for_path_access()?;
+    let request_path = staging.path().join(BILIBILI_WORKER_REQUEST_FILE_NAME);
+    let (_, request_identity) = staging
+        .root
+        .create_new_bound_file(&request_path, contents, 0o600)
+        .context("failed to create Bilibili worker request")?;
+    let request_file = staging
+        .root
+        .open_bound_file(&request_path)?
+        .context("Bilibili worker request disappeared")?;
+    if request_file.identity() != request_identity {
+        bail!("Bilibili worker request identity changed after creation");
+    }
+    request_file.validate_private_single_link(0o600)?;
+    let request_entry = staging.root.bind_entry(&request_path, false)?;
+    if staging.root.bound_entry_identity(&request_entry)? != Some(request_identity) {
+        bail!("Bilibili worker request identity changed before unlink");
+    }
+    staging
+        .root
+        .remove_bound_file_if_identity(&request_entry, request_identity)
+        .context("failed to unlink Bilibili worker request before launch")?;
+    request_file.validate_private_unlinked(0o600)?;
+    if staging.root.entry_identity(&request_path)?.is_some() {
+        bail!("Bilibili worker request path remained after unlink");
+    }
+    staging.validate_for_path_access()?;
+    Ok(request_file)
 }
 
 fn build_bilibili_worker_request(
@@ -3583,8 +3604,6 @@ async fn run_staged_video_job(
     let root = guard.root().clone();
     let staging = create_video_staging_dir(&root)?;
     let staging_dir = staging.path().to_path_buf();
-    staging.validate_for_path_access()?;
-    copy_bbdown_config_for_staging(&root, &final_dir, &staging_dir)?;
     staging.validate_for_path_access()?;
     send_progress(
         progress.as_ref(),
@@ -7036,36 +7055,36 @@ fn create_video_staging_dir(root: &RootedFs) -> Result<BoundStagingDir> {
     )
 }
 
-fn copy_bbdown_config_for_staging(
-    root: &RootedFs,
-    final_dir: &Path,
-    staging_dir: &Path,
-) -> Result<()> {
-    let source = final_dir.join("BBDown.config");
-    let Some(source_file) = root.open_bound_file(&source)? else {
-        return Ok(());
-    };
-    let contents = source_file
-        .read_limited(BILIBILI_STAGING_CONFIG_LIMIT)
-        .with_context(|| format!("failed to read {}", source.display()))?;
-    let destination = staging_dir.join("BBDown.config");
-    root.create_new_bound_file(&destination, &contents, 0o600)
-        .with_context(|| {
-            format!(
-                "failed to copy {} to {}",
-                source.display(),
-                destination.display()
-            )
-        })?;
-    Ok(())
-}
-
 fn is_staging_support_file(staging_dir: &Path, path: &Path) -> bool {
     path == staging_dir.join("BBDown.config")
         || path == staging_dir.join(VIDEO_STAGING_OWNER_FILE_NAME)
         || path == staging_dir.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME)
         || path == staging_dir.join(VIDEO_STAGING_RETENTION_FILE_NAME)
         || path == staging_dir.join(BILIBILI_WORKER_REQUEST_FILE_NAME)
+}
+
+fn remove_sensitive_staging_support_files(root: &RootedFs, staging_dir: &Path) -> Result<()> {
+    for name in ["BBDown.config", BILIBILI_WORKER_REQUEST_FILE_NAME] {
+        let path = staging_dir.join(name);
+        let Some(file) = root.open_bound_file(&path)? else {
+            continue;
+        };
+        let entry = root.bind_entry(&path, false)?;
+        if root.bound_entry_identity(&entry)? != Some(file.identity()) {
+            bail!(
+                "sensitive staging support file identity changed: {}",
+                path.display()
+            );
+        }
+        root.remove_bound_file_if_identity(&entry, file.identity())
+            .with_context(|| {
+                format!(
+                    "failed to remove sensitive staging support file {}",
+                    path.display()
+                )
+            })?;
+    }
+    Ok(())
 }
 
 fn validate_video_staging_directory(
@@ -7329,6 +7348,7 @@ where
 {
     let mut overwrite = None;
     let result = (|| -> Result<Vec<String>> {
+        remove_sensitive_staging_support_files(root, path)?;
         let manifest_path = path.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME);
         let Some(manifest_file) = root.open_bound_file(&manifest_path)? else {
             if let Some(reason) = retained_video_staging_reason(root, path, identity)? {
@@ -15770,10 +15790,16 @@ mod tests {
     }
 
     #[test]
-    fn bilibili_worker_request_redacts_telegram_configuration() {
+    fn bilibili_worker_request_uses_an_unlinked_descriptor() {
         let mut config = test_config();
         config.telegram.token = "telegram-secret-token".to_string();
         config.telegram.allowed_chat_ids = vec![42];
+        config.bilibili.extra_args = vec![
+            "--cookie".to_string(),
+            "SESSDATA=worker-cookie-secret".to_string(),
+        ];
+        config.bilibili.restricted_area_proxies =
+            vec!["https://proxy-user:proxy-password@example.test".to_string()];
         let expected_identity = VideoIdentity {
             provider: VideoProvider::Bilibili,
             id: "cid123".to_string(),
@@ -15791,9 +15817,11 @@ mod tests {
             Some(&expected_identity),
             &staging,
         );
-        let encoded = serde_json::to_string(&request).expect("worker request should encode");
+        let encoded = serde_json::to_vec(&request).expect("worker request should encode");
 
-        assert!(!encoded.contains("telegram-secret-token"));
+        assert!(!String::from_utf8_lossy(&encoded).contains("telegram-secret-token"));
+        assert!(String::from_utf8_lossy(&encoded).contains("worker-cookie-secret"));
+        assert!(String::from_utf8_lossy(&encoded).contains("proxy-password"));
         assert_eq!(request.config.telegram.token, "redacted-worker-token");
         assert!(request.config.telegram.allowed_chat_ids.is_empty());
         assert!(request.config.telegram.allow_all_chats);
@@ -15804,6 +15832,20 @@ mod tests {
         assert_eq!(request.output_root_inode, root.root_identity().inode());
         assert_eq!(request.staging_device, staging.identity.device());
         assert_eq!(request.staging_inode, staging.identity.inode());
+        let request_file = create_unlinked_bilibili_worker_request(&staging, &encoded)
+            .expect("worker request descriptor should create");
+        assert_eq!(
+            request_file
+                .read_limited(BILIBILI_WORKER_REQUEST_LIMIT)
+                .expect("unlinked request should remain readable"),
+            encoded
+        );
+        assert!(
+            !staging
+                .path()
+                .join(BILIBILI_WORKER_REQUEST_FILE_NAME)
+                .exists()
+        );
         let worker_root =
             RootedFs::new(staging.path()).expect("worker should bind the staging directory");
         persist_bilibili_worker_completion(&worker_root, &request)
@@ -15814,7 +15856,49 @@ mod tests {
                 .as_deref(),
             Some(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)
         );
+        let retained_contents = fs::read_dir(staging.path())
+            .expect("retained staging should read")
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| fs::read(entry.path()).ok())
+            .flatten()
+            .collect::<Vec<_>>();
+        let retained_contents = String::from_utf8_lossy(&retained_contents);
+        assert!(!retained_contents.contains("worker-cookie-secret"));
+        assert!(!retained_contents.contains("proxy-password"));
+        drop(request_file);
         drop(staging);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn startup_recovery_removes_legacy_sensitive_staging_support_files() {
+        let video_dir = temp_test_dir("legacy-sensitive-staging-support");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+        let staging =
+            create_video_staging_dir(&root).expect("worker staging directory should create");
+        let request_path = staging.path().join(BILIBILI_WORKER_REQUEST_FILE_NAME);
+        let config_path = staging.path().join("BBDown.config");
+        let media_path = staging.path().join("Episode.mkv");
+        fs::write(&request_path, r#"{"extra_args":["worker-cookie-secret"]}"#)
+            .expect("legacy request should write");
+        fs::write(&config_path, "--cookie\nSESSDATA=legacy-cookie-secret\n")
+            .expect("legacy config should write");
+        fs::write(&media_path, "completed-media").expect("completed media should write");
+        staging
+            .retain_for_manual_recovery(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)
+            .expect("completed download marker should persist");
+        drop(staging);
+
+        let report = recover_pending_video_staging_directories_locked(&root)
+            .expect("legacy sensitive support cleanup should succeed");
+
+        assert!(!report.unresolved);
+        assert!(!request_path.exists());
+        assert!(!config_path.exists());
+        assert_eq!(fs::read_to_string(&media_path).unwrap(), "completed-media");
+        assert!(report.messages.iter().any(|message| {
+            message.contains("Retained completed staged video job for manual recovery")
+        }));
         let _ = fs::remove_dir_all(video_dir);
     }
 
@@ -17540,6 +17624,19 @@ mv video.original video.m4s || exit 46
             .expect("inherited request should open")
             .expect("inherited request should exist");
         assert_eq!(request_file.identity(), request_identity);
+        request_file
+            .validate_private_single_link(0o600)
+            .expect("linked request should be private");
+        let request_entry = rooted
+            .bind_entry(&request_path, false)
+            .expect("request path should bind");
+        rooted
+            .remove_bound_file_if_identity(&request_entry, request_identity)
+            .expect("request path should unlink before command launch");
+        request_file
+            .validate_private_unlinked(0o600)
+            .expect("unlinked request descriptor should remain private");
+        assert!(!request_path.exists());
         let mut config = test_config();
         config.bot.command_timeout_seconds = 5;
         config.bot.command_idle_timeout_seconds = 5;

@@ -11,7 +11,8 @@ const BILIBILI_COOKIE_NAMES: &[&str] = &[
 ];
 
 pub(crate) fn redact_sensitive_text(text: &str) -> String {
-    let mut redacted = redact_flag_line_values(text, "--cookie", "<redacted Bilibili cookie>");
+    let mut redacted = redact_url_userinfo(text);
+    redacted = redact_flag_line_values(&redacted, "--cookie", "<redacted Bilibili cookie>");
     for flag in ["--access-key", "--access-token", "--refresh-token"] {
         redacted = redact_flag_line_values(&redacted, flag, "<redacted BBDown credential>");
     }
@@ -20,6 +21,33 @@ pub(crate) fn redact_sensitive_text(text: &str) -> String {
         redacted = redact_pair_values(&redacted, name, "<redacted>");
     }
     redact_sensitive_lines(&redacted)
+}
+
+fn redact_url_userinfo(text: &str) -> String {
+    let mut redacted = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(scheme_end) = rest.find("://") {
+        let authority_start = scheme_end + 3;
+        let authority_end = rest[authority_start..]
+            .find(|ch: char| {
+                ch.is_ascii_whitespace()
+                    || matches!(ch, '/' | '?' | '#' | '"' | '\'' | '>' | ')' | ']' | '}')
+            })
+            .map_or(rest.len(), |offset| authority_start + offset);
+        let authority = &rest[authority_start..authority_end];
+        let Some(userinfo_end) = authority.rfind('@').filter(|index| *index > 0) else {
+            redacted.push_str(&rest[..authority_end]);
+            rest = &rest[authority_end..];
+            continue;
+        };
+
+        redacted.push_str(&rest[..authority_start]);
+        redacted.push_str("<redacted>@");
+        redacted.push_str(&authority[userinfo_end + 1..]);
+        rest = &rest[authority_end..];
+    }
+    redacted.push_str(rest);
+    redacted
 }
 
 fn redact_sensitive_lines(text: &str) -> String {
@@ -194,6 +222,18 @@ mod tests {
         assert!(!redacted.contains("csrf"));
         assert!(!redacted.contains("value"));
         assert!(redacted.contains("<redacted Bilibili cookie>"));
+        assert!(redacted.contains("safe"));
+    }
+
+    #[test]
+    fn redacts_proxy_url_userinfo() {
+        let redacted = redact_sensitive_text(
+            "proxy https://proxy-user:proxy-password@example.test:8443/path safe",
+        );
+
+        assert!(!redacted.contains("proxy-user"));
+        assert!(!redacted.contains("proxy-password"));
+        assert!(redacted.contains("https://<redacted>@example.test:8443/path"));
         assert!(redacted.contains("safe"));
     }
 }

@@ -167,6 +167,21 @@ impl BoundFile {
         Ok(())
     }
 
+    pub(crate) fn validate_private_unlinked(&self, mode: u16) -> Result<()> {
+        self.validate_identity()?;
+        let stat = rustix::fs::fstat(self.fd.as_ref())
+            .map_err(errno_to_io)
+            .context("failed to inspect private unlinked bound file")?;
+        if identity_from_stat(&stat) != self.identity
+            || stat.st_mode & 0o777 != mode
+            || stat.st_uid != unsafe { libc::geteuid() }
+            || stat.st_nlink != 0
+        {
+            bail!("private unlinked bound file ownership, permissions, or link count changed");
+        }
+        Ok(())
+    }
+
     pub(crate) fn sync_all(&self) -> Result<()> {
         self.validate_identity()?;
         rustix::fs::fsync(self.fd.as_ref())
