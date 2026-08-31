@@ -45,6 +45,7 @@ enabled = true
 # Legacy bot-managed Web cookie state; BBDown-rust credentials live in credential_file.
 state_path = "~/.local/state/telegram-video-downloader/bilibili-auth.json"
 credential_file = "~/.local/state/telegram-video-downloader/bbdown-credentials.json"
+# The direct parent of credential_file must not be a symbolic link.
 # credential_profile = "default"
 login_timeout_seconds = 180
 poll_interval_seconds = 2

@@ -27,11 +27,19 @@ pub struct CredentialRuntime {
 
 impl CredentialRuntime {
     pub fn from_config(config: &AppConfig) -> Result<Self> {
+        Self::from_credential_file(
+            config.bilibili.auth.credential_file.clone(),
+            config.bilibili.auth.credential_profile.as_deref(),
+        )
+    }
+
+    pub fn from_credential_file(
+        credential_file: PathBuf,
+        credential_profile: Option<&str>,
+    ) -> Result<Self> {
         Ok(Self {
-            store: CredentialStore::new(config.bilibili.auth.credential_file.clone()),
-            selection: credential_profile_selection(
-                config.bilibili.auth.credential_profile.as_deref(),
-            )?,
+            store: CredentialStore::new(credential_file),
+            selection: credential_profile_selection(credential_profile)?,
         })
     }
 

@@ -137,9 +137,10 @@ struct AuthMutationFileLock {
     path: PathBuf,
     anchor_path: PathBuf,
     owner_path: PathBuf,
+    credential_file: AuthCredentialFilePath,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct AuthMutationLockOwner {
     version: u32,
@@ -148,12 +149,47 @@ struct AuthMutationLockOwner {
 }
 
 #[derive(Debug)]
+struct AuthCredentialFilePath {
+    path: PathBuf,
+}
+
+impl AuthCredentialFilePath {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthEpoch {
+    value: u64,
+    lock_owner: AuthMutationLockOwner,
+}
+
+impl AuthEpoch {
+    pub fn value(self) -> u64 {
+        self.value
+    }
+
+    #[cfg(test)]
+    pub fn for_test(value: u64) -> Self {
+        Self {
+            value,
+            lock_owner: AuthMutationLockOwner {
+                version: AUTH_MUTATION_LOCK_OWNER_VERSION,
+                device: 0,
+                inode: 0,
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct AuthReplyFileLock {
     lock: AuthMutationFileLock,
 }
 
 impl AuthReplyFileLock {
-    pub fn current_epoch(&self) -> Result<u64> {
+    pub fn current_epoch(&self) -> Result<AuthEpoch> {
         self.lock.current_epoch()
     }
 }
@@ -162,7 +198,7 @@ pub struct LockedAuthMutation<'a> {
     state_path: &'a Path,
     credential_file: &'a Path,
     _lock: &'a AuthMutationFileLock,
-    epoch: u64,
+    epoch: AuthEpoch,
 }
 
 pub type AuthCleanupResult = (Result<bool>, Result<()>);
@@ -180,8 +216,12 @@ impl LockedAuthMutation<'_> {
         delete_auth_state_unlocked(self.state_path, self.credential_file)
     }
 
-    pub fn epoch(&self) -> u64 {
+    pub fn epoch(&self) -> AuthEpoch {
         self.epoch
+    }
+
+    pub fn credential_file(&self) -> &Path {
+        self.credential_file
     }
 }
 
@@ -568,24 +608,25 @@ fn encode_cookie_value_for_bbdown(value: &str) -> String {
 }
 
 impl AuthMutationFileLock {
-    fn current_epoch(&self) -> Result<u64> {
+    fn current_epoch(&self) -> Result<AuthEpoch> {
         validate_auth_mutation_lock_binding(
             &self.file,
             &self.path,
             &self.anchor_path,
             &self.owner_path,
         )?;
-        let epoch = read_auth_epoch(&self.file, &self.path)?;
+        let value = read_auth_epoch(&self.file, &self.path)?;
+        let lock_owner = auth_mutation_lock_owner_for_file(&self.file)?;
         validate_auth_mutation_lock_binding(
             &self.file,
             &self.path,
             &self.anchor_path,
             &self.owner_path,
         )?;
-        Ok(epoch)
+        Ok(AuthEpoch { value, lock_owner })
     }
 
-    fn bump_epoch(&self) -> Result<u64> {
+    fn bump_epoch(&self) -> Result<AuthEpoch> {
         validate_auth_mutation_lock_binding(
             &self.file,
             &self.path,
@@ -608,7 +649,14 @@ impl AuthMutationFileLock {
         if persisted != next {
             bail!("BBDown auth epoch changed while persisting it")
         }
-        Ok(next)
+        Ok(AuthEpoch {
+            value: next,
+            lock_owner: auth_mutation_lock_owner_for_file(&self.file)?,
+        })
+    }
+
+    fn credential_file(&self) -> &Path {
+        self.credential_file.path()
     }
 }
 
@@ -1040,7 +1088,7 @@ pub fn recover_interrupted_auth_cleanup(
     credential_file: &Path,
 ) -> Result<Vec<String>> {
     with_auth_mutation_lock(credential_file, &[state_path, credential_file], |lock| {
-        reconcile_interrupted_auth_cleanup_and_bump_epoch(lock, state_path, credential_file)
+        reconcile_interrupted_auth_cleanup_and_bump_epoch(lock, state_path, lock.credential_file())
     })
 }
 
@@ -1148,9 +1196,21 @@ fn acquire_auth_mutation_file_lock(
     credential_file: &Path,
     protected_paths: &[&Path],
 ) -> Result<AuthMutationFileLock> {
-    let lock_path = auth_mutation_lock_path(credential_file);
-    let anchor_path = auth_mutation_lock_anchor_path(credential_file);
-    let owner_path = auth_mutation_lock_owner_path(credential_file);
+    let configured_credential_file = credential_file;
+    let credential_file = bind_auth_credential_file(credential_file)?;
+    let lock_path = auth_mutation_lock_path(credential_file.path());
+    let anchor_path = auth_mutation_lock_anchor_path(credential_file.path());
+    let owner_path = auth_mutation_lock_owner_path(credential_file.path());
+    let protected_paths = protected_paths
+        .iter()
+        .map(|path| {
+            if **path == *configured_credential_file {
+                credential_file.path()
+            } else {
+                *path
+            }
+        })
+        .collect::<Vec<_>>();
     if protected_paths
         .iter()
         .any(|path| **path == lock_path || **path == anchor_path || **path == owner_path)
@@ -1161,17 +1221,6 @@ fn acquire_auth_mutation_file_lock(
             anchor_path.display(),
             owner_path.display()
         );
-    }
-    if let Some(parent) = lock_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        create_private_dir_if_missing(parent).with_context(|| {
-            format!(
-                "failed to create BBDown auth lock directory {}",
-                parent.display()
-            )
-        })?;
     }
 
     let owner_exists = load_auth_mutation_lock_owner(&owner_path)?.is_some();
@@ -1202,7 +1251,7 @@ fn acquire_auth_mutation_file_lock(
             bail!("BBDown auth lock ownership record does not match the active lock object");
         }
     }
-    validate_auth_mutation_lock_is_distinct(&file, protected_paths, &lock_path)?;
+    validate_auth_mutation_lock_is_distinct(&file, &protected_paths, &lock_path)?;
     validate_existing_auth_lock_format(&file, &lock_path)?;
     set_auth_mutation_lock_private(&file, &lock_path)?;
     ensure_auth_mutation_lock_aliases(&file, &lock_path, &anchor_path)?;
@@ -1213,7 +1262,50 @@ fn acquire_auth_mutation_file_lock(
         path: lock_path,
         anchor_path,
         owner_path,
+        credential_file,
     })
+}
+
+fn bind_auth_credential_file(credential_file: &Path) -> Result<AuthCredentialFilePath> {
+    let parent = credential_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    create_private_dir_if_missing(parent).with_context(|| {
+        format!(
+            "failed to create BBDown credential directory {}",
+            parent.display()
+        )
+    })?;
+    let parent = canonical_non_symlink_directory(parent, "BBDown credential directory")?;
+    let leaf = credential_file
+        .file_name()
+        .context("BBDown credential file has no file name")?;
+    Ok(AuthCredentialFilePath {
+        path: parent.join(leaf),
+    })
+}
+
+fn canonical_non_symlink_directory(path: &Path, label: &str) -> Result<PathBuf> {
+    let absolute = absolute_auth_cleanup_path(path)?;
+    // Protected property: auth mutations must stay in the directory selected when the lock is
+    // acquired. Resolve ancestors once to a canonical path, but reject a configurable final
+    // parent symlink because it is the direct, retargetable credential-store selector.
+    let metadata = fs::symlink_metadata(&absolute)
+        .with_context(|| format!("failed to inspect {label} {}", absolute.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "{label} must not resolve through a symbolic link: {}",
+            absolute.display()
+        );
+    }
+    let metadata = fs::metadata(&absolute)
+        .with_context(|| format!("failed to inspect {label} {}", absolute.display()))?;
+    if !metadata.is_dir() {
+        bail!("{label} is not a directory: {}", absolute.display());
+    }
+    fs::canonicalize(&absolute)
+        .with_context(|| format!("failed to resolve {label} {}", absolute.display()))
 }
 
 fn open_or_create_auth_mutation_lock(path: &Path) -> Result<File> {
@@ -1342,7 +1434,7 @@ pub fn acquire_auth_reply_file_lock(
     credential_file: &Path,
 ) -> Result<AuthReplyFileLock> {
     let lock = acquire_auth_mutation_file_lock(credential_file, &[state_path, credential_file])?;
-    reconcile_interrupted_auth_cleanup_and_bump_epoch(&lock, state_path, credential_file)?;
+    reconcile_interrupted_auth_cleanup_and_bump_epoch(&lock, state_path, lock.credential_file())?;
     Ok(AuthReplyFileLock { lock })
 }
 
@@ -1350,16 +1442,16 @@ pub fn with_auth_mutation_transaction<T>(
     state_path: &Path,
     credential_file: &Path,
     operation: impl for<'a> FnOnce(&LockedAuthMutation<'a>) -> Result<T>,
-) -> Result<(T, u64)> {
+) -> Result<(T, AuthEpoch)> {
     with_auth_mutation_transaction_inner(state_path, credential_file, None, operation)
 }
 
 pub fn with_auth_mutation_transaction_at_epoch<T>(
     state_path: &Path,
     credential_file: &Path,
-    expected_epoch: u64,
+    expected_epoch: AuthEpoch,
     operation: impl for<'a> FnOnce(&LockedAuthMutation<'a>) -> Result<T>,
-) -> Result<(T, u64)> {
+) -> Result<(T, AuthEpoch)> {
     with_auth_mutation_transaction_inner(
         state_path,
         credential_file,
@@ -1371,23 +1463,29 @@ pub fn with_auth_mutation_transaction_at_epoch<T>(
 fn with_auth_mutation_transaction_inner<T>(
     state_path: &Path,
     credential_file: &Path,
-    expected_epoch: Option<u64>,
+    expected_epoch: Option<AuthEpoch>,
     operation: impl for<'a> FnOnce(&LockedAuthMutation<'a>) -> Result<T>,
-) -> Result<(T, u64)> {
+) -> Result<(T, AuthEpoch)> {
     with_auth_mutation_lock(credential_file, &[state_path, credential_file], |lock| {
-        reconcile_interrupted_auth_cleanup_and_bump_epoch(lock, state_path, credential_file)?;
+        reconcile_interrupted_auth_cleanup_and_bump_epoch(
+            lock,
+            state_path,
+            lock.credential_file(),
+        )?;
         if let Some(expected_epoch) = expected_epoch {
             let current_epoch = lock.current_epoch()?;
             if current_epoch != expected_epoch {
                 bail!(
-                    "BBDown credential state changed while login was pending (expected epoch {expected_epoch}, current epoch {current_epoch})"
+                    "BBDown credential state changed while login was pending (expected epoch {}, current epoch {})",
+                    expected_epoch.value(),
+                    current_epoch.value()
                 );
             }
         }
         let epoch = lock.bump_epoch()?;
         let transaction = LockedAuthMutation {
             state_path,
-            credential_file,
+            credential_file: lock.credential_file(),
             _lock: lock,
             epoch,
         };
@@ -1922,7 +2020,7 @@ pub fn sync_bbdown_rust_credentials_from_state_with_epoch(
     state_path: &Path,
     credential_file: &Path,
     credential_profile: Option<&str>,
-) -> Result<(Result<bool>, u64)> {
+) -> Result<(Result<bool>, AuthEpoch)> {
     sync_bbdown_rust_credentials_from_state_with_epoch_and_hook(
         state_path,
         credential_file,
@@ -1951,9 +2049,14 @@ fn sync_bbdown_rust_credentials_from_state_with_epoch_and_hook(
     credential_file: &Path,
     credential_profile: Option<&str>,
     after_legacy_read: impl FnOnce(),
-) -> Result<(Result<bool>, u64)> {
+) -> Result<(Result<bool>, AuthEpoch)> {
     with_auth_mutation_lock(credential_file, &[state_path, credential_file], |lock| {
-        reconcile_interrupted_auth_cleanup_and_bump_epoch(lock, state_path, credential_file)?;
+        reconcile_interrupted_auth_cleanup_and_bump_epoch(
+            lock,
+            state_path,
+            lock.credential_file(),
+        )?;
+        let credential_file = lock.credential_file();
         let current_epoch = lock.current_epoch()?;
         let cookie = match legacy_cookie_from_state_unlocked(state_path) {
             Ok(Some(cookie)) => cookie,
@@ -2029,6 +2132,7 @@ pub fn clear_bbdown_rust_cookie(
 ) -> Result<bool> {
     with_auth_mutation_lock(credential_file, &[credential_file], |lock| {
         lock.bump_epoch()?;
+        let credential_file = lock.credential_file();
         if !credential_file.exists() {
             return Ok(false);
         }
@@ -2039,7 +2143,7 @@ pub fn clear_bbdown_rust_cookie(
 pub fn clear_auth_state_and_credentials(
     state_path: &Path,
     credential_file: &Path,
-    clear_credentials: impl FnOnce() -> Result<()>,
+    clear_credentials: impl for<'a> FnOnce(&LockedAuthMutation<'a>) -> Result<()>,
 ) -> Result<AuthCleanupResult> {
     clear_auth_state_and_credentials_with_epoch(state_path, credential_file, clear_credentials)
         .map(|(result, _)| result)
@@ -2048,12 +2152,12 @@ pub fn clear_auth_state_and_credentials(
 pub fn clear_auth_state_and_credentials_with_epoch(
     state_path: &Path,
     credential_file: &Path,
-    clear_credentials: impl FnOnce() -> Result<()>,
-) -> Result<(AuthCleanupResult, u64)> {
+    clear_credentials: impl for<'a> FnOnce(&LockedAuthMutation<'a>) -> Result<()>,
+) -> Result<(AuthCleanupResult, AuthEpoch)> {
     with_auth_mutation_transaction(state_path, credential_file, |transaction| {
         let legacy_state = transaction.delete_legacy_state();
         let credential_state = if legacy_state.is_ok() {
-            clear_credentials()
+            clear_credentials(transaction)
         } else {
             Err(anyhow!(
                 "BBDown credential cleanup skipped because legacy login state cleanup failed"
@@ -2870,7 +2974,7 @@ mod tests {
         let credential_cleanup_called = std::cell::Cell::new(false);
 
         let (legacy_state, credential_state) =
-            clear_auth_state_and_credentials(&state_path, &credential_file, || {
+            clear_auth_state_and_credentials(&state_path, &credential_file, |_| {
                 credential_cleanup_called.set(true);
                 fs::remove_file(&credential_file).context("failed to clear active credentials")
             })
@@ -3288,43 +3392,90 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn auth_lock_supports_a_symlinked_credential_parent_directory() {
+    fn auth_mutation_rejects_retargeted_symlinked_credential_parents_before_epoch_mutation() {
+        use std::cell::Cell;
         use std::os::unix::fs::symlink;
 
-        let state_path = temp_state_file("symlinked-credential-parent");
+        let state_path = temp_state_file("auth-epoch-symlink-retarget");
         let root = state_path
             .parent()
             .expect("state should have a parent")
             .to_path_buf();
-        let credential_parent = root.join("credential-store");
-        let credential_parent_link = root.join("credential-store-link");
-        fs::create_dir_all(&credential_parent).expect("credential parent should create");
-        symlink(&credential_parent, &credential_parent_link)
-            .expect("credential parent symlink should create");
-        let credential_file = credential_parent_link.join("credentials.json");
+        let first_parent = root.join("credential-store-first");
+        let second_parent = root.join("credential-store-second");
+        let parent_link = root.join("credential-store-link");
+        fs::create_dir_all(&first_parent).expect("first credential parent should create");
+        fs::create_dir_all(&second_parent).expect("second credential parent should create");
+        let credential_file = parent_link.join("credentials.json");
+        for credential_parent in [&first_parent, &second_parent] {
+            if parent_link.exists() {
+                fs::remove_file(&parent_link).expect("previous credential symlink should unlink");
+            }
+            symlink(credential_parent, &parent_link)
+                .expect("credential symlink should point at the selected parent");
+            let called = Cell::new(false);
+            let error = with_auth_mutation_transaction(&state_path, &credential_file, |_| {
+                called.set(true);
+                Ok(())
+            })
+            .expect_err("retargetable credential parents must be rejected before mutation");
 
-        let (_, epoch) = with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
-            .expect("auth transaction should support a symlinked credential parent");
-        let reply_lock = acquire_auth_reply_file_lock(&state_path, &credential_file)
-            .expect("auth reply lock should reopen through the symlinked parent");
+            assert!(
+                error
+                    .to_string()
+                    .contains("must not resolve through a symbolic link")
+            );
+            assert!(!called.get());
+            assert!(!auth_mutation_lock_path(&credential_file).exists());
+        }
+        let _ = fs::remove_dir_all(root);
+    }
 
-        assert_eq!(epoch, 1);
-        assert_eq!(reply_lock.current_epoch().unwrap(), epoch);
-        let lock_name = auth_mutation_lock_path(&credential_file)
-            .file_name()
-            .expect("auth lock should have a file name")
-            .to_os_string();
-        let anchor_name = auth_mutation_lock_anchor_path(&credential_file)
-            .file_name()
-            .expect("auth lock anchor should have a file name")
-            .to_os_string();
-        let owner_name = auth_mutation_lock_owner_path(&credential_file)
-            .file_name()
-            .expect("auth lock owner should have a file name")
-            .to_os_string();
-        assert!(credential_parent.join(lock_name).is_file());
-        assert!(credential_parent.join(anchor_name).is_file());
-        assert!(credential_parent.join(owner_name).is_file());
+    #[cfg(unix)]
+    #[test]
+    fn auth_epoch_rejects_a_retargeted_ancestor_symlink_with_a_colliding_epoch() {
+        use std::cell::Cell;
+        use std::os::unix::fs::symlink;
+
+        let state_path = temp_state_file("auth-epoch-ancestor-symlink-retarget");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let first_root = root.join("credential-store-first");
+        let second_root = root.join("credential-store-second");
+        let parent_link = root.join("credential-store-link");
+        let first_parent = first_root.join("profiles");
+        let second_parent = second_root.join("profiles");
+        fs::create_dir_all(&first_parent).expect("first credential parent should create");
+        fs::create_dir_all(&second_parent).expect("second credential parent should create");
+        symlink(&first_root, &parent_link).expect("initial credential symlink should create");
+        let credential_file = parent_link.join("profiles").join("credentials.json");
+
+        let (_, pending_epoch) =
+            with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+                .expect("pending login should capture the first credential epoch");
+        fs::remove_file(&parent_link).expect("credential symlink should unlink");
+        symlink(&second_root, &parent_link).expect("credential symlink should retarget");
+        let (_, logout_epoch) =
+            with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+                .expect("retargeted logout should advance the second credential epoch");
+        assert_eq!(pending_epoch.value(), logout_epoch.value());
+
+        let called = Cell::new(false);
+        let error = with_auth_mutation_transaction_at_epoch(
+            &state_path,
+            &credential_file,
+            pending_epoch,
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("a same-valued epoch from a different credential directory must be rejected");
+
+        assert!(error.to_string().contains("credential state changed"));
+        assert!(!called.get());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3426,16 +3577,15 @@ mod tests {
         fs::write(root.join("logout-child-started"), b"started")
             .expect("child start marker should write");
 
-        let (legacy, credentials) = clear_auth_state_and_credentials(
-            &state_path,
-            &credential_file,
-            || match fs::remove_file(&credential_file) {
-                Ok(()) => Ok(()),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(err) => Err(err).context("failed to clear child credentials"),
-            },
-        )
-        .expect("child should acquire the shared auth lock");
+        let (legacy, credentials) =
+            clear_auth_state_and_credentials(&state_path, &credential_file, |_| {
+                match fs::remove_file(&credential_file) {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(err) => Err(err).context("failed to clear child credentials"),
+                }
+            })
+            .expect("child should acquire the shared auth lock");
         legacy.expect("child should clear legacy state");
         credentials.expect("child should clear credentials");
     }
@@ -3552,7 +3702,10 @@ mod tests {
 
         let initial = acquire_auth_reply_file_lock(&state_path, &credential_file)
             .expect("initial auth lock should open");
-        assert_eq!(initial.current_epoch().expect("epoch should read"), 0);
+        assert_eq!(
+            initial.current_epoch().expect("epoch should read").value(),
+            0
+        );
         drop(initial);
         let lock_path = auth_mutation_lock_path(&credential_file);
         assert!(
@@ -3564,11 +3717,17 @@ mod tests {
         let (_, first_epoch) =
             with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
                 .expect("first auth mutation should commit its epoch");
-        assert_eq!(first_epoch, 1);
+        assert_eq!(first_epoch.value(), 1);
 
         let reopened = acquire_auth_reply_file_lock(&state_path, &credential_file)
             .expect("auth lock should reopen");
-        assert_eq!(reopened.current_epoch().expect("epoch should persist"), 1);
+        assert_eq!(
+            reopened
+                .current_epoch()
+                .expect("epoch should persist")
+                .value(),
+            1
+        );
         drop(reopened);
 
         let (_, second_epoch) = with_auth_mutation_transaction_at_epoch(
@@ -3578,7 +3737,7 @@ mod tests {
             |_| Ok(()),
         )
         .expect("second auth mutation should commit its epoch");
-        assert_eq!(second_epoch, 2);
+        assert_eq!(second_epoch.value(), 2);
 
         if let Some(parent) = state_path.parent() {
             let _ = fs::remove_dir_all(parent);
@@ -3591,15 +3750,18 @@ mod tests {
 
         let state_path = temp_state_file("auth-epoch-stale-mutation");
         let credential_file = state_path.with_file_name("credentials.json");
-        let (_, current_epoch) =
+        let (_, pending_epoch) =
             with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
                 .expect("initial auth mutation should commit");
+        let (_, current_epoch) =
+            with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+                .expect("second auth mutation should commit");
         let called = Cell::new(false);
 
         let error = with_auth_mutation_transaction_at_epoch(
             &state_path,
             &credential_file,
-            current_epoch - 1,
+            pending_epoch,
             |_| {
                 called.set(true);
                 Ok(())
@@ -3635,8 +3797,8 @@ mod tests {
         let (_, logout_epoch) =
             with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
                 .expect("logout mutation should advance the epoch");
-        assert_eq!(pending_epoch, 0);
-        assert_eq!(logout_epoch, 1);
+        assert_eq!(pending_epoch.value(), 0);
+        assert_eq!(logout_epoch.value(), 1);
 
         let lock_path = auth_mutation_lock_path(&credential_file);
         let anchor_path = auth_mutation_lock_anchor_path(&credential_file);
@@ -3678,7 +3840,7 @@ mod tests {
         let (_, pending_epoch) =
             with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
                 .expect("pending login epoch should initialize");
-        assert_eq!(pending_epoch, 1);
+        assert_eq!(pending_epoch.value(), 1);
         let lock_path = auth_mutation_lock_path(&credential_file);
         let anchor_path = auth_mutation_lock_anchor_path(&credential_file);
         let owner_path = auth_mutation_lock_owner_path(&credential_file);
@@ -3776,10 +3938,16 @@ mod tests {
             with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
                 .expect("next auth mutation should migrate the epoch log");
 
-        assert_eq!(repaired_epoch, 2);
+        assert_eq!(repaired_epoch.value(), 2);
         let reopened = acquire_auth_reply_file_lock(&state_path, &credential_file)
             .expect("auth lock should reopen");
-        assert_eq!(reopened.current_epoch().expect("epoch should persist"), 2);
+        assert_eq!(
+            reopened
+                .current_epoch()
+                .expect("epoch should persist")
+                .value(),
+            2
+        );
         assert!(
             fs::metadata(&lock_path)
                 .expect("auth epoch file should exist")
@@ -3814,12 +3982,12 @@ mod tests {
         let (_, migrated_epoch) =
             with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
                 .expect("near-limit legacy epoch should migrate");
-        assert_eq!(migrated_epoch, epoch + 1);
-        for expected in (migrated_epoch + 1)..=(migrated_epoch + 4) {
+        assert_eq!(migrated_epoch.value(), epoch + 1);
+        for expected in (migrated_epoch.value() + 1)..=(migrated_epoch.value() + 4) {
             let (_, observed) =
                 with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
                     .expect("fixed epoch slot should continue advancing");
-            assert_eq!(observed, expected);
+            assert_eq!(observed.value(), expected);
         }
         assert_eq!(
             fs::metadata(&lock_path)
@@ -3845,10 +4013,13 @@ mod tests {
                 .expect("no-op credential sync should succeed");
 
         assert!(!sync_result.expect("sync result should be available"));
-        assert_eq!(observed_epoch, 0);
+        assert_eq!(observed_epoch.value(), 0);
         let reopened = acquire_auth_reply_file_lock(&state_path, &credential_file)
             .expect("auth lock should open");
-        assert_eq!(reopened.current_epoch().expect("epoch should read"), 0);
+        assert_eq!(
+            reopened.current_epoch().expect("epoch should read").value(),
+            0
+        );
         if let Some(parent) = state_path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
