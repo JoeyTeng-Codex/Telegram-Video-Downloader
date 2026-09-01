@@ -10,7 +10,7 @@ use std::sync::{
     Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bbdown_core::{CredentialProfileSelection, CredentialStore};
@@ -43,6 +43,8 @@ const AUTH_EPOCH_SLOT_COUNT: usize = 2;
 const AUTH_EPOCH_SLOT_MAGIC: &[u8; 8] = b"TVDAUTH1";
 const AUTH_LOCK_HEADER: &[u8] = b"telegram-video-downloader-auth-lock-v1\n";
 const AUTH_STATE_FILE_LIMIT: usize = 1024 * 1024;
+const AUTH_MUTATION_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const AUTH_MUTATION_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const LOGIN_URL_COOKIE_NAMES: &[&str] = &[
     "SESSDATA",
     "bili_jct",
@@ -1287,9 +1289,7 @@ fn acquire_auth_mutation_file_lock(
         )?,
         None => open_or_create_auth_mutation_lock(&lock_path)?,
     };
-    rustix::fs::flock(&file, FlockOperation::LockExclusive)
-        .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
-        .with_context(|| format!("failed to lock BBDown auth state {}", lock_path.display()))?;
+    wait_for_auth_mutation_file_lock(&file, &lock_path, AUTH_MUTATION_LOCK_WAIT_TIMEOUT)?;
     validate_auth_mutation_lock_candidate(&file, &lock_path, &anchor_path)?;
     if owner_exists {
         let expected_owner = auth_mutation_lock_owner_for_file(&file)?;
@@ -1316,6 +1316,36 @@ fn acquire_auth_mutation_file_lock(
         owner_path,
         credential_file,
     })
+}
+
+fn wait_for_auth_mutation_file_lock(file: &File, path: &Path, timeout: Duration) -> Result<()> {
+    let started_at = Instant::now();
+    loop {
+        match rustix::fs::flock(file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if std::io::Error::from_raw_os_error(error.raw_os_error()).kind()
+                    == std::io::ErrorKind::WouldBlock =>
+            {
+                let elapsed = started_at.elapsed();
+                if elapsed >= timeout {
+                    bail!(
+                        "timed out after {}ms waiting to lock BBDown auth state {}",
+                        timeout.as_millis(),
+                        path.display()
+                    );
+                }
+                std::thread::sleep(
+                    AUTH_MUTATION_LOCK_RETRY_INTERVAL.min(timeout.saturating_sub(elapsed)),
+                );
+            }
+            Err(error) => {
+                return Err(std::io::Error::from_raw_os_error(error.raw_os_error())).with_context(
+                    || format!("failed to lock BBDown auth state {}", path.display()),
+                );
+            }
+        }
+    }
 }
 
 fn bind_auth_credential_file(credential_file: &Path) -> Result<AuthCredentialFilePath> {
@@ -1357,7 +1387,9 @@ fn validate_auth_credential_directory_ancestry(path: &Path) -> Result<()> {
 
     // A path-only core store cannot preserve a directory descriptor. The required access policy
     // therefore prevents another UID from renaming any reachable directory component. A sticky
-    // shared parent is safe for the current UID's child: another UID cannot remove or rename it.
+    // shared ancestor is safe below a private credential parent because another UID cannot remove
+    // or rename that current-user child. The direct parent must not be shared writable: before the
+    // credential leaf exists, another UID could otherwise create it first.
     let current_uid = unsafe { libc::geteuid() };
     let mut ancestor = Some(path);
     while let Some(directory) = ancestor {
@@ -1382,7 +1414,8 @@ fn validate_auth_credential_directory_ancestry(path: &Path) -> Result<()> {
         }
         let mode = metadata.mode();
         let shared_write = mode & 0o022 != 0;
-        let sticky_protected = mode & 0o1000 != 0 && (owner == current_uid || owner == 0);
+        let sticky_protected =
+            directory != path && mode & 0o1000 != 0 && (owner == current_uid || owner == 0);
         if shared_write && !sticky_protected {
             bail!(
                 "BBDown credential directory ancestor permits another user to replace credentials: {}",
@@ -4349,6 +4382,64 @@ mod tests {
             .expect("sticky shared parents must protect current-user credential children");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_mutation_rejects_sticky_shared_credential_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_path = temp_state_file("auth-sticky-credential-parent");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let shared_parent = root.join("shared");
+        let credential_file = shared_parent.join("credentials.json");
+        fs::create_dir_all(&shared_parent).expect("credential parent should create");
+        fs::set_permissions(&shared_parent, fs::Permissions::from_mode(0o1777))
+            .expect("sticky parent permissions should update");
+
+        let error = with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+            .expect_err("a missing credential leaf must not use a shared writable parent");
+
+        assert!(
+            error
+                .to_string()
+                .contains("permits another user to replace credentials")
+        );
+        assert!(!auth_mutation_lock_path(&credential_file).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auth_mutation_lock_wait_times_out_when_another_descriptor_holds_it() {
+        let path = temp_state_file("auth-lock-wait-timeout");
+        let parent = path
+            .parent()
+            .expect("lock file should have a parent")
+            .to_path_buf();
+        fs::create_dir_all(&parent).expect("lock directory should create");
+        fs::write(&path, "lock").expect("lock file should write");
+        let holder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("lock holder should open");
+        rustix::fs::flock(&holder, FlockOperation::LockExclusive)
+            .expect("lock holder should acquire");
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("lock contender should open");
+
+        let error = wait_for_auth_mutation_file_lock(&contender, &path, Duration::from_millis(5))
+            .expect_err("a held auth lock must time out");
+
+        assert!(error.to_string().contains("timed out after 5ms"));
+        rustix::fs::flock(&holder, FlockOperation::Unlock).expect("lock holder should unlock");
+        let _ = fs::remove_dir_all(parent);
     }
 
     #[cfg(unix)]
