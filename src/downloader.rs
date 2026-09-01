@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(unix)]
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -165,7 +165,16 @@ struct AdditionalInheritedCommandFd {
 struct PreparedCommandFds {
     bound_file_sources: Vec<(BoundFile, RawFd, i32)>,
     inherited: Vec<(OwnedFd, i32)>,
+    remap: Vec<ChildFdRemapOperation>,
+    scratch: Option<OwnedFd>,
     targets: BTreeSet<i32>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+enum ChildFdRemapOperation {
+    Duplicate { source: RawFd, target: RawFd },
+    ClearCloseOnExec { fd: RawFd },
 }
 
 #[cfg(not(unix))]
@@ -5798,6 +5807,8 @@ async fn run_command_with_execution_context_and_additional_fds(
     let PreparedCommandFds {
         bound_file_sources,
         inherited: inherited_fds,
+        remap: inherited_fd_remap,
+        scratch: inherited_fd_scratch,
         targets: inherited_fd_targets,
     } = prepare_command_inherited_fds(
         inherited_files,
@@ -5834,25 +5845,21 @@ async fn run_command_with_execution_context_and_additional_fds(
         if matches!(policy.process_group, CommandProcessGroupMode::Owned) {
             command.process_group(0);
         }
-        if bound_cwd_fd.is_some() || !bound_file_sources.is_empty() || !inherited_fds.is_empty() {
+        if bound_cwd_fd.is_some() || !inherited_fd_remap.is_empty() {
             // Captured bound files keep their validated CLOEXEC source descriptors open until
-            // fork. dup2 clears CLOEXEC on each fixed child descriptor without an argv lookup.
+            // fork. The precomputed remap preserves their original open descriptions even when
+            // fixed child descriptors overlap the source descriptor numbers.
             unsafe {
                 command.pre_exec(move || {
+                    let _source_holders =
+                        (&bound_file_sources, &inherited_fds, &inherited_fd_scratch);
                     if let Some(directory) = &bound_cwd_fd
                         && libc::fchdir(directory.as_raw_fd()) == -1
                     {
                         return Err(std::io::Error::last_os_error());
                     }
-                    for (_, source, target) in &bound_file_sources {
-                        if libc::dup2(*source, *target) == -1 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                    }
-                    for (source, target) in &inherited_fds {
-                        if libc::dup2(source.as_raw_fd(), *target) == -1 {
-                            return Err(std::io::Error::last_os_error());
-                        }
+                    for operation in &inherited_fd_remap {
+                        apply_child_fd_remap_operation(*operation)?;
                     }
                     Ok(())
                 });
@@ -6031,6 +6038,31 @@ fn prepare_bound_command_cwd_fd(
 }
 
 #[cfg(unix)]
+fn apply_child_fd_remap_operation(operation: ChildFdRemapOperation) -> std::io::Result<()> {
+    match operation {
+        ChildFdRemapOperation::Duplicate { source, target } => {
+            // SAFETY: source descriptors are held alive by the captured PreparedCommandFds,
+            // and targets were validated as positive, distinct child descriptor numbers.
+            if unsafe { libc::dup2(source, target) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        ChildFdRemapOperation::ClearCloseOnExec { fd } => {
+            // SAFETY: the same captured holder keeps fd valid until the child calls exec.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: fd remains valid and F_SETFD accepts the flag bits returned by F_GETFD.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn prepare_command_inherited_fds(
     files: &[BoundFile],
     additional: Vec<AdditionalInheritedCommandFd>,
@@ -6061,6 +6093,7 @@ fn prepare_command_inherited_fds(
 
     let mut bound_file_sources = Vec::with_capacity(files.len());
     let mut inherited_fds = Vec::with_capacity(files.len().saturating_add(additional.len()));
+    let mut mappings = Vec::with_capacity(files.len().saturating_add(additional.len()));
     for (index, file) in files.iter().enumerate() {
         let index = i32::try_from(index).context("too many inherited command files")?;
         let target = inherited_fd_base
@@ -6068,29 +6101,113 @@ fn prepare_command_inherited_fds(
             .checked_add(index)
             .context("too many inherited command files")?;
         let source = file.child_process_fd()?;
-        if source <= libc::STDERR_FILENO || targets.contains(&source) {
+        if source <= libc::STDERR_FILENO {
             let source = duplicate_command_fd_avoiding_targets(
                 |minimum| file.duplicate_fd_cloexec_at_least(minimum),
                 &targets,
             )?;
+            let source_fd = source.as_raw_fd();
             inherited_fds.push((source, target));
+            mappings.push((source_fd, target));
         } else {
             bound_file_sources.push((file.clone(), source, target));
+            mappings.push((source, target));
         }
     }
     for AdditionalInheritedCommandFd { source, target } in additional {
-        let source = if targets.contains(&source.as_raw_fd()) {
-            duplicate_inherited_command_fd_avoiding_targets(&source, &targets)?
-        } else {
-            source
-        };
+        let source_fd = source.as_raw_fd();
         inherited_fds.push((source, target));
+        mappings.push((source_fd, target));
     }
+    let scratch = child_fd_remap_requires_scratch(&mappings)
+        .then(|| allocate_child_fd_remap_scratch(&mappings))
+        .transpose()?;
+    let remap = build_child_fd_remap_plan(&mappings, scratch.as_ref().map(AsRawFd::as_raw_fd))?;
     Ok(PreparedCommandFds {
         bound_file_sources,
         inherited: inherited_fds,
+        remap,
+        scratch,
         targets,
     })
+}
+
+#[cfg(unix)]
+fn child_fd_remap_requires_scratch(mappings: &[(RawFd, i32)]) -> bool {
+    let mut pending = mappings.to_vec();
+    while !pending.is_empty() {
+        let Some(index) = pending.iter().position(|(source, target)| {
+            source == target
+                || !pending
+                    .iter()
+                    .any(|(candidate_source, _)| candidate_source == target)
+        }) else {
+            return true;
+        };
+        pending.remove(index);
+    }
+    false
+}
+
+#[cfg(unix)]
+fn allocate_child_fd_remap_scratch(mappings: &[(RawFd, i32)]) -> Result<OwnedFd> {
+    let source = mappings
+        .first()
+        .map(|(source, _)| *source)
+        .context("command descriptor remapping has no source descriptor")?;
+    let minimum = mappings
+        .iter()
+        .flat_map(|(source, target)| [*source, *target])
+        .max()
+        .context("command descriptor remapping has no descriptor numbers")?
+        .checked_add(1)
+        .context("command descriptor remapping descriptor range is exhausted")?;
+    // Protected property: each child target must retain the original open description of its
+    // bound source. A single scratch descriptor breaks a source-target cycle without reopening
+    // a filesystem path or allocating one duplicate per overlapping input.
+    let source = unsafe { BorrowedFd::borrow_raw(source) };
+    rustix::io::fcntl_dupfd_cloexec(source, minimum)
+        .context("command descriptor remapping requires one spare file descriptor")
+}
+
+#[cfg(unix)]
+fn build_child_fd_remap_plan(
+    mappings: &[(RawFd, i32)],
+    scratch: Option<RawFd>,
+) -> Result<Vec<ChildFdRemapOperation>> {
+    let mut pending = mappings.to_vec();
+    let mut operations = Vec::with_capacity(mappings.len().saturating_add(1));
+    while !pending.is_empty() {
+        if let Some(index) = pending.iter().position(|(source, target)| {
+            source == target
+                || !pending
+                    .iter()
+                    .any(|(candidate_source, _)| candidate_source == target)
+        }) {
+            let (source, target) = pending.remove(index);
+            operations.push(if source == target {
+                ChildFdRemapOperation::ClearCloseOnExec { fd: source }
+            } else {
+                ChildFdRemapOperation::Duplicate { source, target }
+            });
+            continue;
+        }
+
+        let scratch = scratch.context(
+            "command descriptor remapping needs a scratch descriptor but none was reserved",
+        )?;
+        let source = pending[0].0;
+        operations.push(ChildFdRemapOperation::Duplicate {
+            source,
+            target: scratch,
+        });
+        for (candidate_source, _) in &mut pending {
+            if *candidate_source == source {
+                *candidate_source = scratch;
+            }
+        }
+    }
+    Ok(operations)
 }
 
 #[cfg(unix)]
@@ -19668,6 +19785,30 @@ mv video.original video.m4s || exit 46
 
     #[cfg(unix)]
     #[test]
+    fn child_fd_remap_reuses_one_scratch_descriptor_for_multiple_cycles() {
+        let mappings = [(9, 10), (10, 9), (12, 13), (13, 12)];
+        assert!(child_fd_remap_requires_scratch(&mappings));
+        let operations = build_child_fd_remap_plan(&mappings, Some(20))
+            .expect("one scratch descriptor should break every remap cycle");
+
+        let mut descriptors = BTreeMap::from([(9, 'a'), (10, 'b'), (12, 'c'), (13, 'd')]);
+        for operation in operations {
+            if let ChildFdRemapOperation::Duplicate { source, target } = operation {
+                let value = *descriptors
+                    .get(&source)
+                    .expect("remap source should retain its original open description");
+                descriptors.insert(target, value);
+            }
+        }
+
+        assert_eq!(descriptors.get(&9), Some(&'b'));
+        assert_eq!(descriptors.get(&10), Some(&'a'));
+        assert_eq!(descriptors.get(&12), Some(&'d'));
+        assert_eq!(descriptors.get(&13), Some(&'c'));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn bilibili_mux_releases_descriptors_below_a_low_process_limit() {
         use std::os::unix::process::CommandExt;
 
@@ -19788,6 +19929,132 @@ mv video.original video.m4s || exit 46
             assert!(mux.recovery.is_none());
         }
         drop(report);
+        drop(rooted);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_command_descriptors_remap_many_collisions_below_a_low_process_limit() {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new(
+            std::env::current_exe().expect("test binary should resolve"),
+        );
+        command
+            .arg("--ignored")
+            .arg("--exact")
+            .arg(
+                "downloader::tests::inherited_command_descriptors_remap_many_collisions_low_limit_child",
+            )
+            .arg("--nocapture")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+                if libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut limits = limits.assume_init();
+                limits.rlim_cur = limits.rlim_cur.min(80 as libc::rlim_t);
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limits) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let output = command.output().expect("low-limit helper should run");
+        assert!(
+            output.status.success(),
+            "low-limit inherited descriptor helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "spawned by inherited_command_descriptors_remap_many_collisions_below_a_low_process_limit"]
+    async fn inherited_command_descriptors_remap_many_collisions_low_limit_child() {
+        const INPUT_COUNT: usize = 10;
+
+        let root = temp_test_dir("inherited-command-remap-low-fd-limit");
+        let mut paths = Vec::with_capacity(INPUT_COUNT);
+        for index in 0..INPUT_COUNT {
+            let path = root.join(format!("input-{index:02}.bin"));
+            fs::write(&path, "input").expect("test input should write");
+            paths.push(path);
+        }
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+        unsafe {
+            let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+            assert_eq!(
+                libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()),
+                0,
+                "process file descriptor limit should read"
+            );
+            let mut limits = limits.assume_init();
+            limits.rlim_cur = limits.rlim_cur.min(32 as libc::rlim_t);
+            assert_eq!(
+                libc::setrlimit(libc::RLIMIT_NOFILE, &limits),
+                0,
+                "process file descriptor limit should lower"
+            );
+        }
+        let bound_files = paths
+            .iter()
+            .map(|path| {
+                rooted
+                    .open_bound_file(path)
+                    .expect("test input should bind")
+                    .expect("test input should exist")
+            })
+            .collect::<Vec<_>>();
+        let targets = BILIBILI_MUX_MIN_FD_BASE
+            ..BILIBILI_MUX_MIN_FD_BASE + i32::try_from(INPUT_COUNT).expect("count should fit");
+        assert!(
+            bound_files
+                .iter()
+                .map(|file| file
+                    .child_process_fd()
+                    .expect("input descriptor should validate"))
+                .any(|source| targets.contains(&source)),
+            "low-limit helper must exercise an inherited source-target collision"
+        );
+
+        let script = (0..INPUT_COUNT)
+            .map(|index| {
+                let descriptor = inherited_command_descriptor(index, BILIBILI_MUX_MIN_FD_BASE)
+                    .expect("target descriptor should fit");
+                format!("/bin/test -r /dev/fd/{descriptor} || exit 41")
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let mut config = test_config();
+        config.bot.command_timeout_seconds = 5;
+        config.bot.command_idle_timeout_seconds = 5;
+        let spec = CommandSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".to_string(), script],
+            cwd: root.clone(),
+            activity_dir: None,
+            cleanup_paths: Vec::new(),
+            inherited_fd_base: Some(BILIBILI_MUX_MIN_FD_BASE),
+        };
+        let output = run_command_with_execution_context(
+            &config,
+            &spec,
+            None,
+            &bound_files,
+            None,
+            CommandExecutionPolicy::BILIBILI_MUX,
+        )
+        .await
+        .expect("many inherited descriptors should fit below the low limit");
+        assert!(output.status.success());
+
+        drop(bound_files);
         drop(rooted);
         let _ = fs::remove_dir_all(root);
     }
