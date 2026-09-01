@@ -189,6 +189,12 @@ enum CommandTotalDeadline {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandIdleDeadline {
+    Configured,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandProcessGroupMode {
     Owned,
     Inherited,
@@ -197,6 +203,7 @@ enum CommandProcessGroupMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CommandExecutionPolicy {
     total_deadline: CommandTotalDeadline,
+    idle_deadline: CommandIdleDeadline,
     process_group: CommandProcessGroupMode,
     descendant_fence: bool,
 }
@@ -204,18 +211,21 @@ struct CommandExecutionPolicy {
 impl CommandExecutionPolicy {
     const EXTERNAL: Self = Self {
         total_deadline: CommandTotalDeadline::Configured,
+        idle_deadline: CommandIdleDeadline::Configured,
         process_group: CommandProcessGroupMode::Owned,
         descendant_fence: false,
     };
 
     const BILIBILI_WORKER: Self = Self {
         total_deadline: CommandTotalDeadline::Disabled,
+        idle_deadline: CommandIdleDeadline::Disabled,
         process_group: CommandProcessGroupMode::Owned,
         descendant_fence: false,
     };
 
     const BILIBILI_MUX: Self = Self {
         total_deadline: CommandTotalDeadline::Configured,
+        idle_deadline: CommandIdleDeadline::Configured,
         process_group: CommandProcessGroupMode::Inherited,
         descendant_fence: true,
     };
@@ -5903,16 +5913,21 @@ async fn run_command_with_execution_context_and_additional_fds(
     let started_at = Instant::now();
     let total_deadline = matches!(policy.total_deadline, CommandTotalDeadline::Configured)
         .then_some(started_at + total_timeout);
+    let idle_deadline_enabled = matches!(policy.idle_deadline, CommandIdleDeadline::Configured);
     let mut last_activity_at = started_at;
     let progress_interval = Duration::from_secs(config.bot.progress_update_seconds);
-    let activity_poll_interval = file_activity_poll_interval(progress_interval, idle_timeout);
+    let activity_poll_interval = if idle_deadline_enabled {
+        file_activity_poll_interval(progress_interval, idle_timeout)
+    } else {
+        progress_interval
+    };
     let mut next_activity_poll = started_at + activity_poll_interval;
     let mut progress_tracker =
         ProgressTracker::new(command_progress_name(spec), progress_interval, progress);
 
     let mut output_closed = false;
     let status = loop {
-        let idle_deadline = last_activity_at + idle_timeout;
+        let idle_deadline = idle_deadline_enabled.then_some(last_activity_at + idle_timeout);
         tokio::select! {
             maybe_chunk = chunk_rx.recv(), if !output_closed => {
                 match maybe_chunk {
@@ -5949,7 +5964,12 @@ async fn run_command_with_execution_context_and_additional_fds(
                     summarize_output(&String::from_utf8_lossy(&stdout), &String::from_utf8_lossy(&stderr))
                 );
             }
-            _ = sleep_until(idle_deadline) => {
+            _ = async {
+                match idle_deadline {
+                    Some(deadline) => sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
                 terminate_command_tree(&mut child, process_group).await;
                 let (stdout, stderr) =
                     collect_stream_outputs(
@@ -19673,11 +19693,11 @@ mv video.original video.m4s || exit 46
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn bilibili_worker_policy_disables_only_the_total_deadline() {
-        let root = temp_test_dir("bilibili-worker-total-deadline");
+    async fn bilibili_worker_policy_disables_outer_deadlines() {
+        let root = temp_test_dir("bilibili-worker-outer-deadlines");
         let mut config = test_config();
         config.bot.command_timeout_seconds = 1;
-        config.bot.command_idle_timeout_seconds = 5;
+        config.bot.command_idle_timeout_seconds = 1;
         let spec = CommandSpec {
             program: PathBuf::from("/bin/sh"),
             args: vec!["-c".to_string(), "sleep 2; printf finished".to_string()],
@@ -19704,6 +19724,10 @@ mv video.original video.m4s || exit 46
 
         assert!(output.status.success());
         assert_eq!(output.stdout, b"finished");
+        assert_eq!(
+            CommandExecutionPolicy::BILIBILI_WORKER.idle_deadline,
+            CommandIdleDeadline::Disabled
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -19750,6 +19774,10 @@ mv video.original video.m4s || exit 46
         assert_eq!(
             CommandExecutionPolicy::BILIBILI_MUX.total_deadline,
             CommandTotalDeadline::Configured
+        );
+        assert_eq!(
+            CommandExecutionPolicy::BILIBILI_MUX.idle_deadline,
+            CommandIdleDeadline::Configured
         );
         let _ = fs::remove_dir_all(root);
     }

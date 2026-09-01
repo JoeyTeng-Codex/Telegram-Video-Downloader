@@ -165,11 +165,12 @@ impl AuthCredentialFilePath {
     }
 
     fn store_path(&self) -> Result<PathBuf> {
-        // Protected property: each bbdown-core pathname handoff must begin in the directory
-        // object selected before the auth lock. On macOS, F_GETPATH preserves a benign rename;
-        // other Unix platforms revalidate the configured path. Both reopen with O_NOFOLLOW and
-        // compare device/inode before the path-only core call starts. This is an operation-boundary
-        // check, not continuous protection after that handoff.
+        // Protected property: a path-only bbdown-core call must name the credential directory
+        // selected before the auth lock. The credential path's validated ancestry prevents a
+        // different UID from replacing that directory after this handoff; same-UID processes can
+        // already read the 0600 credential file and are outside this filesystem isolation boundary.
+        // On macOS, F_GETPATH preserves a benign rename; other Unix platforms revalidate the
+        // configured path. Both reopen with O_NOFOLLOW and compare device/inode before the call.
         #[cfg(target_os = "macos")]
         {
             Ok(macos_path_for_open_directory(&self._parent)?.join(&self.leaf))
@@ -185,6 +186,10 @@ impl AuthCredentialFilePath {
         #[cfg(not(unix))]
         Ok(self.control_path.clone())
     }
+}
+
+pub fn validated_credential_store_path(credential_file: &Path) -> Result<PathBuf> {
+    bind_auth_credential_file(credential_file)?.store_path()
 }
 
 #[derive(Debug)]
@@ -1314,6 +1319,7 @@ fn acquire_auth_mutation_file_lock(
 }
 
 fn bind_auth_credential_file(credential_file: &Path) -> Result<AuthCredentialFilePath> {
+    ensure_auth_credential_path_has_no_symlink_components(credential_file)?;
     let parent = credential_file
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1325,6 +1331,7 @@ fn bind_auth_credential_file(credential_file: &Path) -> Result<AuthCredentialFil
         )
     })?;
     let parent_path = canonical_non_symlink_directory(parent, "BBDown credential directory")?;
+    validate_auth_credential_directory_ancestry(&parent_path)?;
     let leaf = credential_file
         .file_name()
         .context("BBDown credential file has no file name")?;
@@ -1342,6 +1349,54 @@ fn bind_auth_credential_file(credential_file: &Path) -> Result<AuthCredentialFil
     Ok(AuthCredentialFilePath {
         control_path: parent_path.join(leaf),
     })
+}
+
+#[cfg(unix)]
+fn validate_auth_credential_directory_ancestry(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    // A path-only core store cannot preserve a directory descriptor. The required access policy
+    // therefore prevents another UID from renaming any reachable directory component. A sticky
+    // shared parent is safe for the current UID's child: another UID cannot remove or rename it.
+    let current_uid = unsafe { libc::geteuid() };
+    let mut ancestor = Some(path);
+    while let Some(directory) = ancestor {
+        let metadata = fs::symlink_metadata(directory).with_context(|| {
+            format!(
+                "failed to inspect BBDown credential directory ancestor {}",
+                directory.display()
+            )
+        })?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            bail!(
+                "BBDown credential directory ancestor is not a real directory: {}",
+                directory.display()
+            );
+        }
+        let owner = metadata.uid();
+        if owner != current_uid && owner != 0 {
+            bail!(
+                "BBDown credential directory ancestor is not owned by the current user or root: {}",
+                directory.display()
+            );
+        }
+        let mode = metadata.mode();
+        let shared_write = mode & 0o022 != 0;
+        let sticky_protected = mode & 0o1000 != 0 && (owner == current_uid || owner == 0);
+        if shared_write && !sticky_protected {
+            bail!(
+                "BBDown credential directory ancestor permits another user to replace credentials: {}",
+                directory.display()
+            );
+        }
+        ancestor = directory.parent();
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_auth_credential_directory_ancestry(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2997,6 +3052,14 @@ fn bind_auth_state_path_before_lock(path: &Path) -> Result<Option<BoundAuthState
 }
 
 pub(crate) fn ensure_auth_state_path_has_no_symlink_components(path: &Path) -> Result<()> {
+    ensure_auth_path_has_no_symlink_components(path, "Bilibili auth state path")
+}
+
+fn ensure_auth_credential_path_has_no_symlink_components(path: &Path) -> Result<()> {
+    ensure_auth_path_has_no_symlink_components(path, "BBDown credential path")
+}
+
+fn ensure_auth_path_has_no_symlink_components(path: &Path, label: &str) -> Result<()> {
     let absolute = absolute_auth_cleanup_path(path)?;
     let mut current = PathBuf::new();
     for component in absolute.components() {
@@ -3007,7 +3070,7 @@ pub(crate) fn ensure_auth_state_path_has_no_symlink_components(path: &Path) -> R
                     continue;
                 }
                 bail!(
-                    "Bilibili auth state path must not resolve through a symbolic link: {}",
+                    "{label} must not resolve through a symbolic link: {}",
                     current.display()
                 );
             }
@@ -3015,10 +3078,7 @@ pub(crate) fn ensure_auth_state_path_has_no_symlink_components(path: &Path) -> R
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
                 return Err(err).with_context(|| {
-                    format!(
-                        "failed to inspect Bilibili auth state path component {}",
-                        current.display()
-                    )
+                    format!("failed to inspect {label} component {}", current.display())
                 });
             }
         }
@@ -4239,6 +4299,60 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn auth_mutation_rejects_replaceable_credential_ancestry_before_epoch_mutation() {
+        use std::cell::Cell;
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_path = temp_state_file("auth-replaceable-credential-ancestor");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let shared_parent = root.join("shared");
+        let credential_parent = shared_parent.join("credentials");
+        let credential_file = credential_parent.join("credentials.json");
+        fs::create_dir_all(&credential_parent).expect("credential parent should create");
+        fs::set_permissions(&shared_parent, fs::Permissions::from_mode(0o777))
+            .expect("shared parent permissions should update");
+
+        let called = Cell::new(false);
+        let error = with_auth_mutation_transaction(&state_path, &credential_file, |_| {
+            called.set(true);
+            Ok(())
+        })
+        .expect_err("replaceable credential ancestry must be rejected before mutation");
+
+        assert!(format!("{error:#}").contains("permits another user to replace credentials"));
+        assert!(!called.get());
+        assert!(!auth_mutation_lock_path(&credential_file).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_mutation_accepts_sticky_shared_credential_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_path = temp_state_file("auth-sticky-credential-ancestor");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let shared_parent = root.join("shared");
+        let credential_parent = shared_parent.join("credentials");
+        let credential_file = credential_parent.join("credentials.json");
+        fs::create_dir_all(&credential_parent).expect("credential parent should create");
+        fs::set_permissions(&shared_parent, fs::Permissions::from_mode(0o1777))
+            .expect("sticky parent permissions should update");
+
+        with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+            .expect("sticky shared parents must protect current-user credential children");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn auth_mutation_binds_or_rejects_a_replaced_credential_parent() {
         let state_path = temp_state_file("auth-credential-parent-replacement");
         let root = state_path
@@ -4411,8 +4525,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn auth_epoch_rejects_a_retargeted_ancestor_symlink_with_a_colliding_epoch() {
-        use std::cell::Cell;
+    fn auth_epoch_rejects_a_retargetable_credential_ancestor_before_epoch_mutation() {
         use std::os::unix::fs::symlink;
 
         let state_path = temp_state_file("auth-epoch-ancestor-symlink-retarget");
@@ -4430,30 +4543,22 @@ mod tests {
         symlink(&first_root, &parent_link).expect("initial credential symlink should create");
         let credential_file = parent_link.join("profiles").join("credentials.json");
 
-        let (_, pending_epoch) =
-            with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
-                .expect("pending login should capture the first credential epoch");
-        fs::remove_file(&parent_link).expect("credential symlink should unlink");
-        symlink(&second_root, &parent_link).expect("credential symlink should retarget");
-        let (_, logout_epoch) =
-            with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
-                .expect("retargeted logout should advance the second credential epoch");
-        assert_eq!(pending_epoch.value(), logout_epoch.value());
+        let error = with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+            .expect_err("retargetable credential ancestors must be rejected before epoch capture");
 
-        let called = Cell::new(false);
-        let error = with_auth_mutation_transaction_at_epoch(
-            &state_path,
-            &credential_file,
-            pending_epoch,
-            |_| {
-                called.set(true);
-                Ok(())
-            },
-        )
-        .expect_err("a same-valued epoch from a different credential directory must be rejected");
-
-        assert!(error.to_string().contains("credential state changed"));
-        assert!(!called.get());
+        assert!(
+            error
+                .to_string()
+                .contains("BBDown credential path must not resolve through a symbolic link")
+        );
+        assert!(
+            !auth_mutation_lock_path(&first_parent.join("credentials.json")).exists(),
+            "rejected credential paths must not create the first target's lock"
+        );
+        assert!(
+            !auth_mutation_lock_path(&second_parent.join("credentials.json")).exists(),
+            "rejected credential paths must not create another target's lock"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

@@ -68,7 +68,9 @@ impl CredentialRuntime {
         credential_profile: Option<&str>,
     ) -> Result<Self> {
         Ok(Self {
-            store: CredentialStore::new(credential_file),
+            store: CredentialStore::new(crate::bilibili_auth::validated_credential_store_path(
+                &credential_file,
+            )?),
             selection: credential_profile_selection(credential_profile)?,
         })
     }
@@ -858,6 +860,36 @@ mod tests {
             Some("SESSDATA=selected")
         );
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_runtime_rejects_replaceable_store_ancestry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "telegram-video-downloader-runtime-credential-ancestry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let shared_parent = root.join("shared");
+        let credential_file = shared_parent.join("credentials").join("credentials.json");
+        std::fs::create_dir_all(
+            credential_file
+                .parent()
+                .expect("credential file should have a parent"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shared_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = CredentialRuntime::from_credential_file(credential_file, None)
+            .expect_err("runtime must reject a credential store another user can replace");
+
+        assert!(format!("{error:#}").contains("permits another user to replace credentials"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
