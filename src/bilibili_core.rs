@@ -51,7 +51,7 @@ const LEGACY_ENDPOINT_BASE_FLAGS: &[&str] = &[
 
 #[derive(Clone, Debug)]
 pub struct CredentialRuntime {
-    store: CredentialStore,
+    credential_file: PathBuf,
     selection: CredentialProfileSelection,
 }
 
@@ -67,23 +67,28 @@ impl CredentialRuntime {
         credential_file: PathBuf,
         credential_profile: Option<&str>,
     ) -> Result<Self> {
+        crate::bilibili_auth::validated_credential_store_path(&credential_file)?;
         Ok(Self {
-            store: CredentialStore::new(crate::bilibili_auth::validated_credential_store_path(
-                &credential_file,
-            )?),
+            credential_file,
             selection: credential_profile_selection(credential_profile)?,
         })
     }
 
+    fn store(&self) -> Result<CredentialStore> {
+        Ok(CredentialStore::new(
+            crate::bilibili_auth::validated_credential_store_path(&self.credential_file)?,
+        ))
+    }
+
     pub fn load(&self) -> Result<Credentials> {
-        self.store
+        self.store()?
             .load_selected_profile(&self.selection)
             .context("failed to load BBDown credentials")
     }
 
     pub fn save_merged(&self, credentials: Credentials) -> Result<CredentialSource> {
         let stored = self
-            .store
+            .store()?
             .update_selected_profile(&self.selection, |mut stored| {
                 merge_credentials(&mut stored, credentials);
                 Ok(stored)
@@ -93,7 +98,7 @@ impl CredentialRuntime {
     }
 
     pub fn logout(&self) -> Result<()> {
-        self.store
+        self.store()?
             .update_profiles(|profiles| {
                 let profile = self
                     .selection
@@ -892,6 +897,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn credential_runtime_revalidates_existing_store_leaf_before_each_core_call() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "telegram-video-downloader-runtime-credential-leaf-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let credential_file = directory.join("credentials.json");
+        let store = CredentialStore::new(credential_file.clone());
+        let mut profiles = bbdown_core::CredentialProfiles::default();
+        profiles
+            .set_profile(
+                "default",
+                Credentials::default().with_cookie("SESSDATA=default"),
+            )
+            .unwrap();
+        store.save_profiles(&profiles).unwrap();
+        std::fs::set_permissions(&credential_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let runtime = CredentialRuntime::from_credential_file(credential_file.clone(), None)
+            .expect("private credential file should initialize a runtime");
+
+        std::fs::set_permissions(&credential_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mode_error = runtime
+            .load()
+            .expect_err("runtime must reject a credential leaf with group-readable permissions");
+        assert!(format!("{mode_error:#}").contains("current-user-owned private single-link"));
+
+        std::fs::set_permissions(&credential_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let alias = directory.join("credentials.alias.json");
+        std::fs::hard_link(&credential_file, &alias).unwrap();
+        let link_error = runtime
+            .load()
+            .expect_err("runtime must reject a credential leaf with another hard link");
+        assert!(format!("{link_error:#}").contains("current-user-owned private single-link"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
     #[test]
     fn maps_router_selection_to_core_selection() {
         assert_eq!(
@@ -1072,10 +1123,7 @@ mod tests {
         profiles.set_default_profile("current").unwrap();
         store.save_profiles(&profiles).unwrap();
 
-        let runtime = CredentialRuntime {
-            store: store.clone(),
-            selection: CredentialProfileSelection::Default,
-        };
+        let runtime = CredentialRuntime::from_credential_file(credential_file, None).unwrap();
         runtime.logout().unwrap();
 
         let loaded = store.load_profiles().unwrap();

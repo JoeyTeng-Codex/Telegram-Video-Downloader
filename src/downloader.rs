@@ -5911,8 +5911,7 @@ async fn run_command_with_execution_context_and_additional_fds(
     let total_timeout = Duration::from_secs(config.bot.command_timeout_seconds);
     let idle_timeout = Duration::from_secs(config.bot.command_idle_timeout_seconds);
     let started_at = Instant::now();
-    let total_deadline = matches!(policy.total_deadline, CommandTotalDeadline::Configured)
-        .then_some(started_at + total_timeout);
+    let total_deadline_enabled = matches!(policy.total_deadline, CommandTotalDeadline::Configured);
     let idle_deadline_enabled = matches!(policy.idle_deadline, CommandIdleDeadline::Configured);
     let mut last_activity_at = started_at;
     let progress_interval = Duration::from_secs(config.bot.progress_update_seconds);
@@ -5927,7 +5926,6 @@ async fn run_command_with_execution_context_and_additional_fds(
 
     let mut output_closed = false;
     let status = loop {
-        let idle_deadline = idle_deadline_enabled.then_some(last_activity_at + idle_timeout);
         tokio::select! {
             maybe_chunk = chunk_rx.recv(), if !output_closed => {
                 match maybe_chunk {
@@ -5942,12 +5940,7 @@ async fn run_command_with_execution_context_and_additional_fds(
                 break wait_result
                     .with_context(|| format!("failed to wait for {}", spec.program.display()))?;
             }
-            _ = async {
-                match total_deadline {
-                    Some(deadline) => sleep_until(deadline).await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => {
+            _ = wait_for_configured_deadline(total_deadline_enabled, started_at, total_timeout) => {
                 terminate_command_tree(&mut child, process_group).await;
                 let (stdout, stderr) =
                     collect_stream_outputs(
@@ -5964,12 +5957,7 @@ async fn run_command_with_execution_context_and_additional_fds(
                     summarize_output(&String::from_utf8_lossy(&stdout), &String::from_utf8_lossy(&stderr))
                 );
             }
-            _ = async {
-                match idle_deadline {
-                    Some(deadline) => sleep_until(deadline).await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => {
+            _ = wait_for_configured_deadline(idle_deadline_enabled, last_activity_at, idle_timeout) => {
                 terminate_command_tree(&mut child, process_group).await;
                 let (stdout, stderr) =
                     collect_stream_outputs(
@@ -6046,6 +6034,21 @@ async fn run_command_with_execution_context_and_additional_fds(
         stdout,
         stderr,
     })
+}
+
+async fn wait_for_configured_deadline(enabled: bool, started_at: Instant, timeout: Duration) {
+    if !enabled {
+        std::future::pending::<()>().await;
+    }
+
+    // Disabled workers can carry intentionally unbounded configuration values. Do not construct
+    // an Instant deadline unless the policy enables it, and treat an unrepresentable future
+    // deadline as effectively unbounded instead of overflowing.
+    let remaining = timeout.saturating_sub(started_at.elapsed());
+    match Instant::now().checked_add(remaining) {
+        Some(deadline) => sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 #[cfg(unix)]
@@ -19728,6 +19731,42 @@ mv video.original video.m4s || exit 46
             CommandExecutionPolicy::BILIBILI_WORKER.idle_deadline,
             CommandIdleDeadline::Disabled
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bilibili_worker_policy_skips_disabled_deadline_arithmetic() {
+        let root = temp_test_dir("bilibili-worker-disabled-deadline-arithmetic");
+        let mut config = test_config();
+        config.bot.command_timeout_seconds = u64::MAX;
+        config.bot.command_idle_timeout_seconds = u64::MAX;
+        let spec = CommandSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".to_string(), "printf finished".to_string()],
+            cwd: root.clone(),
+            activity_dir: None,
+            cleanup_paths: Vec::new(),
+            inherited_fd_base: None,
+        };
+
+        let output = tokio_timeout(
+            Duration::from_secs(2),
+            run_command_with_execution_context(
+                &config,
+                &spec,
+                None,
+                &[],
+                None,
+                CommandExecutionPolicy::BILIBILI_WORKER,
+            ),
+        )
+        .await
+        .expect("disabled worker deadlines should not overflow")
+        .expect("disabled worker command should succeed");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"finished");
         let _ = fs::remove_dir_all(root);
     }
 

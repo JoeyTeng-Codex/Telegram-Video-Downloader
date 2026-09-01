@@ -191,7 +191,56 @@ impl AuthCredentialFilePath {
 }
 
 pub fn validated_credential_store_path(credential_file: &Path) -> Result<PathBuf> {
-    bind_auth_credential_file(credential_file)?.store_path()
+    let credential_file = bind_auth_credential_file(credential_file)?;
+    let store_path = credential_file.store_path()?;
+    validate_existing_credential_store_file(&store_path)?;
+    Ok(store_path)
+}
+
+fn validate_existing_credential_store_file(store_path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = store_path
+            .parent()
+            .context("BBDown credential file has no parent directory")?;
+        let root = RootedFs::new(parent).with_context(|| {
+            format!(
+                "failed to bind BBDown credential file parent directory {}",
+                parent.display()
+            )
+        })?;
+        let Some(file) = root.open_bound_file(store_path).with_context(|| {
+            format!(
+                "failed to inspect BBDown credential file {}",
+                store_path.display()
+            )
+        })?
+        else {
+            root.validate_configured_root()?;
+            return Ok(());
+        };
+
+        // Protected property: a path-only bbdown-core call must only receive an existing
+        // credential leaf whose access policy limits it to the current user. The bound
+        // descriptor proves the selected regular-file identity; its mode, UID, and link count
+        // establish that policy. The final entry-identity check detects object replacement,
+        // while the validated private parent prevents another UID from winning a missing-leaf
+        // race. Content changes by the current UID remain within the configured account scope.
+        file.validate_private_single_link(0o600).context(
+            "BBDown credential file must be a current-user-owned private single-link file",
+        )?;
+        if root.entry_identity(store_path)? != Some(file.identity()) {
+            bail!(
+                "BBDown credential file identity changed after validation: {}",
+                store_path.display()
+            );
+        }
+    }
+
+    #[cfg(not(unix))]
+    let _ = store_path;
+
+    Ok(())
 }
 
 #[derive(Debug)]
