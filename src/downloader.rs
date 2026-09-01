@@ -5450,6 +5450,7 @@ async fn video_output_lock(
             || mux_recovery.unresolved
             || overwrite_recovery.unresolved;
         incomplete_recovery = quarantine_recovery.incomplete
+            || staging_recovery.incomplete
             || mux_recovery.incomplete
             || overwrite_recovery.incomplete;
         recoveries.extend(quarantine_recovery.messages);
@@ -8033,24 +8034,29 @@ fn is_staging_support_file(staging_dir: &Path, path: &Path) -> bool {
         || path == staging_dir.join(BILIBILI_WORKER_LIFECYCLE_TRANSITION_FILE_NAME)
 }
 
-fn remove_sensitive_staging_support_files(root: &RootedFs, staging_dir: &Path) -> Result<()> {
+fn remove_sensitive_staging_support_files(
+    root: &RootedFs,
+    staging_entry: &BoundEntry,
+    staging_identity: EntryIdentity,
+) -> Result<()> {
+    // Protected property: cleanup may remove only support files from the owned staging directory
+    // selected by recovery. Bind each child through that directory descriptor and require the
+    // original directory identity, so a lexical staging-path replacement cannot redirect unlink.
     for name in ["BBDown.config", BILIBILI_WORKER_REQUEST_FILE_NAME] {
-        let path = staging_dir.join(name);
-        let Some(file) = root.open_bound_file(&path)? else {
+        let entry = root.bind_direct_child_of_bound_directory(
+            staging_entry,
+            staging_identity,
+            std::ffi::OsStr::new(name),
+        )?;
+        let Some(identity) = root.bound_entry_identity(&entry)? else {
             continue;
         };
-        let entry = root.bind_entry(&path, false)?;
-        if root.bound_entry_identity(&entry)? != Some(file.identity()) {
-            bail!(
-                "sensitive staging support file identity changed: {}",
-                path.display()
-            );
-        }
+        let file = root.open_bound_file_if_identity(&entry, identity)?;
         root.remove_bound_file_if_identity(&entry, file.identity())
             .with_context(|| {
                 format!(
                     "failed to remove sensitive staging support file {}",
-                    path.display()
+                    entry.path().display()
                 )
             })?;
     }
@@ -8392,6 +8398,7 @@ fn persist_video_staging_retention_marker(
 struct VideoStagingRecoveryReport {
     messages: Vec<String>,
     unresolved: bool,
+    incomplete: bool,
     blocked_overwrites: BTreeSet<StagedPublicationOverwrite>,
 }
 
@@ -8399,6 +8406,13 @@ struct VideoStagingRecoveryReport {
 struct VideoStagingRecoveryFailure {
     error: anyhow::Error,
     overwrite: Option<StagedPublicationOverwrite>,
+}
+
+#[derive(Debug, Default)]
+struct OwnedVideoStagingRecovery {
+    messages: Vec<String>,
+    unresolved: bool,
+    incomplete: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8473,7 +8487,11 @@ where
         match validate_video_staging_directory(root, &path, identity) {
             Ok(entry) => {
                 match recover_owned_video_staging_directory(root, &path, &entry, identity, hook) {
-                    Ok(messages) => report.messages.extend(messages),
+                    Ok(outcome) => {
+                        report.messages.extend(outcome.messages);
+                        report.unresolved |= outcome.unresolved;
+                        report.incomplete |= outcome.incomplete;
+                    }
                     Err(failure) => {
                         report.unresolved = true;
                         if let Some(overwrite) = failure.overwrite {
@@ -8505,13 +8523,13 @@ fn recover_owned_video_staging_directory<F>(
     entry: &BoundEntry,
     identity: EntryIdentity,
     hook: &mut F,
-) -> std::result::Result<Vec<String>, VideoStagingRecoveryFailure>
+) -> std::result::Result<OwnedVideoStagingRecovery, VideoStagingRecoveryFailure>
 where
     F: FnMut(StagedPublicationDirection, &StagedPublicationStep) -> Result<()>,
 {
     let mut overwrite = None;
-    let result = (|| -> Result<Vec<String>> {
-        remove_sensitive_staging_support_files(root, path)?;
+    let result = (|| -> Result<OwnedVideoStagingRecovery> {
+        remove_sensitive_staging_support_files(root, entry, identity)?;
         let manifest_path = path.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME);
         let Some(manifest_file) = root.open_bound_file(&manifest_path)? else {
             if let Some(reason) = retained_video_staging_reason(root, path, identity)? {
@@ -8545,10 +8563,13 @@ where
                 );
             }
             root.remove_bound_tree_durably_if_identity(entry, identity)?;
-            return Ok(vec![format!(
-                "Discarded interrupted staged video job: {}",
-                path.display()
-            )]);
+            return Ok(OwnedVideoStagingRecovery {
+                messages: vec![format!(
+                    "Discarded interrupted staged video job: {}",
+                    path.display()
+                )],
+                ..OwnedVideoStagingRecovery::default()
+            });
         };
         manifest_file.validate_private_single_link(0o600)?;
         let manifest: StagedPublicationManifest = serde_json::from_slice(
@@ -8576,10 +8597,13 @@ where
             StagedPublicationDirection::RollForward => "Rolled forward",
             StagedPublicationDirection::RollBack => "Rolled back",
         };
-        Ok(vec![format!(
-            "{action} interrupted staged video publication: {}",
-            path.display()
-        )])
+        Ok(OwnedVideoStagingRecovery {
+            messages: vec![format!(
+                "{action} interrupted staged video publication: {}",
+                path.display()
+            )],
+            ..OwnedVideoStagingRecovery::default()
+        })
     })();
     result.map_err(|error| VideoStagingRecoveryFailure { error, overwrite })
 }
@@ -8589,19 +8613,23 @@ fn retain_bilibili_staging_for_manual_recovery(
     path: &Path,
     identity: EntryIdentity,
     message: String,
-) -> Result<Vec<String>> {
+) -> Result<OwnedVideoStagingRecovery> {
     let mux_recovery = recover_pending_bilibili_mux_transactions_locked(root, path)?;
-    if mux_recovery.unresolved {
-        bail!(
-            "retained staged job has unresolved Bilibili mux recovery: {}",
-            mux_recovery.messages.join("; ")
-        );
-    }
     validate_video_staging_directory(root, path, identity)
         .context("retained staged job changed during Bilibili mux recovery")?;
     let mut messages = mux_recovery.messages;
+    if mux_recovery.unresolved {
+        messages.push(format!(
+            "Retained staged video job with unresolved Bilibili mux recovery: {}",
+            path.display()
+        ));
+    }
     messages.push(message);
-    Ok(messages)
+    Ok(OwnedVideoStagingRecovery {
+        messages,
+        unresolved: mux_recovery.unresolved,
+        incomplete: mux_recovery.incomplete,
+    })
 }
 
 fn validate_staged_publication_manifest(
@@ -11363,8 +11391,10 @@ pub fn recover_pending_overwrite_transactions(video_dir: &Path) -> Result<Vec<St
         || staging_recovery.unresolved
         || mux_recovery.unresolved
         || overwrite_recovery.unresolved;
-    let incomplete =
-        quarantine_recovery.incomplete || mux_recovery.incomplete || overwrite_recovery.incomplete;
+    let incomplete = quarantine_recovery.incomplete
+        || staging_recovery.incomplete
+        || mux_recovery.incomplete
+        || overwrite_recovery.incomplete;
     recovery_state.write_state(video_recovery_state_after_scan(unresolved, incomplete))?;
     let mut messages = quarantine_recovery.messages;
     messages.extend(staging_recovery.messages);
@@ -17072,6 +17102,77 @@ mod tests {
                 .is_dir()
         );
         assert!(!nested.join(transaction.file_name().unwrap()).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staging_support_cleanup_does_not_follow_a_replaced_staging_directory() {
+        let root = temp_test_dir("staging-support-cleanup-replacement");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+        let mut staging = create_video_staging_dir(&rooted).expect("staging should create");
+        let staging_path = staging.path().to_path_buf();
+        let original = root.join("original-staging");
+        let config = staging_path.join("BBDown.config");
+        fs::write(&config, "original-sensitive-config")
+            .expect("original support file should write");
+        let entry = staging.entry.clone();
+        let identity = staging.identity;
+
+        fs::rename(&staging_path, &original).expect("owned staging directory should move");
+        fs::create_dir(&staging_path).expect("replacement staging directory should create");
+        let replacement_config = staging_path.join("BBDown.config");
+        fs::write(&replacement_config, "replacement-user-file")
+            .expect("replacement support file should write");
+
+        let error = remove_sensitive_staging_support_files(&rooted, &entry, identity)
+            .expect_err("replaced staging directory must not be cleaned through its lexical path");
+
+        assert!(format!("{error:#}").contains("bound directory identity changed"));
+        assert_eq!(
+            fs::read_to_string(&replacement_config).expect("replacement file should remain"),
+            "replacement-user-file"
+        );
+        assert_eq!(
+            fs::read_to_string(original.join("BBDown.config"))
+                .expect("original support file should remain"),
+            "original-sensitive-config"
+        );
+        staging.removed = true;
+        drop(staging);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_staging_propagates_incomplete_nested_mux_recovery() {
+        let root = temp_test_dir("retained-staging-incomplete-mux-recovery");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+        let staging = create_video_staging_dir(&rooted).expect("staging should create");
+        staging
+            .retain_for_manual_recovery(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)
+            .expect("completed staging marker should persist");
+        let unreadable = staging.path().join("nested-unreadable");
+        fs::create_dir(&unreadable).expect("nested directory should create");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+            .expect("nested directory should become unreadable");
+        let staging_path = staging.path().to_path_buf();
+        drop(staging);
+
+        let report = recover_pending_overwrite_transactions(&root)
+            .expect("nested recovery scan should return diagnostics");
+
+        assert!(staging_path.is_dir());
+        assert!(report.iter().any(|line| {
+            line.contains("Skipped unreadable directory during Bilibili mux recovery scan")
+        }));
+        let (state, _) =
+            video_recovery_state_file(&rooted).expect("recovery state should remain readable");
+        assert!(
+            video_recovery_state_is_incomplete(&state)
+                .expect("recovery state should mark nested scan incomplete")
+        );
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700))
+            .expect("nested directory should become removable");
         let _ = fs::remove_dir_all(root);
     }
 

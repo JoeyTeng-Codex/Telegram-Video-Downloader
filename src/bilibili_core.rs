@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -146,9 +147,181 @@ pub fn output_dir(config: &AppConfig) -> PathBuf {
     config.downloads.video_dir.clone()
 }
 
+pub(crate) fn validate_legacy_direct_api_config(config: &AppConfig) -> Result<()> {
+    validate_legacy_bilibili_args(
+        &config.bilibili.extra_args,
+        "bilibili.extra_args",
+        true,
+        true,
+    )?;
+    validate_legacy_bilibili_args(
+        &config.bilibili.global_args,
+        "bilibili.global_args",
+        false,
+        true,
+    )?;
+    validate_legacy_bilibili_args(
+        &config.bilibili.download_args,
+        "bilibili.download_args",
+        true,
+        false,
+    )?;
+    if !config.bilibili.plan_args.is_empty() {
+        bail!(
+            "bilibili.plan_args is not supported by the direct bbdown-core downloader; migrate to structured bilibili settings"
+        );
+    }
+
+    let implicit_config = config.downloads.video_dir.join("BBDown.config");
+    match fs::symlink_metadata(&implicit_config) {
+        Ok(_) => bail!(
+            "legacy BBDown config {} is not supported by the direct bbdown-core downloader; migrate its settings to config.toml or remove the file",
+            implicit_config.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect legacy BBDown config {}",
+                implicit_config.display()
+            )
+        }),
+    }
+}
+
+fn validate_legacy_bilibili_args(
+    args: &[String],
+    setting: &str,
+    allow_download_modes: bool,
+    allow_global_options: bool,
+) -> Result<()> {
+    const GLOBAL_VALUE_FLAGS: &[&str] = &[
+        "--api-base",
+        "--pgc-base",
+        "--intl-base",
+        "--comment-base",
+        "--passport-base",
+        "--tv-api-base",
+        "--tv-passport-base",
+        "--tv-passport-poll-base",
+        "--app-grpc-base",
+        "--app-pgc-grpc-base",
+        "--playurl-mode",
+        "--restricted-area",
+        "--restricted-area-proxy",
+        "--restricted-api-proxy",
+        "--request-timeout-seconds",
+    ];
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if allow_global_options
+            && let Some(flag) = GLOBAL_VALUE_FLAGS
+                .iter()
+                .copied()
+                .find(|flag| legacy_arg_matches_value_flag(arg, flag))
+        {
+            index = consume_legacy_value_arg(args, index, flag, setting)?;
+            continue;
+        }
+        if allow_download_modes && legacy_arg_matches_value_flag(arg, "--only") {
+            let next = consume_legacy_value_arg(args, index, "--only", setting)?;
+            let value = legacy_arg_value(args, index, "--only")?;
+            parse_download_mode(value)
+                .with_context(|| format!("invalid legacy Bilibili download mode in {setting}"))?;
+            index = next;
+            continue;
+        }
+        if allow_download_modes
+            && ["--audio-only", "--video-only"]
+                .iter()
+                .any(|flag| legacy_arg_matches_boolean_flag(arg, flag))
+        {
+            index = consume_legacy_boolean_arg(args, index, setting)?;
+            continue;
+        }
+        bail!(
+            "unsupported legacy BBDown option {} in {setting}; migrate it to a direct bbdown-core setting before starting the bot",
+            legacy_arg_label(arg)
+        );
+    }
+    Ok(())
+}
+
+fn legacy_arg_matches_value_flag(arg: &str, flag: &str) -> bool {
+    arg == flag
+        || arg
+            .strip_prefix(flag)
+            .is_some_and(|suffix| suffix.starts_with('='))
+}
+
+fn legacy_arg_matches_boolean_flag(arg: &str, flag: &str) -> bool {
+    arg == flag
+        || arg
+            .strip_prefix(flag)
+            .is_some_and(|suffix| suffix.starts_with('=') || suffix.starts_with(':'))
+}
+
+fn consume_legacy_value_arg(
+    args: &[String],
+    index: usize,
+    flag: &str,
+    setting: &str,
+) -> Result<usize> {
+    let value = legacy_arg_value(args, index, flag)?;
+    ensure!(
+        !value.trim().is_empty(),
+        "legacy BBDown option {flag} in {setting} requires a non-empty value"
+    );
+    Ok(if args[index] == flag {
+        index + 2
+    } else {
+        index + 1
+    })
+}
+
+fn legacy_arg_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str> {
+    let arg = &args[index];
+    if arg == flag {
+        return args
+            .get(index + 1)
+            .map(String::as_str)
+            .with_context(|| format!("legacy BBDown option {flag} requires a value"));
+    }
+    arg.strip_prefix(flag)
+        .and_then(|suffix| suffix.strip_prefix('='))
+        .with_context(|| format!("invalid legacy BBDown option {flag}"))
+}
+
+fn consume_legacy_boolean_arg(args: &[String], index: usize, setting: &str) -> Result<usize> {
+    if args[index].starts_with("--audio-only") || args[index].starts_with("--video-only") {
+        if (args[index] == "--audio-only" || args[index] == "--video-only")
+            && args
+                .get(index + 1)
+                .is_some_and(|value| parse_bool_token(value).is_some())
+        {
+            return Ok(index + 2);
+        }
+        if let Some(value) = args[index].split_once(['=', ':']).map(|(_, value)| value) {
+            ensure!(
+                parse_bool_token(value).is_some(),
+                "legacy BBDown boolean option {} in {setting} must be true, false, 1, or 0",
+                legacy_arg_label(&args[index])
+            );
+        }
+        return Ok(index + 1);
+    }
+    Ok(index + 1)
+}
+
+fn legacy_arg_label(arg: &str) -> &str {
+    arg.split(['=', ':']).next().unwrap_or("<value>")
+}
+
 pub fn download_mode_from_config(config: &AppConfig) -> Result<DownloadMode> {
     let mut args = legacy_bilibili_extra_args_for_direct_api(&config.bilibili.extra_args);
-    args.extend(config.bilibili.download_args.clone());
+    args.extend(legacy_bilibili_extra_args_for_direct_api(
+        &config.bilibili.download_args,
+    ));
     let mut mode = DownloadMode::All;
     let mut index = 0;
     while index < args.len() {

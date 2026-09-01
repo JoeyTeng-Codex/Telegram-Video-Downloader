@@ -917,7 +917,7 @@ where
                 sync_legacy(transaction)?;
                 ensure_bbdown_login_active(auth_generation)?;
                 let summary = bilibili_core::CredentialRuntime::from_credential_file(
-                    transaction.credential_file().to_path_buf(),
+                    transaction.credential_file()?,
                     credential_profile.as_deref(),
                 )?
                 .save_merged(credentials)?;
@@ -1491,7 +1491,7 @@ async fn run_bbdown_logout(telegram: TelegramClient, config: Arc<AppConfig>, cha
                 &credential_file,
                 |transaction| {
                     bilibili_core::CredentialRuntime::from_credential_file(
-                        transaction.credential_file().to_path_buf(),
+                        transaction.credential_file()?,
                         credential_profile.as_deref(),
                     )
                     .and_then(|runtime| runtime.logout())

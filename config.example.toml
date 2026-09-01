@@ -25,9 +25,10 @@ write_nfo = true
 keep_sidecars = true
 
 [bilibili]
-# Legacy CLI passthrough fields are kept for config compatibility.
-# Direct bbdown-core integration reads supported global flags from extra_args, with
-# global_args and the structured fields below taking precedence for single values.
+# Legacy CLI fields accept only mapped bbdown-core options. Unsupported values, non-empty
+# plan_args, and a BBDown.config file in video_dir fail startup instead of being ignored.
+# Direct bbdown-core integration reads supported global flags from extra_args, with global_args
+# and the structured fields below taking precedence for single values.
 extra_args = []
 global_args = []
 plan_args = []

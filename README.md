@@ -44,7 +44,7 @@ Bilibili 下载和登录不需要本机 `bbdown` 可执行文件；项目直接�
 
 staging 下载成功后会先持久化身份绑定的 `.retained.json`；Bilibili worker 会在向父进程报告成功前完成这一步。随后发布流程在写入 `.publication.json` 前 `fsync` 每个源文件，再从最深层源目录逐级同步到任务 staging 根目录；发布所需的最终目录也会通过绑定父目录逐层创建并立即持久化。正常发布完成会连同 staging 一起删除完成标记。若一次已完成下载超过 4096 个发布文件，或 recovery manifest 超过 512 KiB，bot 不会删除耗时下载得到的产物，而是保留该标记并返回人工恢复路径。后续启动恢复会校验并保留该目录，把它记录为不需重试的终态，因此不会误删产物或让全局恢复状态长期保持 dirty。
 
-区域受限或 intl 番剧可以配置 `playurl_mode`、`restricted_area`、`restricted_area_proxies`、`restricted_api_proxies`。为兼容旧配置，`bilibili.extra_args` 和 `bilibili.global_args` 里的已知 BBDown-rust 全局项也会被 direct API 读取：endpoint base、`--playurl-mode`、`--restricted-area`、restricted proxy 和 `--request-timeout-seconds`。单值参数按 `extra_args`、`global_args`、结构化字段的顺序覆盖；restricted proxy 参数保持累加。`bilibili.plan_args` 不再用于主路径；`bilibili.download_args` 仅保留 `--only audio|video|subtitle|danmaku|cover` 这类下载模式迁移。
+区域受限或 intl 番剧可以配置 `playurl_mode`、`restricted_area`、`restricted_area_proxies`、`restricted_api_proxies`。为兼容旧配置，`bilibili.extra_args` 和 `bilibili.global_args` 里的已知 BBDown-rust 全局项也会被 direct API 读取：endpoint base、`--playurl-mode`、`--restricted-area`、restricted proxy 和 `--request-timeout-seconds`。单值参数按 `extra_args`、`global_args`、结构化字段的顺序覆盖；restricted proxy 参数保持累加。`bilibili.download_args` 仅保留 `--only audio|video|subtitle|danmaku|cover` 和 `--audio-only`/`--video-only` 这类下载模式迁移。其余旧 CLI 参数、任何非空 `bilibili.plan_args`，以及 `video_dir/BBDown.config` 都会在启动时明确报错，必须迁移到结构化 `config.toml` 设置后再运行，避免 direct API 静默忽略旧行为。
 
 `bilibili.danmaku.enabled = true` 时，bot 会让 `bbdown-core` 写出配置里的弹幕格式，默认是 `.xml` 和 `.ass` sidecar，并让它们跟随 staging、覆盖和两者并存流程移动。后续会接入 `bbdown-core` 的 danmaku update API，用于只更新已有视频的弹幕 sidecar；暂时不做 PGO/PGS 图形字幕预渲染。
 

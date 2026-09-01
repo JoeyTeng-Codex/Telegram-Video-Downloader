@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashSet;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
@@ -152,12 +152,34 @@ struct AuthMutationLockOwner {
 
 #[derive(Debug)]
 struct AuthCredentialFilePath {
-    path: PathBuf,
+    control_path: PathBuf,
+    #[cfg(unix)]
+    _parent: File,
+    #[cfg(unix)]
+    leaf: OsString,
 }
 
 impl AuthCredentialFilePath {
-    fn path(&self) -> &Path {
-        &self.path
+    fn control_path(&self) -> &Path {
+        &self.control_path
+    }
+
+    fn store_path(&self) -> Result<PathBuf> {
+        // Protected property: each bbdown-core pathname handoff must begin in the directory
+        // object selected before the auth lock. On macOS, F_GETPATH gives the current name of
+        // the held descriptor; reopening it with O_NOFOLLOW and comparing device/inode accepts
+        // a benign rename while rejecting a replacement before the path-only core call starts.
+        // This is an operation-boundary check, not continuous protection after that handoff.
+        #[cfg(target_os = "macos")]
+        {
+            Ok(macos_path_for_open_directory(&self._parent)?.join(&self.leaf))
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            Ok(auth_descriptor_relative_path(&self._parent, &self.leaf))
+        }
+        #[cfg(not(unix))]
+        Ok(self.control_path.clone())
     }
 }
 
@@ -226,7 +248,8 @@ impl AuthReplyFileLock {
 
 pub struct LockedAuthMutation<'a> {
     state: Option<&'a BoundAuthStatePath>,
-    credential_file: &'a Path,
+    credential_file: &'a AuthCredentialFilePath,
+    credential_control_path: &'a Path,
     _lock: &'a AuthMutationFileLock,
     epoch: AuthEpoch,
 }
@@ -235,23 +258,24 @@ pub type AuthCleanupResult = (Result<bool>, Result<()>);
 
 impl LockedAuthMutation<'_> {
     pub fn sync_legacy_cookie(&self, credential_profile: Option<&str>) -> Result<bool> {
+        let credential_file = self.credential_file.store_path()?;
         sync_bbdown_rust_credentials_from_state_unlocked(
             self.state,
-            self.credential_file,
+            &credential_file,
             credential_profile,
         )
     }
 
     pub fn delete_legacy_state(&self) -> Result<bool> {
-        delete_auth_state_unlocked(self.state, self.credential_file)
+        delete_auth_state_unlocked(self.state, self.credential_control_path)
     }
 
     pub fn epoch(&self) -> AuthEpoch {
         self.epoch
     }
 
-    pub fn credential_file(&self) -> &Path {
-        self.credential_file
+    pub fn credential_file(&self) -> Result<PathBuf> {
+        self.credential_file.store_path()
     }
 }
 
@@ -686,7 +710,11 @@ impl AuthMutationFileLock {
     }
 
     fn credential_file(&self) -> &Path {
-        self.credential_file.path()
+        self.credential_file.control_path()
+    }
+
+    fn credential_store_path(&self) -> Result<PathBuf> {
+        self.credential_file.store_path()
     }
 }
 
@@ -1222,10 +1250,11 @@ fn acquire_auth_mutation_file_lock(
 ) -> Result<AuthMutationFileLock> {
     let configured_credential_file = credential_file;
     let credential_file = bind_auth_credential_file(credential_file)?;
-    let [lock_path, anchor_path, owner_path] = auth_mutation_control_paths(credential_file.path());
+    let [lock_path, anchor_path, owner_path] =
+        auth_mutation_control_paths(credential_file.control_path());
     let protected_paths = normalize_auth_protected_paths(
         configured_credential_file,
-        credential_file.path(),
+        credential_file.control_path(),
         protected_paths,
     )?;
     validate_auth_control_paths_are_distinct(
@@ -1291,13 +1320,85 @@ fn bind_auth_credential_file(credential_file: &Path) -> Result<AuthCredentialFil
             parent.display()
         )
     })?;
-    let parent = canonical_non_symlink_directory(parent, "BBDown credential directory")?;
+    let parent_path = canonical_non_symlink_directory(parent, "BBDown credential directory")?;
     let leaf = credential_file
         .file_name()
         .context("BBDown credential file has no file name")?;
+    #[cfg(unix)]
+    {
+        let parent = open_auth_credential_directory(&parent_path)?;
+        let control_path = parent_path.join(leaf);
+        Ok(AuthCredentialFilePath {
+            control_path,
+            _parent: parent,
+            leaf: leaf.to_os_string(),
+        })
+    }
+    #[cfg(not(unix))]
     Ok(AuthCredentialFilePath {
-        path: parent.join(leaf),
+        control_path: parent_path.join(leaf),
     })
+}
+
+#[cfg(unix)]
+fn open_auth_credential_directory(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    let directory = options.open(path).with_context(|| {
+        format!(
+            "failed to open BBDown credential directory {}",
+            path.display()
+        )
+    })?;
+    if !directory
+        .metadata()
+        .context("failed to inspect opened BBDown credential directory")?
+        .is_dir()
+    {
+        bail!(
+            "BBDown credential directory is not a directory: {}",
+            path.display()
+        );
+    }
+    Ok(directory)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn auth_descriptor_relative_path(directory: &File, leaf: &OsStr) -> PathBuf {
+    use std::os::fd::AsRawFd;
+
+    // Linux exposes descriptor-relative child paths through /dev/fd. Darwin does not support
+    // child lookup below /dev/fd descriptors, so it uses F_GETPATH below instead.
+    let fd_parent = Path::new("/dev/fd").join(directory.as_raw_fd().to_string());
+    fd_parent.join(leaf)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_path_for_open_directory(directory: &File) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let path = rustix::fs::getpath(directory)
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+        .context("failed to resolve the held BBDown credential directory")?;
+    let path = PathBuf::from(OsString::from_vec(path.as_bytes().to_vec()));
+    let reopened = open_auth_credential_directory(&path)?;
+    let expected = directory
+        .metadata()
+        .context("failed to inspect held BBDown credential directory")?;
+    let actual = reopened
+        .metadata()
+        .context("failed to inspect BBDown credential directory resolved from its descriptor")?;
+    if expected.dev() != actual.dev() || expected.ino() != actual.ino() {
+        bail!(
+            "BBDown credential directory identity changed while resolving its descriptor-backed path"
+        );
+    }
+    Ok(path)
 }
 
 fn canonical_non_symlink_directory(path: &Path, label: &str) -> Result<PathBuf> {
@@ -1637,7 +1738,8 @@ fn with_auth_mutation_transaction_inner<T>(
         let epoch = lock.bump_epoch()?;
         let transaction = LockedAuthMutation {
             state: state.as_ref(),
-            credential_file: lock.credential_file(),
+            credential_file: &lock.credential_file,
+            credential_control_path: lock.credential_file(),
             _lock: lock,
             epoch,
         };
@@ -2272,7 +2374,7 @@ fn sync_bbdown_rust_credentials_from_state_with_epoch_and_hooks(
             state.as_ref(),
             lock.credential_file(),
         )?;
-        let credential_file = lock.credential_file();
+        let credential_file = lock.credential_store_path()?;
         let current_epoch = lock.current_epoch()?;
         let cookie = match legacy_cookie_from_state_unlocked(state.as_ref()) {
             Ok(Some(cookie)) => cookie,
@@ -2280,7 +2382,7 @@ fn sync_bbdown_rust_credentials_from_state_with_epoch_and_hooks(
             Err(err) => return Ok((Err(err), current_epoch)),
         };
         let update_needed = match bbdown_rust_cookie_update_needed_unlocked(
-            credential_file,
+            &credential_file,
             credential_profile,
             Some(&cookie),
             false,
@@ -2297,7 +2399,7 @@ fn sync_bbdown_rust_credentials_from_state_with_epoch_and_hooks(
         after_legacy_read();
         let epoch = lock.bump_epoch()?;
         let result = update_bbdown_rust_cookie_unlocked(
-            credential_file,
+            &credential_file,
             credential_profile,
             Some(&cookie),
             false,
@@ -2369,11 +2471,11 @@ pub fn clear_bbdown_rust_cookie(
 ) -> Result<bool> {
     with_auth_mutation_lock(credential_file, &[credential_file], |lock| {
         lock.bump_epoch()?;
-        let credential_file = lock.credential_file();
+        let credential_file = lock.credential_store_path()?;
         if !credential_file.exists() {
             return Ok(false);
         }
-        update_bbdown_rust_cookie_unlocked(credential_file, credential_profile, None, true)
+        update_bbdown_rust_cookie_unlocked(&credential_file, credential_profile, None, true)
     })
 }
 
@@ -4134,6 +4236,52 @@ mod tests {
             assert!(!called.get());
             assert!(!auth_mutation_lock_path(&credential_file).exists());
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_mutation_keeps_credential_store_in_the_bound_parent_after_replacement() {
+        let state_path = temp_state_file("auth-credential-parent-replacement");
+        let root = state_path
+            .parent()
+            .expect("state path should have a parent")
+            .to_path_buf();
+        let credential_parent = root.join("credentials");
+        let moved_parent = root.join("credentials-original");
+        let credential_file = credential_parent.join("credentials.json");
+        fs::create_dir_all(&credential_parent).expect("credential parent should create");
+
+        with_auth_mutation_transaction(&state_path, &credential_file, |transaction| {
+            fs::rename(&credential_parent, &moved_parent)
+                .expect("bound credential parent should move");
+            fs::create_dir(&credential_parent)
+                .expect("replacement credential parent should create");
+            CredentialStore::new(transaction.credential_file()?)
+                .update_selected_profile(
+                    &CredentialProfileSelection::default_profile(),
+                    |mut credentials| {
+                        credentials.cookie = Some("SESSDATA=bound-parent".to_string());
+                        Ok(credentials)
+                    },
+                )
+                .expect("descriptor-backed credential mutation should save");
+            Ok(())
+        })
+        .expect("auth transaction should keep using the original credential directory");
+
+        assert_eq!(
+            CredentialStore::new(moved_parent.join("credentials.json"))
+                .load()
+                .expect("original credential store should load")
+                .cookie
+                .as_deref(),
+            Some("SESSDATA=bound-parent")
+        );
+        assert!(
+            !credential_file.exists(),
+            "replacement credential directory must remain untouched"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

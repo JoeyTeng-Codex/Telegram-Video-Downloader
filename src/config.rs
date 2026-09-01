@@ -281,6 +281,7 @@ impl AppConfig {
                 bail!("bilibili.danmaku_formats entries must be xml or ass");
             }
         }
+        crate::bilibili_core::validate_legacy_direct_api_config(self)?;
         Ok(())
     }
 }
@@ -849,8 +850,8 @@ mod tests {
     }
 
     #[test]
-    fn preserves_explicit_bilibili_multi_thread_setting() {
-        let config = AppConfig::from_toml_str(
+    fn rejects_unmapped_legacy_bilibili_options_before_startup() {
+        let error = AppConfig::from_toml_str(
             r#"
             [telegram]
             token = "token"
@@ -861,12 +862,86 @@ mod tests {
             "#,
             PathBuf::from("/tmp/project"),
         )
-        .expect("config should parse");
+        .expect_err("unmapped BBDown options must fail before the bot starts");
+
+        assert!(
+            format!("{error:#}").contains("--video-ascending"),
+            "error should identify the unsupported option without showing a following value"
+        );
+    }
+
+    #[test]
+    fn accepts_mapped_legacy_bilibili_options() {
+        let root = temp_test_dir("mapped-legacy-bilibili-options");
+        fs::create_dir_all(&root).expect("test root should create");
+        let config_toml = format!(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [downloads]
+            video_dir = "{}"
+
+            [bilibili]
+            extra_args = ["--api-base", "https://api.example.test", "--audio-only"]
+            global_args = ["--request-timeout-seconds=45"]
+            download_args = ["--only", "subtitle"]
+            "#,
+            root.join("videos").display(),
+        );
+        let config = AppConfig::from_toml_str(&config_toml, root.clone())
+            .expect("mapped BBDown options should remain supported");
 
         assert_eq!(
             config.bilibili.extra_args,
-            vec!["--video-ascending", "--skip-mux", "--multi-thread", "true"]
+            vec!["--api-base", "https://api.example.test", "--audio-only"]
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_ignored_legacy_download_args_before_startup() {
+        let error = AppConfig::from_toml_str(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [bilibili]
+            download_args = ["--api-base", "https://api.example.test"]
+            "#,
+            PathBuf::from("/tmp/project"),
+        )
+        .expect_err("download_args must not silently accept ignored global options");
+
+        assert!(format!("{error:#}").contains("--api-base"));
+    }
+
+    #[test]
+    fn rejects_implicit_legacy_bbdown_config_before_startup() {
+        let root = temp_test_dir("implicit-legacy-bbdown-config");
+        let video_dir = root.join("videos");
+        fs::create_dir_all(&video_dir).expect("video directory should create");
+        fs::write(video_dir.join("BBDown.config"), "--multi-thread true\n")
+            .expect("legacy BBDown config should write");
+        let config = format!(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [downloads]
+            video_dir = "{}"
+            "#,
+            video_dir.display()
+        );
+
+        let error = AppConfig::from_toml_str(&config, root.clone())
+            .expect_err("implicit BBDown config must not be silently ignored");
+
+        assert!(format!("{error:#}").contains("legacy BBDown config"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
