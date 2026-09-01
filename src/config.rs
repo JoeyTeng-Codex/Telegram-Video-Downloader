@@ -281,6 +281,7 @@ impl AppConfig {
                 bail!("bilibili.danmaku_formats entries must be xml or ass");
             }
         }
+        crate::bilibili_core::validate_structured_restricted_proxy_config(self)?;
         crate::bilibili_core::validate_legacy_direct_api_config(self)?;
         Ok(())
     }
@@ -938,6 +939,43 @@ mod tests {
             assert!(
                 format!("{error:#}").contains(expected),
                 "error for {argument} should mention {expected}: {error:#}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_invalid_structured_restricted_proxy_values_before_startup() {
+        let root = temp_test_dir("invalid-structured-restricted-proxy-values");
+        fs::create_dir_all(&root).expect("test root should create");
+
+        for setting in ["restricted_area_proxies", "restricted_api_proxies"] {
+            let config_toml = format!(
+                r#"
+                [telegram]
+                token = "token"
+                allow_all_chats = true
+
+                [downloads]
+                video_dir = "{}"
+
+                [bilibili]
+                {setting} = ["ftp://proxy.example.test"]
+                "#,
+                root.join("videos").display(),
+            );
+            let error = AppConfig::from_toml_str(&config_toml, root.clone())
+                .expect_err("invalid structured proxy values must fail before the bot starts");
+
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains(setting),
+                "error for {setting} should identify the setting: {rendered}"
+            );
+            assert!(
+                rendered.contains("must use http or https"),
+                "error for {setting} should reject unsupported URL schemes: {rendered}"
             );
         }
 

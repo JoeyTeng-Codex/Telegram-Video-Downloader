@@ -224,6 +224,31 @@ pub(crate) fn validate_legacy_direct_api_config(config: &AppConfig) -> Result<()
     }
 }
 
+pub(crate) fn validate_structured_restricted_proxy_config(config: &AppConfig) -> Result<()> {
+    validate_structured_restricted_proxy_values(
+        &config.bilibili.restricted_area_proxies,
+        RestrictedAreaProxyKind::PlayUrl,
+        "bilibili.restricted_area_proxies",
+    )?;
+    validate_structured_restricted_proxy_values(
+        &config.bilibili.restricted_api_proxies,
+        RestrictedAreaProxyKind::BilibiliApi,
+        "bilibili.restricted_api_proxies",
+    )
+}
+
+fn validate_structured_restricted_proxy_values(
+    values: &[String],
+    kind: RestrictedAreaProxyKind,
+    setting: &str,
+) -> Result<()> {
+    for value in values.iter().filter(|value| !value.trim().is_empty()) {
+        parse_restricted_proxy_spec(value, kind)
+            .with_context(|| format!("invalid Bilibili restricted-area proxy in {setting}"))?;
+    }
+    Ok(())
+}
+
 fn validate_legacy_bilibili_args(
     args: &[String],
     setting: &str,
