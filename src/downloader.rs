@@ -2645,14 +2645,15 @@ fn recover_pending_bilibili_mux_transactions_locked(
 ) -> Result<BilibiliMuxRecoveryReport> {
     let mut directories = Vec::new();
     let mut report = BilibiliMuxRecoveryReport::default();
+    let mut scan_diagnostics = Vec::new();
     collect_bilibili_mux_recovery_directories(
         root,
         video_dir,
         video_dir,
         &mut directories,
-        &mut report.messages,
+        &mut scan_diagnostics,
     )?;
-    report.unresolved = !report.messages.is_empty();
+    report.messages.extend(scan_diagnostics);
     directories.sort();
     for directory in directories {
         match recover_bilibili_mux_transaction(root, &directory) {
@@ -2674,13 +2675,13 @@ fn collect_bilibili_mux_recovery_directories(
     scan_root: &Path,
     directory: &Path,
     recovered: &mut Vec<PathBuf>,
-    issues: &mut Vec<String>,
+    diagnostics: &mut Vec<String>,
 ) -> Result<()> {
     root.validate_configured_root()?;
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(err) if directory != scan_root => {
-            issues.push(format!(
+            diagnostics.push(format!(
                 "Skipped unreadable directory during Bilibili mux recovery scan {}: {err}",
                 directory.display()
             ));
@@ -2699,7 +2700,7 @@ fn collect_bilibili_mux_recovery_directories(
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
-                issues.push(format!(
+                diagnostics.push(format!(
                     "Skipped unreadable entry during Bilibili mux recovery scan {}: {err}",
                     directory.display()
                 ));
@@ -2709,7 +2710,7 @@ fn collect_bilibili_mux_recovery_directories(
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(err) => {
-                issues.push(format!(
+                diagnostics.push(format!(
                     "Skipped uninspectable entry during Bilibili mux recovery scan {}: {err}",
                     entry.path().display()
                 ));
@@ -2732,7 +2733,7 @@ fn collect_bilibili_mux_recovery_directories(
         {
             continue;
         }
-        collect_bilibili_mux_recovery_directories(root, scan_root, &path, recovered, issues)?;
+        collect_bilibili_mux_recovery_directories(root, scan_root, &path, recovered, diagnostics)?;
     }
     root.validate_configured_root()
 }
@@ -10887,14 +10888,15 @@ fn recover_pending_overwrite_transactions_locked(
 ) -> Result<OverwriteRecoveryReport> {
     let mut directories = Vec::new();
     let mut report = OverwriteRecoveryReport::default();
+    let mut scan_diagnostics = Vec::new();
     collect_overwrite_recovery_directories(
         root,
         video_dir,
         video_dir,
         &mut directories,
-        &mut report.messages,
+        &mut scan_diagnostics,
     )?;
-    report.unresolved = !report.messages.is_empty();
+    report.messages.extend(scan_diagnostics);
     directories.sort();
 
     for directory in directories {
@@ -10942,13 +10944,13 @@ fn collect_overwrite_recovery_directories(
     scan_root: &Path,
     directory: &Path,
     recovered: &mut Vec<PathBuf>,
-    issues: &mut Vec<String>,
+    diagnostics: &mut Vec<String>,
 ) -> Result<()> {
     root.validate_configured_root()?;
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(err) if directory != scan_root => {
-            issues.push(format!(
+            diagnostics.push(format!(
                 "Skipped unreadable directory during overwrite recovery scan {}: {err}",
                 directory.display()
             ));
@@ -10967,7 +10969,7 @@ fn collect_overwrite_recovery_directories(
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
-                issues.push(format!(
+                diagnostics.push(format!(
                     "Skipped unreadable entry during overwrite recovery scan {}: {err}",
                     directory.display()
                 ));
@@ -10977,7 +10979,7 @@ fn collect_overwrite_recovery_directories(
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(err) => {
-                issues.push(format!(
+                diagnostics.push(format!(
                     "Skipped uninspectable entry during overwrite recovery scan {}: {err}",
                     entry.path().display()
                 ));
@@ -10997,7 +10999,7 @@ fn collect_overwrite_recovery_directories(
         if name == VIDEO_STAGING_DIR_NAME {
             continue;
         }
-        collect_overwrite_recovery_directories(root, scan_root, &path, recovered, issues)?;
+        collect_overwrite_recovery_directories(root, scan_root, &path, recovered, diagnostics)?;
     }
     root.validate_configured_root()
 }
@@ -15884,8 +15886,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn startup_recovery_skips_an_unreadable_unrelated_directory() {
+    #[tokio::test]
+    async fn startup_recovery_skips_an_unreadable_unrelated_directory_without_dirtying_state() {
         let final_dir = temp_test_dir("overwrite-startup-unreadable-child");
         let unreadable = final_dir.join("unrelated");
         fs::create_dir(&unreadable).expect("unrelated directory should create");
@@ -15901,6 +15903,29 @@ mod tests {
             line.contains("Skipped unreadable directory during overwrite recovery scan")
                 && line.contains("unrelated")
         }));
+        assert!(report.iter().any(|line| {
+            line.contains("Skipped unreadable directory during Bilibili mux recovery scan")
+                && line.contains("unrelated")
+        }));
+        assert!(report.iter().any(|line| {
+            line.contains("Skipped unreadable directory during interrupted-removal scan")
+                && line.contains("unrelated")
+        }));
+        let root = RootedFs::new(&final_dir).expect("output root should reopen");
+        assert!(
+            video_recovery_state_is_clean(
+                &video_recovery_state_file(&root)
+                    .expect("recovery state should reopen")
+                    .0
+            )
+            .expect("recovery state should remain clean")
+        );
+        let (tx, rx) = job_progress_channel();
+        let guard = video_output_lock(&final_dir, "Bilibili download", Some(&tx))
+            .await
+            .expect("clean output lock should acquire without a recursive recovery scan");
+        assert_no_progress(&rx);
+        drop(guard);
         let _ = fs::remove_dir_all(final_dir);
     }
 

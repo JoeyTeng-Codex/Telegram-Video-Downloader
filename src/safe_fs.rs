@@ -1879,7 +1879,6 @@ where
             if is_managed_name {
                 continue;
             }
-            state.unresolved = true;
             state.messages.push(format!(
                 "Skipped disappearing entry during interrupted-removal scan: {}",
                 path.display()
@@ -1944,10 +1943,13 @@ where
         if scan_depth == RemoveQuarantineScanDepth::CurrentDirectory || !identity.is_dir() {
             continue;
         }
+        // An inaccessible ordinary subtree has not identified a managed recovery candidate.
+        // Keep the diagnostic, but reserve `unresolved` for a known quarantine/tombstone that
+        // cannot be authenticated or completed. This distinguishes unrelated library churn or
+        // permissions from a bot-owned recovery state that actually requires another pass.
         let child = match openat_directory_cstr(directory, &name) {
             Ok(child) => child,
             Err(err) => {
-                state.unresolved = true;
                 state.messages.push(format!(
                     "Skipped unreadable directory during interrupted-removal scan {}: {err}",
                     path.display()
@@ -1956,7 +1958,6 @@ where
             }
         };
         if identity_for_fd(&child)? != identity {
-            state.unresolved = true;
             state.messages.push(format!(
                 "Skipped replaced directory during interrupted-removal scan: {}",
                 path.display()
@@ -1971,7 +1972,6 @@ where
             should_restore,
             RemoveQuarantineScanDepth::Recursive,
         ) {
-            state.unresolved = true;
             state.messages.push(format!(
                 "Skipped directory during interrupted-removal scan {}: {err:#}",
                 path.display()
