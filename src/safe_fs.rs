@@ -276,6 +276,11 @@ impl BoundFile {
         writer
             .sync_all()
             .context("failed to sync private unlinked bound file")?;
+        // `dup` shares an open file description with the descriptor retained by `self`.
+        // Rewind that shared offset so a subsequently inherited descriptor starts at byte zero.
+        writer
+            .seek(SeekFrom::Start(0))
+            .context("failed to rewind private unlinked bound file")?;
         self.validate_private_unlinked(mode)
     }
 

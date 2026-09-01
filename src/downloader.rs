@@ -1177,14 +1177,7 @@ fn persist_bilibili_core_download_completion(
 }
 
 #[cfg(unix)]
-pub async fn run_bilibili_worker() -> Result<()> {
-    ensure_current_process_owns_its_group()
-        .context("Bilibili worker requires a dedicated process group")?;
-    if BILIBILI_WORKER_PROCESS.swap(true, Ordering::AcqRel) {
-        bail!("Bilibili worker mode was initialized more than once");
-    }
-    let liveness = inherited_worker_liveness_stream()?;
-    let request_fd = unsafe { OwnedFd::from_raw_fd(BILIBILI_MUX_FD_BASE) };
+fn read_bilibili_worker_request_from_fd(request_fd: OwnedFd) -> Result<BilibiliWorkerRequest> {
     let mut reader = std::fs::File::from(request_fd)
         .take((BILIBILI_WORKER_REQUEST_LIMIT as u64).saturating_add(1));
     let mut contents = Vec::new();
@@ -1201,6 +1194,19 @@ pub async fn run_bilibili_worker() -> Result<()> {
     {
         bail!("invalid Bilibili worker request");
     }
+    Ok(request)
+}
+
+#[cfg(unix)]
+pub async fn run_bilibili_worker() -> Result<()> {
+    ensure_current_process_owns_its_group()
+        .context("Bilibili worker requires a dedicated process group")?;
+    if BILIBILI_WORKER_PROCESS.swap(true, Ordering::AcqRel) {
+        bail!("Bilibili worker mode was initialized more than once");
+    }
+    let liveness = inherited_worker_liveness_stream()?;
+    let request_fd = unsafe { OwnedFd::from_raw_fd(BILIBILI_MUX_FD_BASE) };
+    let request = read_bilibili_worker_request_from_fd(request_fd)?;
     let _output_lock =
         inherited_worker_output_lock(request.output_lock_device, request.output_lock_inode)?;
     let root = RootedFs::new(Path::new("."))?;
@@ -16500,6 +16506,54 @@ mod tests {
             drop(staging);
             let _ = fs::remove_dir_all(video_dir);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bilibili_worker_request_is_rewound_before_inheritance() {
+        let config = test_config();
+        let video_dir = temp_test_dir("bilibili-worker-request-inheritance");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+        let output_lock = video_output_lock_file(&root).expect("output lock should bind");
+        let staging =
+            create_video_staging_dir(&root).expect("worker staging directory should create");
+        let expected_identity = VideoIdentity {
+            provider: VideoProvider::Bilibili,
+            id: "cid123".to_string(),
+        };
+        let request = build_bilibili_worker_request(
+            &config,
+            "https://www.bilibili.com/video/BV123",
+            Some(BilibiliSelection::Latest),
+            Some(&expected_identity),
+            &staging,
+            &output_lock,
+        );
+        let encoded = serde_json::to_vec(&request).expect("worker request should encode");
+        let request_file = create_unlinked_bilibili_worker_request(&staging, &encoded)
+            .expect("worker request descriptor should create");
+
+        let inherited_request = request_file
+            .duplicate_fd_cloexec_at_least(BILIBILI_MUX_FD_BASE)
+            .expect("worker request should duplicate for inheritance");
+        let parsed = read_bilibili_worker_request_from_fd(inherited_request)
+            .expect("worker should parse the inherited request at its current offset");
+
+        assert_eq!(parsed.url, request.url);
+        assert_eq!(parsed.selection, request.selection);
+        assert_eq!(
+            parsed.expected_overwrite_identity,
+            request.expected_overwrite_identity
+        );
+        assert!(
+            !staging
+                .path()
+                .join(BILIBILI_WORKER_REQUEST_FILE_NAME)
+                .exists()
+        );
+        drop(request_file);
+        drop(staging);
+        let _ = fs::remove_dir_all(video_dir);
     }
 
     #[test]
