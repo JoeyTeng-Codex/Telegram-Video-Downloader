@@ -2,7 +2,7 @@ use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
@@ -342,6 +342,17 @@ impl BoundFile {
         Ok(duplicate)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn child_process_fd(&self) -> Result<RawFd> {
+        self.validate_identity()?;
+        let flags = rustix::io::fcntl_getfd(self.fd.as_ref())
+            .context("failed to inspect bound file descriptor flags")?;
+        if !flags.contains(rustix::io::FdFlags::CLOEXEC) {
+            bail!("bound file descriptor is not close-on-exec");
+        }
+        Ok(self.fd.as_raw_fd())
+    }
+
     pub(crate) fn lock_exclusive(&self) -> Result<()> {
         rustix::fs::flock(self.fd.as_ref(), FlockOperation::LockExclusive)
             .map_err(errno_to_io)
@@ -423,6 +434,17 @@ impl RootedFs {
 
     pub(crate) fn validate_configured_root(&self) -> Result<()> {
         self.validate_root()
+    }
+
+    pub(crate) fn list_root_directory(&self) -> Result<Vec<(OsString, EntryIdentity)>> {
+        self.validate_root()?;
+        let entries = list_directory_entries(
+            self.root_fd.as_ref(),
+            self.root_identity,
+            &self.logical_root,
+        )?;
+        self.validate_root()?;
+        Ok(entries)
     }
 
     #[cfg(test)]
@@ -550,6 +572,57 @@ impl RootedFs {
             parent,
             leaf,
         })
+    }
+
+    pub(crate) fn bind_direct_child_of_bound_directory(
+        &self,
+        directory: &BoundEntry,
+        expected: EntryIdentity,
+        name: &OsStr,
+    ) -> Result<BoundEntry> {
+        // Protected property: the child binding inherits the selected parent directory object.
+        // This avoids re-traversing a mutable lexical path between scan and recursion.
+        let mut components = Path::new(name).components();
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+            bail!(
+                "bound directory child name is not one path component: {}",
+                name.to_string_lossy()
+            );
+        }
+        self.validate_bound_parent(&directory.parent)?;
+        if !expected.is_dir()
+            || identity_at(directory.parent.fd.as_ref(), &directory.leaf)? != Some(expected)
+        {
+            bail!(
+                "bound directory identity changed before binding child: {}",
+                directory.path.display()
+            );
+        }
+        let fd =
+            openat_directory(directory.parent.fd.as_ref(), &directory.leaf).with_context(|| {
+                format!(
+                    "failed to open bound directory before binding child {}",
+                    directory.path.display()
+                )
+            })?;
+        if identity_for_fd(&fd)? != expected {
+            bail!(
+                "bound directory identity changed while binding child: {}",
+                directory.path.display()
+            );
+        }
+        let parent = BoundParent {
+            fd: Arc::new(fd),
+            relative_path: self.relative_directory_path(&directory.path)?,
+            identity: expected,
+        };
+        let child = BoundEntry {
+            path: directory.path.join(name),
+            parent,
+            leaf: name.to_os_string(),
+        };
+        self.validate_bound_parent(&child.parent)?;
+        Ok(child)
     }
 
     pub(crate) fn bound_entry_identity(&self, entry: &BoundEntry) -> Result<Option<EntryIdentity>> {
@@ -1012,30 +1085,12 @@ impl RootedFs {
         if identity_for_fd(&directory)? != expected {
             bail!("bound directory identity changed: {}", entry.path.display());
         }
-        let names = rustix::fs::Dir::read_from(&directory)
-            .map_err(errno_to_io)
-            .with_context(|| format!("failed to read bound directory {}", entry.path.display()))?
-            .map(|item| item.map_err(errno_to_io))
-            .collect::<std::result::Result<Vec<_>, std::io::Error>>()?;
-        let mut entries = Vec::new();
-        for item in names {
-            let name = item.file_name();
-            if matches!(name.to_bytes(), b"." | b"..") {
-                continue;
-            }
-            let display_name = name.to_str().with_context(|| {
-                format!(
-                    "bound directory contains a non-UTF-8 entry: {}",
-                    entry.path.display()
-                )
-            })?;
-            let identity = identity_at_cstr(&directory, name)?.ok_or_else(|| {
-                anyhow!(
-                    "bound directory entry disappeared: {}",
-                    entry.path.join(display_name).display()
-                )
-            })?;
-            entries.push((OsString::from(display_name), identity));
+        let entries = list_directory_entries(&directory, expected, &entry.path)?;
+        if identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected) {
+            bail!(
+                "bound directory identity changed during listing: {}",
+                entry.path.display()
+            );
         }
         self.validate_bound_parent(&entry.parent)?;
         Ok(entries)
@@ -1789,6 +1844,75 @@ impl RootedFs {
         }
         Ok((parent, leaf))
     }
+
+    fn relative_directory_path(&self, path: &Path) -> Result<PathBuf> {
+        let relative = path.strip_prefix(&self.logical_root).with_context(|| {
+            format!(
+                "directory is outside the configured output root {}: {}",
+                self.logical_root.display(),
+                path.display()
+            )
+        })?;
+        if relative.as_os_str().is_empty() {
+            bail!("configured output root has no parent-relative directory path");
+        }
+        let mut result = PathBuf::new();
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                bail!(
+                    "directory path contains an invalid component: {}",
+                    path.display()
+                );
+            };
+            result.push(name);
+        }
+        Ok(result)
+    }
+}
+
+fn list_directory_entries(
+    directory: &OwnedFd,
+    expected: EntryIdentity,
+    display_path: &Path,
+) -> Result<Vec<(OsString, EntryIdentity)>> {
+    if identity_for_fd(directory)? != expected {
+        bail!(
+            "bound directory identity changed before listing: {}",
+            display_path.display()
+        );
+    }
+    let names = rustix::fs::Dir::read_from(directory)
+        .map_err(errno_to_io)
+        .with_context(|| format!("failed to read bound directory {}", display_path.display()))?
+        .map(|item| item.map_err(errno_to_io))
+        .collect::<std::result::Result<Vec<_>, std::io::Error>>()?;
+    let mut entries = Vec::new();
+    for item in names {
+        let name = item.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let display_name = name.to_str().with_context(|| {
+            format!(
+                "bound directory contains a non-UTF-8 entry: {}",
+                display_path.display()
+            )
+        })?;
+        let identity = identity_at_cstr(directory, name)?.ok_or_else(|| {
+            anyhow!(
+                "bound directory entry disappeared: {}",
+                display_path.join(display_name).display()
+            )
+        })?;
+        entries.push((OsString::from(display_name), identity));
+    }
+    if identity_for_fd(directory)? != expected {
+        bail!(
+            "bound directory identity changed during listing: {}",
+            display_path.display()
+        );
+    }
+    Ok(entries)
 }
 
 fn open_directory(path: &Path) -> Result<OwnedFd, std::io::Error> {

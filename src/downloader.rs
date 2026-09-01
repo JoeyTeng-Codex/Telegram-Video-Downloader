@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(unix)]
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -84,13 +84,17 @@ const BILIBILI_MUX_RECOVERY_ANCHOR_NAME: &str = "output.anchor";
 const BILIBILI_MUX_RECOVERY_MANIFEST_VERSION: u32 = 1;
 const BILIBILI_MUX_RECOVERY_MANIFEST_LIMIT: usize = 16 * 1024;
 #[cfg(unix)]
-const BILIBILI_MUX_FD_BASE: i32 = 64;
+const BILIBILI_MUX_PREFERRED_FD_BASE: i32 = 64;
 #[cfg(unix)]
-const BILIBILI_WORKER_LIVENESS_FD: i32 = BILIBILI_MUX_FD_BASE - 1;
+const BILIBILI_MUX_MIN_FD_BASE: i32 = 9;
 #[cfg(unix)]
-const COMMAND_DESCENDANT_FENCE_FD: i32 = BILIBILI_MUX_FD_BASE - 2;
+const BILIBILI_WORKER_REQUEST_FD: i32 = 5;
 #[cfg(unix)]
-const BILIBILI_WORKER_OUTPUT_LOCK_FD: i32 = BILIBILI_MUX_FD_BASE - 3;
+const BILIBILI_WORKER_OUTPUT_LOCK_FD: i32 = 6;
+#[cfg(unix)]
+const BILIBILI_WORKER_LIVENESS_FD: i32 = 7;
+#[cfg(unix)]
+const COMMAND_DESCENDANT_FENCE_FD: i32 = 8;
 const OVERWRITE_BACKUP_DIR_PREFIX: &str = ".telegram-video-downloader-overwrite";
 const OVERWRITE_RECOVERY_MANIFEST_NAME: &str = ".transaction.json";
 const OVERWRITE_RECOVERY_MANIFEST_TEMP_NAME: &str = ".transaction.next.json";
@@ -159,6 +163,7 @@ struct AdditionalInheritedCommandFd {
 #[cfg(unix)]
 #[derive(Debug)]
 struct PreparedCommandFds {
+    bound_file_sources: Vec<(BoundFile, RawFd, i32)>,
     inherited: Vec<(OwnedFd, i32)>,
     targets: BTreeSet<i32>,
 }
@@ -370,6 +375,7 @@ pub struct CommandSpec {
     pub cwd: PathBuf,
     pub activity_dir: Option<PathBuf>,
     pub cleanup_paths: Vec<PathBuf>,
+    pub inherited_fd_base: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1011,6 +1017,7 @@ async fn run_staged_bilibili_worker(
         cwd: staging.path().to_path_buf(),
         activity_dir: Some(staging.path().to_path_buf()),
         cleanup_paths: Vec::new(),
+        inherited_fd_base: Some(BILIBILI_WORKER_REQUEST_FD),
     };
     #[cfg(unix)]
     let (additional_inherited_fds, _parent_liveness) = {
@@ -1248,7 +1255,7 @@ pub async fn run_bilibili_worker() -> Result<()> {
         bail!("Bilibili worker mode was initialized more than once");
     }
     let liveness = inherited_worker_liveness_stream()?;
-    let request_fd = unsafe { OwnedFd::from_raw_fd(BILIBILI_MUX_FD_BASE) };
+    let request_fd = unsafe { OwnedFd::from_raw_fd(BILIBILI_WORKER_REQUEST_FD) };
     let request = read_bilibili_worker_request_from_fd(request_fd)?;
     let _output_lock =
         inherited_worker_output_lock(request.output_lock_device, request.output_lock_inode)?;
@@ -2236,11 +2243,17 @@ fn bilibili_local_mux_command_spec(
         "-y".to_string(),
         "-nostdin".to_string(),
     ];
-    let (concat_file, mut inherited_files) = if only_bilibili_flv_segments(media_inputs) {
+    let flv_concat = only_bilibili_flv_segments(media_inputs);
+    let inherited_file_count = bound_inputs
+        .len()
+        .checked_add(if flv_concat { 2 } else { 1 })
+        .context("too many inherited Bilibili mux files")?;
+    let inherited_fd_base = select_bilibili_mux_inherited_fd_base(inherited_file_count)?;
+    let (concat_file, mut inherited_files) = if flv_concat {
         let concat_file = create_bilibili_concat_file(
             root,
             entry_dir,
-            ffmpeg_concat_file_list(media_inputs.len(), 1)?.as_bytes(),
+            ffmpeg_concat_file_list(media_inputs.len(), 1, inherited_fd_base)?.as_bytes(),
         )?;
         args.extend([
             "-f".to_string(),
@@ -2248,7 +2261,7 @@ fn bilibili_local_mux_command_spec(
             "-safe".to_string(),
             "0".to_string(),
             "-i".to_string(),
-            inherited_command_path(0)?,
+            inherited_command_path(0, inherited_fd_base)?,
         ]);
         let mut inherited_files = Vec::with_capacity(bound_inputs.len() + 1);
         inherited_files.push(concat_file.bound_file().clone());
@@ -2257,7 +2270,7 @@ fn bilibili_local_mux_command_spec(
     } else {
         for index in 0..media_inputs.len() {
             args.push("-i".to_string());
-            args.push(inherited_command_path(index)?);
+            args.push(inherited_command_path(index, inherited_fd_base)?);
         }
         for index in 0..media_inputs.len() {
             args.push("-map".to_string());
@@ -2273,7 +2286,7 @@ fn bilibili_local_mux_command_spec(
     };
     let output_index = inherited_files.len();
     inherited_files.push(output.clone());
-    let output_descriptor = inherited_command_descriptor(output_index)?;
+    let output_descriptor = inherited_command_descriptor(output_index, inherited_fd_base)?;
     args.extend([
         "-c".to_string(),
         "copy".to_string(),
@@ -2292,6 +2305,7 @@ fn bilibili_local_mux_command_spec(
             cwd: entry_dir.to_path_buf(),
             activity_dir: Some(entry_dir.to_path_buf()),
             cleanup_paths: Vec::new(),
+            inherited_fd_base: Some(inherited_fd_base),
         },
         concat_file,
         inherited_files,
@@ -2404,34 +2418,75 @@ fn only_bilibili_flv_segments(media_inputs: &[BilibiliMediaInput]) -> bool {
     !media_inputs.is_empty() && media_inputs.iter().all(|input| input.kind == "flv_segment")
 }
 
-fn ffmpeg_concat_file_list(input_count: usize, inherited_offset: usize) -> Result<String> {
+#[cfg(unix)]
+fn select_bilibili_mux_inherited_fd_base(file_count: usize) -> Result<i32> {
+    let file_count = i32::try_from(file_count).context("too many inherited Bilibili mux files")?;
+    if file_count <= 0 {
+        bail!("Bilibili mux requires at least one inherited file descriptor");
+    }
+    let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to read the process file descriptor limit");
+    }
+    let soft_limit = unsafe { limits.assume_init() }.rlim_cur;
+    let soft_limit = i32::try_from(soft_limit).unwrap_or(i32::MAX);
+    let fits = |base: i32| {
+        base.checked_add(file_count)
+            .is_some_and(|end| end <= soft_limit)
+    };
+    if fits(BILIBILI_MUX_PREFERRED_FD_BASE) {
+        return Ok(BILIBILI_MUX_PREFERRED_FD_BASE);
+    }
+    if fits(BILIBILI_MUX_MIN_FD_BASE) {
+        return Ok(BILIBILI_MUX_MIN_FD_BASE);
+    }
+    bail!(
+        "process file descriptor limit {soft_limit} cannot accommodate {file_count} Bilibili mux descriptors"
+    )
+}
+
+#[cfg(not(unix))]
+fn select_bilibili_mux_inherited_fd_base(_file_count: usize) -> Result<i32> {
+    bail!("descriptor-bound Bilibili muxing requires a Unix platform")
+}
+
+fn ffmpeg_concat_file_list(
+    input_count: usize,
+    inherited_offset: usize,
+    inherited_fd_base: i32,
+) -> Result<String> {
     (0..input_count)
         .map(|index| {
-            inherited_command_path(inherited_offset + index).map(|path| format!("file '{path}'\n"))
+            inherited_command_path(inherited_offset + index, inherited_fd_base)
+                .map(|path| format!("file '{path}'\n"))
         })
         .collect()
 }
 
 #[cfg(unix)]
-fn inherited_command_path(index: usize) -> Result<String> {
-    Ok(format!("/dev/fd/{}", inherited_command_descriptor(index)?))
+fn inherited_command_path(index: usize, inherited_fd_base: i32) -> Result<String> {
+    Ok(format!(
+        "/dev/fd/{}",
+        inherited_command_descriptor(index, inherited_fd_base)?
+    ))
 }
 
 #[cfg(unix)]
-fn inherited_command_descriptor(index: usize) -> Result<i32> {
+fn inherited_command_descriptor(index: usize, inherited_fd_base: i32) -> Result<i32> {
     let index = i32::try_from(index).context("too many inherited Bilibili mux inputs")?;
-    BILIBILI_MUX_FD_BASE
+    inherited_fd_base
         .checked_add(index)
         .context("too many inherited Bilibili mux inputs")
 }
 
 #[cfg(not(unix))]
-fn inherited_command_path(_index: usize) -> Result<String> {
+fn inherited_command_path(_index: usize, _inherited_fd_base: i32) -> Result<String> {
     bail!("descriptor-bound Bilibili muxing requires a Unix platform")
 }
 
 #[cfg(not(unix))]
-fn inherited_command_descriptor(_index: usize) -> Result<i32> {
+fn inherited_command_descriptor(_index: usize, _inherited_fd_base: i32) -> Result<i32> {
     bail!("descriptor-bound Bilibili muxing requires a Unix platform")
 }
 
@@ -2641,6 +2696,277 @@ struct PendingBilibiliMuxRecovery {
     manifest: BilibiliMuxRecoveryManifest,
 }
 
+#[derive(Debug)]
+struct RecoveryScanCandidate {
+    path: PathBuf,
+    identity: EntryIdentity,
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryTransactionKind {
+    BilibiliMux,
+    Overwrite,
+}
+
+impl RecoveryTransactionKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::BilibiliMux => "Bilibili mux",
+            Self::Overwrite => "overwrite",
+        }
+    }
+
+    fn is_recovery_directory(self, name: &str) -> bool {
+        match self {
+            Self::BilibiliMux => name.starts_with(BILIBILI_MUX_STAGING_DIR_PREFIX),
+            Self::Overwrite => name.starts_with(OVERWRITE_BACKUP_DIR_PREFIX),
+        }
+    }
+
+    fn skip_directory(self, name: &str) -> bool {
+        match self {
+            Self::BilibiliMux => {
+                name == VIDEO_STAGING_DIR_NAME
+                    || name == VIDEO_CONTROL_DIR_NAME
+                    || name.starts_with(OVERWRITE_BACKUP_DIR_PREFIX)
+            }
+            Self::Overwrite => name == VIDEO_STAGING_DIR_NAME,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum RecoveryScanDirectory {
+    Root,
+    Bound {
+        entry: BoundEntry,
+        identity: EntryIdentity,
+    },
+}
+
+impl RecoveryScanDirectory {
+    fn path(&self, root: &RootedFs) -> PathBuf {
+        match self {
+            Self::Root => root.logical_root_path().to_path_buf(),
+            Self::Bound { entry, .. } => entry.path().to_path_buf(),
+        }
+    }
+
+    fn is_root(&self) -> bool {
+        matches!(self, Self::Root)
+    }
+}
+
+fn recovery_scan_root(root: &RootedFs, scan_root: &Path) -> Result<RecoveryScanDirectory> {
+    if scan_root == root.logical_root_path() || scan_root == root.root_path() {
+        return Ok(RecoveryScanDirectory::Root);
+    }
+    let entry = root.bind_entry(scan_root, false)?;
+    let identity = root
+        .bound_entry_identity(&entry)?
+        .with_context(|| format!("recovery scan root is missing: {}", scan_root.display()))?;
+    if !identity.is_dir() {
+        bail!(
+            "recovery scan root is not a directory: {}",
+            scan_root.display()
+        );
+    }
+    Ok(RecoveryScanDirectory::Bound { entry, identity })
+}
+
+fn recovery_scan_entries(
+    root: &RootedFs,
+    directory: &RecoveryScanDirectory,
+) -> Result<Vec<(std::ffi::OsString, EntryIdentity)>> {
+    match directory {
+        RecoveryScanDirectory::Root => root.list_root_directory(),
+        RecoveryScanDirectory::Bound { entry, identity } => {
+            root.list_bound_directory(entry, *identity)
+        }
+    }
+}
+
+fn bind_recovery_scan_child(
+    root: &RootedFs,
+    directory: &RecoveryScanDirectory,
+    name: &std::ffi::OsStr,
+) -> Result<BoundEntry> {
+    match directory {
+        RecoveryScanDirectory::Root => root.bind_entry(&root.logical_root_path().join(name), false),
+        RecoveryScanDirectory::Bound { entry, identity } => {
+            root.bind_direct_child_of_bound_directory(entry, *identity, name)
+        }
+    }
+}
+
+fn recovery_scan_child_is_current(
+    root: &RootedFs,
+    entry: &BoundEntry,
+    expected: EntryIdentity,
+) -> Result<bool> {
+    Ok(root.bound_entry_identity(entry)? == Some(expected))
+}
+
+fn collect_recovery_directories(
+    root: &RootedFs,
+    directory: RecoveryScanDirectory,
+    recovered: &mut Vec<RecoveryScanCandidate>,
+    diagnostics: &mut Vec<String>,
+    incomplete: &mut bool,
+    kind: RecoveryTransactionKind,
+) -> Result<()> {
+    let result = collect_recovery_directories_with_before_child_binding(
+        root,
+        directory,
+        recovered,
+        diagnostics,
+        incomplete,
+        kind,
+        &mut |_| {},
+    );
+    root.validate_configured_root()?;
+    result
+}
+
+fn collect_recovery_directories_with_before_child_binding<H>(
+    root: &RootedFs,
+    directory: RecoveryScanDirectory,
+    recovered: &mut Vec<RecoveryScanCandidate>,
+    diagnostics: &mut Vec<String>,
+    incomplete: &mut bool,
+    kind: RecoveryTransactionKind,
+    before_child_binding: &mut H,
+) -> Result<()>
+where
+    H: FnMut(&Path),
+{
+    let label = kind.label();
+    let directory_path = directory.path(root);
+    let entries = match recovery_scan_entries(root, &directory) {
+        Ok(entries) => entries,
+        Err(err) if !directory.is_root() => {
+            *incomplete = true;
+            diagnostics.push(format!(
+                "Skipped unreadable directory during {label} recovery scan {} (directory may have changed): {err:#}",
+                directory_path.display()
+            ));
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to scan {label} recovery root {}",
+                    directory_path.display()
+                )
+            });
+        }
+    };
+
+    for (name, expected) in entries {
+        if !expected.is_dir() {
+            continue;
+        }
+        before_child_binding(&directory_path.join(&name));
+        let child = match bind_recovery_scan_child(root, &directory, &name) {
+            Ok(child) => child,
+            Err(err) => {
+                *incomplete = true;
+                diagnostics.push(format!(
+                    "Skipped disappearing or replaced directory during {label} recovery scan {}: {err:#}",
+                    directory_path.join(&name).display()
+                ));
+                continue;
+            }
+        };
+        let child_path = child.path().to_path_buf();
+        let child_is_current = match recovery_scan_child_is_current(root, &child, expected) {
+            Ok(current) => current,
+            Err(err) => {
+                *incomplete = true;
+                diagnostics.push(format!(
+                    "Skipped uninspectable directory during {label} recovery scan {}: {err:#}",
+                    child_path.display()
+                ));
+                continue;
+            }
+        };
+        if !child_is_current {
+            *incomplete = true;
+            diagnostics.push(format!(
+                "Skipped replaced directory during {label} recovery scan: {}",
+                child_path.display()
+            ));
+            continue;
+        }
+
+        let name = name.to_string_lossy();
+        if kind.is_recovery_directory(&name) {
+            recovered.push(RecoveryScanCandidate {
+                path: child_path,
+                identity: expected,
+            });
+            continue;
+        }
+        if kind.skip_directory(&name) {
+            continue;
+        }
+
+        if let Err(err) = collect_recovery_directories_with_before_child_binding(
+            root,
+            RecoveryScanDirectory::Bound {
+                entry: child.clone(),
+                identity: expected,
+            },
+            recovered,
+            diagnostics,
+            incomplete,
+            kind,
+            before_child_binding,
+        ) {
+            *incomplete = true;
+            diagnostics.push(format!(
+                "Skipped directory during {label} recovery scan {}: {err:#}",
+                child_path.display()
+            ));
+        }
+
+        match recovery_scan_child_is_current(root, &child, expected) {
+            Ok(true) => {}
+            Ok(false) => {
+                *incomplete = true;
+                diagnostics.push(format!(
+                    "Skipped disappearing or replaced directory during {label} recovery scan: {}",
+                    child_path.display()
+                ));
+            }
+            Err(err) => {
+                *incomplete = true;
+                diagnostics.push(format!(
+                    "Skipped uninspectable directory during {label} recovery scan {}: {err:#}",
+                    child_path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn bind_recovery_scan_candidate(
+    root: &RootedFs,
+    candidate: &RecoveryScanCandidate,
+) -> Result<BoundEntry> {
+    let entry = root.bind_entry(&candidate.path, false)?;
+    if root.bound_entry_identity(&entry)? != Some(candidate.identity)
+        || !candidate.identity.is_dir()
+    {
+        bail!(
+            "recovery directory disappeared or changed identity after scanning: {}",
+            candidate.path.display()
+        );
+    }
+    Ok(entry)
+}
+
 fn recover_pending_bilibili_mux_transactions_locked(
     root: &RootedFs,
     video_dir: &Path,
@@ -2649,113 +2975,46 @@ fn recover_pending_bilibili_mux_transactions_locked(
     let mut report = BilibiliMuxRecoveryReport::default();
     let mut scan_diagnostics = Vec::new();
     let mut scan_incomplete = false;
-    collect_bilibili_mux_recovery_directories(
+    collect_recovery_directories(
         root,
-        video_dir,
-        video_dir,
+        recovery_scan_root(root, video_dir)?,
         &mut directories,
         &mut scan_diagnostics,
         &mut scan_incomplete,
+        RecoveryTransactionKind::BilibiliMux,
     )?;
     report.messages.extend(scan_diagnostics);
     report.incomplete = scan_incomplete;
-    directories.sort();
+    directories.sort_by(|left, right| left.path.cmp(&right.path));
     for directory in directories {
         match recover_bilibili_mux_transaction(root, &directory) {
             Ok(message) => report.messages.push(message),
             Err(err) => {
-                report.unresolved = true;
-                report.messages.push(format!(
-                    "Retained unresolved Bilibili mux transaction {}: {err:#}",
-                    directory.display()
-                ));
+                if bind_recovery_scan_candidate(root, &directory).is_err() {
+                    report.incomplete = true;
+                    report.messages.push(format!(
+                        "Skipped changed Bilibili mux transaction {}: {err:#}",
+                        directory.path.display()
+                    ));
+                } else {
+                    report.unresolved = true;
+                    report.messages.push(format!(
+                        "Retained unresolved Bilibili mux transaction {}: {err:#}",
+                        directory.path.display()
+                    ));
+                }
             }
         }
     }
     Ok(report)
 }
 
-fn collect_bilibili_mux_recovery_directories(
+fn recover_bilibili_mux_transaction(
     root: &RootedFs,
-    scan_root: &Path,
-    directory: &Path,
-    recovered: &mut Vec<PathBuf>,
-    diagnostics: &mut Vec<String>,
-    incomplete: &mut bool,
-) -> Result<()> {
-    root.validate_configured_root()?;
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(err) if directory != scan_root => {
-            *incomplete = true;
-            diagnostics.push(format!(
-                "Skipped unreadable directory during Bilibili mux recovery scan {}: {err}",
-                directory.display()
-            ));
-            return Ok(());
-        }
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "failed to scan Bilibili mux recovery root {}",
-                    directory.display()
-                )
-            });
-        }
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) => {
-                *incomplete = true;
-                diagnostics.push(format!(
-                    "Skipped unreadable entry during Bilibili mux recovery scan {}: {err}",
-                    directory.display()
-                ));
-                continue;
-            }
-        };
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(err) => {
-                *incomplete = true;
-                diagnostics.push(format!(
-                    "Skipped uninspectable entry during Bilibili mux recovery scan {}: {err}",
-                    entry.path().display()
-                ));
-                continue;
-            }
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with(BILIBILI_MUX_STAGING_DIR_PREFIX) {
-            recovered.push(path);
-            continue;
-        }
-        if name == VIDEO_STAGING_DIR_NAME
-            || name == VIDEO_CONTROL_DIR_NAME
-            || name.starts_with(OVERWRITE_BACKUP_DIR_PREFIX)
-        {
-            continue;
-        }
-        collect_bilibili_mux_recovery_directories(
-            root,
-            scan_root,
-            &path,
-            recovered,
-            diagnostics,
-            incomplete,
-        )?;
-    }
-    root.validate_configured_root()
-}
-
-fn recover_bilibili_mux_transaction(root: &RootedFs, directory: &Path) -> Result<String> {
-    let mut pending = load_bilibili_mux_recovery(root, directory)?;
+    candidate: &RecoveryScanCandidate,
+) -> Result<String> {
+    let directory = &candidate.path;
+    let mut pending = load_bilibili_mux_recovery(root, candidate)?;
     remove_valid_bilibili_mux_manifest_temp(root, directory, pending.directory_identity)?;
     let parent = directory
         .parent()
@@ -2866,12 +3125,11 @@ fn recover_bilibili_mux_transaction(root: &RootedFs, directory: &Path) -> Result
 
 fn load_bilibili_mux_recovery(
     root: &RootedFs,
-    directory: &Path,
+    candidate: &RecoveryScanCandidate,
 ) -> Result<PendingBilibiliMuxRecovery> {
-    let directory_entry = root.bind_entry(directory, false)?;
-    let directory_identity = root
-        .bound_entry_identity(&directory_entry)?
-        .context("Bilibili mux recovery directory is missing")?;
+    let directory = &candidate.path;
+    let directory_entry = bind_recovery_scan_candidate(root, candidate)?;
+    let directory_identity = candidate.identity;
     root.validate_private_bound_directory(&directory_entry, directory_identity, 0o700)?;
     let manifest_path = directory.join(BILIBILI_MUX_RECOVERY_MANIFEST_NAME);
     let manifest_file = root
@@ -4062,6 +4320,7 @@ pub fn bilibili_metadata_command_spec(config: &AppConfig, url: &str) -> Result<C
         cwd: config.downloads.video_dir.clone(),
         activity_dir: None,
         cleanup_paths: vec![config_path],
+        inherited_fd_base: None,
     })
 }
 
@@ -4327,6 +4586,7 @@ pub fn youtube_metadata_command_spec(config: &AppConfig, url: &str) -> CommandSp
         cwd: config.downloads.video_dir.clone(),
         activity_dir: None,
         cleanup_paths: Vec::new(),
+        inherited_fd_base: None,
     }
 }
 
@@ -4387,6 +4647,7 @@ pub fn youtube_download_command_spec(
         cwd: config.downloads.video_dir.clone(),
         activity_dir: Some(config.downloads.video_dir.clone()),
         cleanup_paths: Vec::new(),
+        inherited_fd_base: None,
     }
 }
 
@@ -4410,6 +4671,7 @@ pub fn pdf_command_spec(config: &AppConfig, url: &str) -> CommandSpec {
         cwd: config.resolve_project_path(Path::new(".")),
         activity_dir: Some(config.downloads.pdf_dir.clone()),
         cleanup_paths: Vec::new(),
+        inherited_fd_base: None,
     }
 }
 
@@ -4441,6 +4703,7 @@ fn ffmpeg_mux_command_spec(
         cwd: config.downloads.video_dir.clone(),
         activity_dir: Some(config.downloads.video_dir.clone()),
         cleanup_paths: Vec::new(),
+        inherited_fd_base: None,
     }
 }
 
@@ -5533,9 +5796,14 @@ async fn run_command_with_execution_context_and_additional_fds(
     };
     #[cfg(unix)]
     let PreparedCommandFds {
+        bound_file_sources,
         inherited: inherited_fds,
         targets: inherited_fd_targets,
-    } = prepare_command_inherited_fds(inherited_files, additional_inherited_fds)?;
+    } = prepare_command_inherited_fds(
+        inherited_files,
+        additional_inherited_fds,
+        spec.inherited_fd_base,
+    )?;
     #[cfg(unix)]
     let bound_cwd_fd = bound_cwd
         .map(|directory| prepare_bound_command_cwd_fd(directory, &inherited_fd_targets))
@@ -5566,15 +5834,20 @@ async fn run_command_with_execution_context_and_additional_fds(
         if matches!(policy.process_group, CommandProcessGroupMode::Owned) {
             command.process_group(0);
         }
-        if bound_cwd_fd.is_some() || !inherited_fds.is_empty() {
-            // The source descriptors are collision-free CLOEXEC duplicates. dup2 clears CLOEXEC
-            // on each fixed child descriptor without allowing an argv pathname lookup.
+        if bound_cwd_fd.is_some() || !bound_file_sources.is_empty() || !inherited_fds.is_empty() {
+            // Captured bound files keep their validated CLOEXEC source descriptors open until
+            // fork. dup2 clears CLOEXEC on each fixed child descriptor without an argv lookup.
             unsafe {
                 command.pre_exec(move || {
                     if let Some(directory) = &bound_cwd_fd
                         && libc::fchdir(directory.as_raw_fd()) == -1
                     {
                         return Err(std::io::Error::last_os_error());
+                    }
+                    for (_, source, target) in &bound_file_sources {
+                        if libc::dup2(*source, *target) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
                     }
                     for (source, target) in &inherited_fds {
                         if libc::dup2(source.as_raw_fd(), *target) == -1 {
@@ -5761,14 +6034,21 @@ fn prepare_bound_command_cwd_fd(
 fn prepare_command_inherited_fds(
     files: &[BoundFile],
     additional: Vec<AdditionalInheritedCommandFd>,
+    inherited_fd_base: Option<i32>,
 ) -> Result<PreparedCommandFds> {
+    let inherited_fd_base = if files.is_empty() {
+        None
+    } else {
+        Some(inherited_fd_base.context("command with inherited files has no descriptor base")?)
+    };
     let mut targets = BTreeSet::new();
     for index in 0..files.len() {
         let index = i32::try_from(index).context("too many inherited command files")?;
-        let target = BILIBILI_MUX_FD_BASE
+        let target = inherited_fd_base
+            .expect("inherited descriptor base is present for non-empty files")
             .checked_add(index)
             .context("too many inherited command files")?;
-        if !targets.insert(target) {
+        if target <= libc::STDERR_FILENO || !targets.insert(target) {
             bail!("inherited command descriptor target is duplicated");
         }
     }
@@ -5777,18 +6057,26 @@ fn prepare_command_inherited_fds(
             bail!("inherited command descriptor target is invalid or duplicated");
         }
     }
+    validate_inherited_command_targets_within_process_limit(&targets)?;
 
+    let mut bound_file_sources = Vec::with_capacity(files.len());
     let mut inherited_fds = Vec::with_capacity(files.len().saturating_add(additional.len()));
     for (index, file) in files.iter().enumerate() {
         let index = i32::try_from(index).context("too many inherited command files")?;
-        let target = BILIBILI_MUX_FD_BASE
+        let target = inherited_fd_base
+            .expect("inherited descriptor base is present for non-empty files")
             .checked_add(index)
             .context("too many inherited command files")?;
-        let source = duplicate_command_fd_avoiding_targets(
-            |minimum| file.duplicate_fd_cloexec_at_least(minimum),
-            &targets,
-        )?;
-        inherited_fds.push((source, target));
+        let source = file.child_process_fd()?;
+        if source <= libc::STDERR_FILENO || targets.contains(&source) {
+            let source = duplicate_command_fd_avoiding_targets(
+                |minimum| file.duplicate_fd_cloexec_at_least(minimum),
+                &targets,
+            )?;
+            inherited_fds.push((source, target));
+        } else {
+            bound_file_sources.push((file.clone(), source, target));
+        }
     }
     for AdditionalInheritedCommandFd { source, target } in additional {
         let source = if targets.contains(&source.as_raw_fd()) {
@@ -5799,9 +6087,32 @@ fn prepare_command_inherited_fds(
         inherited_fds.push((source, target));
     }
     Ok(PreparedCommandFds {
+        bound_file_sources,
         inherited: inherited_fds,
         targets,
     })
+}
+
+#[cfg(unix)]
+fn validate_inherited_command_targets_within_process_limit(targets: &BTreeSet<i32>) -> Result<()> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to read the process file descriptor limit");
+    }
+    let soft_limit = unsafe { limits.assume_init() }.rlim_cur;
+    let highest_target = *targets
+        .last()
+        .expect("non-empty targets have a highest descriptor");
+    if u128::try_from(highest_target).unwrap_or_default() >= u128::from(soft_limit) {
+        bail!(
+            "inherited command descriptor {highest_target} exceeds the process file descriptor limit {soft_limit}"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -10935,19 +11246,16 @@ struct OverwriteRecoveryReport {
 
 fn overwrite_recovery_is_blocked(
     root: &RootedFs,
-    directory: &Path,
+    directory: &RecoveryScanCandidate,
     blocked: &BTreeSet<StagedPublicationOverwrite>,
 ) -> Result<bool> {
     if blocked.is_empty() {
         return Ok(false);
     }
-    let Some(identity) = root.entry_identity(directory)? else {
-        return Ok(false);
-    };
     let candidate = StagedPublicationOverwrite {
-        transaction_path: publication_relative_path(root, directory)?,
-        transaction_device: identity.device(),
-        transaction_inode: identity.inode(),
+        transaction_path: publication_relative_path(root, &directory.path)?,
+        transaction_device: directory.identity.device(),
+        transaction_inode: directory.identity.inode(),
     };
     Ok(blocked.contains(&candidate))
 }
@@ -10961,144 +11269,81 @@ fn recover_pending_overwrite_transactions_locked(
     let mut report = OverwriteRecoveryReport::default();
     let mut scan_diagnostics = Vec::new();
     let mut scan_incomplete = false;
-    collect_overwrite_recovery_directories(
+    collect_recovery_directories(
         root,
-        video_dir,
-        video_dir,
+        recovery_scan_root(root, video_dir)?,
         &mut directories,
         &mut scan_diagnostics,
         &mut scan_incomplete,
+        RecoveryTransactionKind::Overwrite,
     )?;
     report.messages.extend(scan_diagnostics);
     report.incomplete = scan_incomplete;
-    directories.sort();
+    directories.sort_by(|left, right| left.path.cmp(&right.path));
 
     for directory in directories {
         if overwrite_recovery_is_blocked(root, &directory, blocked)? {
             report.unresolved = true;
             report.messages.push(format!(
                 "Deferred overwrite transaction referenced by an unresolved staged publication: {}",
-                directory.display()
+                directory.path.display()
             ));
             continue;
         }
-        let manifest_path = directory.join(OVERWRITE_RECOVERY_MANIFEST_NAME);
+        let manifest_path = directory.path.join(OVERWRITE_RECOVERY_MANIFEST_NAME);
         match root.open_bound_file(&manifest_path) {
             Ok(None) => {
                 report.unresolved = true;
                 report.messages.push(format!(
                     "Retained unrecognized legacy overwrite backup directory: {}",
-                    directory.display()
+                    directory.path.display()
                 ));
             }
             Ok(Some(_)) => match recover_overwrite_transaction(root, &directory) {
                 Ok(messages) => report.messages.extend(messages),
                 Err(err) => {
-                    report.unresolved = true;
-                    report.messages.push(format!(
-                        "Retained unresolved overwrite transaction {}: {err:#}",
-                        directory.display()
-                    ));
+                    if bind_recovery_scan_candidate(root, &directory).is_err() {
+                        report.incomplete = true;
+                        report.messages.push(format!(
+                            "Skipped changed overwrite transaction {}: {err:#}",
+                            directory.path.display()
+                        ));
+                    } else {
+                        report.unresolved = true;
+                        report.messages.push(format!(
+                            "Retained unresolved overwrite transaction {}: {err:#}",
+                            directory.path.display()
+                        ));
+                    }
                 }
             },
             Err(err) => {
-                report.unresolved = true;
-                report.messages.push(format!(
-                    "Retained unreadable overwrite transaction {}: {err:#}",
-                    directory.display()
-                ));
+                if bind_recovery_scan_candidate(root, &directory).is_err() {
+                    report.incomplete = true;
+                    report.messages.push(format!(
+                        "Skipped changed overwrite transaction {}: {err:#}",
+                        directory.path.display()
+                    ));
+                } else {
+                    report.unresolved = true;
+                    report.messages.push(format!(
+                        "Retained unreadable overwrite transaction {}: {err:#}",
+                        directory.path.display()
+                    ));
+                }
             }
         }
     }
     Ok(report)
 }
 
-fn collect_overwrite_recovery_directories(
+fn recover_overwrite_transaction(
     root: &RootedFs,
-    scan_root: &Path,
-    directory: &Path,
-    recovered: &mut Vec<PathBuf>,
-    diagnostics: &mut Vec<String>,
-    incomplete: &mut bool,
-) -> Result<()> {
-    root.validate_configured_root()?;
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(err) if directory != scan_root => {
-            *incomplete = true;
-            diagnostics.push(format!(
-                "Skipped unreadable directory during overwrite recovery scan {}: {err}",
-                directory.display()
-            ));
-            return Ok(());
-        }
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "failed to scan overwrite recovery root {}",
-                    directory.display()
-                )
-            });
-        }
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) => {
-                *incomplete = true;
-                diagnostics.push(format!(
-                    "Skipped unreadable entry during overwrite recovery scan {}: {err}",
-                    directory.display()
-                ));
-                continue;
-            }
-        };
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(err) => {
-                *incomplete = true;
-                diagnostics.push(format!(
-                    "Skipped uninspectable entry during overwrite recovery scan {}: {err}",
-                    entry.path().display()
-                ));
-                continue;
-            }
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with(OVERWRITE_BACKUP_DIR_PREFIX) {
-            recovered.push(path);
-            continue;
-        }
-        if name == VIDEO_STAGING_DIR_NAME {
-            continue;
-        }
-        collect_overwrite_recovery_directories(
-            root,
-            scan_root,
-            &path,
-            recovered,
-            diagnostics,
-            incomplete,
-        )?;
-    }
-    root.validate_configured_root()
-}
-
-fn recover_overwrite_transaction(root: &RootedFs, directory: &Path) -> Result<Vec<String>> {
-    let directory_entry = root.bind_entry(directory, false)?;
-    let directory_identity = root
-        .bound_entry_identity(&directory_entry)?
-        .with_context(|| {
-            format!(
-                "overwrite recovery directory is missing: {}",
-                directory.display()
-            )
-        })?;
+    candidate: &RecoveryScanCandidate,
+) -> Result<Vec<String>> {
+    let directory = &candidate.path;
+    let directory_entry = bind_recovery_scan_candidate(root, candidate)?;
+    let directory_identity = candidate.identity;
     if !directory_identity.is_dir() {
         bail!(
             "overwrite recovery path is not a directory: {}",
@@ -13006,6 +13251,7 @@ mod tests {
             cwd: staging.path().to_path_buf(),
             activity_dir: None,
             cleanup_paths: Vec::new(),
+            inherited_fd_base: None,
         };
         let output = run_command_with_bound_cwd(&test_config(), &spec, &staging.directory, None)
             .await
@@ -16646,6 +16892,54 @@ mod tests {
     }
 
     #[test]
+    fn recovery_scan_marks_a_replaced_nested_directory_incomplete() {
+        let root = temp_test_dir("recovery-scan-nested-directory-replacement");
+        let nested = root.join("nested");
+        let transaction = nested.join(format!("{BILIBILI_MUX_STAGING_DIR_PREFIX}pending"));
+        fs::create_dir_all(&transaction).expect("nested recovery transaction should create");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+        let original_nested = root.join("nested-original");
+        let mut replaced = false;
+        let mut recovered = Vec::new();
+        let mut diagnostics = Vec::new();
+        let mut incomplete = false;
+
+        collect_recovery_directories_with_before_child_binding(
+            &rooted,
+            RecoveryScanDirectory::Root,
+            &mut recovered,
+            &mut diagnostics,
+            &mut incomplete,
+            RecoveryTransactionKind::BilibiliMux,
+            &mut |path| {
+                if !replaced && path == nested.as_path() {
+                    fs::rename(&nested, &original_nested)
+                        .expect("original nested directory should move");
+                    fs::create_dir(&nested).expect("replacement nested directory should create");
+                    replaced = true;
+                }
+            },
+        )
+        .expect("scan should contain the changed child without treating it as clean");
+
+        assert!(replaced);
+        assert!(recovered.is_empty());
+        assert!(incomplete);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|line| line.contains("replaced directory during Bilibili mux recovery scan"))
+        );
+        assert!(
+            original_nested
+                .join(transaction.file_name().unwrap())
+                .is_dir()
+        );
+        assert!(!nested.join(transaction.file_name().unwrap()).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn retained_staging_recovers_nested_muxing_transaction() {
         let root = temp_test_dir("retained-bilibili-muxing-recovery");
         let rooted = RootedFs::new(&root).expect("output root should bind");
@@ -17109,7 +17403,7 @@ mod tests {
             .expect("worker request descriptor should create");
 
         let inherited_request = request_file
-            .duplicate_fd_cloexec_at_least(BILIBILI_MUX_FD_BASE)
+            .duplicate_fd_cloexec_at_least(BILIBILI_WORKER_REQUEST_FD)
             .expect("worker request should duplicate for inheritance");
         let parsed = read_bilibili_worker_request_from_fd(inherited_request)
             .expect("worker should parse the inherited request at its current offset");
@@ -19096,6 +19390,7 @@ mv video.original video.m4s || exit 46
             cwd: root.clone(),
             activity_dir: Some(root.clone()),
             cleanup_paths: Vec::new(),
+            inherited_fd_base: None,
         };
         let (tx, mut rx) = job_progress_channel();
         let progress_handle = tokio::spawn(async move {
@@ -19152,6 +19447,7 @@ mv video.original video.m4s || exit 46
             cwd: root.clone(),
             activity_dir: None,
             cleanup_paths: Vec::new(),
+            inherited_fd_base: None,
         };
 
         let output = tokio_timeout(
@@ -19193,6 +19489,7 @@ mv video.original video.m4s || exit 46
             cwd: root.clone(),
             activity_dir: None,
             cleanup_paths: Vec::new(),
+            inherited_fd_base: None,
         };
 
         let output = run_command_with_execution_context(
@@ -19332,11 +19629,14 @@ mv video.original video.m4s || exit 46
             program: PathBuf::from("/bin/sh"),
             args: vec![
                 "-c".to_string(),
-                "printf '%s\\n' \"$PWD\"; /bin/cat /dev/fd/64; /bin/test -r /dev/fd/61".to_string(),
+                format!(
+                    "printf '%s\\n' \"$PWD\"; /bin/cat /dev/fd/{BILIBILI_WORKER_REQUEST_FD}; /bin/test -r /dev/fd/{BILIBILI_WORKER_OUTPUT_LOCK_FD}"
+                ),
             ],
             cwd: staging.path().to_path_buf(),
             activity_dir: None,
             cleanup_paths: Vec::new(),
+            inherited_fd_base: Some(BILIBILI_WORKER_REQUEST_FD),
         };
         let (worker_liveness, _parent_liveness) =
             command_liveness_pair().expect("worker liveness pair should create");
@@ -19417,8 +19717,11 @@ mv video.original video.m4s || exit 46
 
         let root = temp_test_dir("bilibili-mux-low-fd-limit");
         let fake_ffmpeg = root.join("fake-ffmpeg.sh");
-        fs::write(&fake_ffmpeg, "#!/bin/sh\nprintf muxed >&65\n")
-            .expect("fake ffmpeg should write");
+        fs::write(
+            &fake_ffmpeg,
+            "#!/bin/sh\noutput_fd=\nnext_is_fd=no\nfor arg do\n    if test \"$next_is_fd\" = yes; then\n        output_fd=$arg\n        next_is_fd=no\n    elif test \"$arg\" = -fd; then\n        next_is_fd=yes\n    fi\ndone\ntest -n \"$output_fd\" || exit 41\nprintf '%s' \"$output_fd\" > mux-output-fd\neval \"printf muxed >&$output_fd\"\n",
+        )
+        .expect("fake ffmpeg should write");
         fs::set_permissions(&fake_ffmpeg, fs::Permissions::from_mode(0o700))
             .expect("fake ffmpeg should become executable");
 
@@ -19446,6 +19749,22 @@ mv video.original video.m4s || exit 46
             });
             raw_inputs.push(raw);
         }
+        let mut flv_files = Vec::new();
+        for index in 0..15 {
+            let raw = root.join(format!("segment-{index:02}.flv"));
+            fs::write(&raw, "raw-flv-segment").expect("FLV segment should write");
+            flv_files.push(BilibiliDownloadedFile {
+                kind: "flv_segment".to_string(),
+                path: raw.clone(),
+            });
+            raw_inputs.push(raw);
+        }
+        report.entries.push(BilibiliEntryDownloadReport {
+            index: 32,
+            title: "Segmented episode".to_string(),
+            files: flv_files,
+            mux: None,
+        });
 
         let rooted = RootedFs::new(&root).expect("output root should bind");
         mux_bilibili_report_media(&config, &rooted, &root, &mut report, UNIX_EPOCH, None)
@@ -19453,6 +19772,11 @@ mv video.original video.m4s || exit 46
             .expect("each mux should release descriptor-bound state before the next entry");
 
         assert!(raw_inputs.iter().all(|path| !path.exists()));
+        assert_eq!(
+            fs::read_to_string(root.join("mux-output-fd"))
+                .expect("fake ffmpeg should report the final output descriptor"),
+            (BILIBILI_MUX_MIN_FD_BASE + 16).to_string()
+        );
         for entry in &report.entries {
             let mux = entry
                 .mux
@@ -19484,8 +19808,9 @@ mv video.original video.m4s || exit 46
             command_liveness_pair().expect("worker liveness pair should create");
         let additional = prepare_bilibili_worker_inherited_fds(&worker_liveness, &output_lock)
             .expect("worker descriptors should prepare");
-        let PreparedCommandFds { inherited, .. } = prepare_command_inherited_fds(&[], additional)
-            .expect("worker descriptors should avoid target collisions");
+        let PreparedCommandFds { inherited, .. } =
+            prepare_command_inherited_fds(&[], additional, None)
+                .expect("worker descriptors should avoid target collisions");
         drop(worker_liveness);
 
         let ready = root.join("worker.ready");
@@ -19626,6 +19951,7 @@ mv video.original video.m4s || exit 46
             cwd: root.clone(),
             activity_dir: None,
             cleanup_paths: Vec::new(),
+            inherited_fd_base: None,
         };
         let child_root = root.clone();
         let command = tokio::spawn(async move {
@@ -19755,6 +20081,7 @@ mv video.original video.m4s || exit 46
             cwd: root,
             activity_dir: None,
             cleanup_paths: Vec::new(),
+            inherited_fd_base: None,
         };
 
         let result = run_command_with_execution_context(
@@ -19788,6 +20115,7 @@ mv video.original video.m4s || exit 46
             cwd: root.clone(),
             activity_dir: Some(root.clone()),
             cleanup_paths: Vec::new(),
+            inherited_fd_base: None,
         };
 
         let result = run_command(&config, &spec, None).await;
@@ -19831,6 +20159,7 @@ mv video.original video.m4s || exit 46
             cwd: root.clone(),
             activity_dir: Some(root.clone()),
             cleanup_paths: Vec::new(),
+            inherited_fd_base: None,
         };
         let task = tokio::spawn(async move { run_command(&config, &spec, None).await });
         for _ in 0..50 {
@@ -19883,6 +20212,7 @@ mv video.original video.m4s || exit 46
             cwd: root.clone(),
             activity_dir: Some(root.clone()),
             cleanup_paths: vec![cleanup_file.clone()],
+            inherited_fd_base: None,
         };
 
         let result = tokio_timeout(Duration::from_secs(8), run_command(&config, &spec, None))

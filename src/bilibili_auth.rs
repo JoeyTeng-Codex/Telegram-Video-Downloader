@@ -42,6 +42,7 @@ const AUTH_EPOCH_SLOT_SIZE: usize = 64;
 const AUTH_EPOCH_SLOT_COUNT: usize = 2;
 const AUTH_EPOCH_SLOT_MAGIC: &[u8; 8] = b"TVDAUTH1";
 const AUTH_LOCK_HEADER: &[u8] = b"telegram-video-downloader-auth-lock-v1\n";
+const AUTH_STATE_FILE_LIMIT: usize = 1024 * 1024;
 const LOGIN_URL_COOKIE_NAMES: &[&str] = &[
     "SESSDATA",
     "bili_jct",
@@ -160,6 +161,34 @@ impl AuthCredentialFilePath {
     }
 }
 
+#[derive(Debug)]
+struct BoundAuthStatePath {
+    root: RootedFs,
+    path: PathBuf,
+}
+
+impl BoundAuthStatePath {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn config_path(&self) -> PathBuf {
+        bbdown_config_path(&self.path)
+    }
+
+    fn legacy_config_path(&self) -> PathBuf {
+        legacy_bbdown_config_path(&self.path)
+    }
+
+    fn config_dir_path(&self) -> PathBuf {
+        bbdown_config_dir(&self.path)
+    }
+
+    fn validate_root(&self) -> Result<()> {
+        self.root.validate_configured_root()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthEpoch {
     value: u64,
@@ -196,7 +225,7 @@ impl AuthReplyFileLock {
 }
 
 pub struct LockedAuthMutation<'a> {
-    state_path: &'a Path,
+    state: Option<&'a BoundAuthStatePath>,
     credential_file: &'a Path,
     _lock: &'a AuthMutationFileLock,
     epoch: AuthEpoch,
@@ -207,14 +236,14 @@ pub type AuthCleanupResult = (Result<bool>, Result<()>);
 impl LockedAuthMutation<'_> {
     pub fn sync_legacy_cookie(&self, credential_profile: Option<&str>) -> Result<bool> {
         sync_bbdown_rust_credentials_from_state_unlocked(
-            self.state_path,
+            self.state,
             self.credential_file,
             credential_profile,
         )
     }
 
     pub fn delete_legacy_state(&self) -> Result<bool> {
-        delete_auth_state_unlocked(self.state_path, self.credential_file)
+        delete_auth_state_unlocked(self.state, self.credential_file)
     }
 
     pub fn epoch(&self) -> AuthEpoch {
@@ -1088,18 +1117,22 @@ pub fn recover_interrupted_auth_cleanup(
     state_path: &Path,
     credential_file: &Path,
 ) -> Result<Vec<String>> {
-    ensure_auth_state_path_has_no_symlink_components(state_path)?;
+    let state = bind_auth_state_path_before_lock(state_path)?;
     with_auth_mutation_lock(credential_file, &[state_path, credential_file], |lock| {
-        reconcile_interrupted_auth_cleanup_and_bump_epoch(lock, state_path, lock.credential_file())
+        reconcile_interrupted_auth_cleanup_and_bump_epoch(
+            lock,
+            state.as_ref(),
+            lock.credential_file(),
+        )
     })
 }
 
 fn reconcile_interrupted_auth_cleanup_and_bump_epoch(
     lock: &AuthMutationFileLock,
-    state_path: &Path,
+    state: Option<&BoundAuthStatePath>,
     credential_file: &Path,
 ) -> Result<Vec<String>> {
-    let messages = reconcile_interrupted_auth_cleanup_unlocked(state_path, credential_file)?;
+    let messages = reconcile_interrupted_auth_cleanup_unlocked(state, credential_file)?;
     if !messages.is_empty() {
         lock.bump_epoch()?;
     }
@@ -1107,44 +1140,23 @@ fn reconcile_interrupted_auth_cleanup_and_bump_epoch(
 }
 
 fn reconcile_interrupted_auth_cleanup_unlocked(
-    state_path: &Path,
+    state: Option<&BoundAuthStatePath>,
     credential_file: &Path,
 ) -> Result<Vec<String>> {
-    let state_path = absolute_auth_cleanup_path(state_path)?;
-    let parent = state_path
-        .parent()
-        .context("Bilibili auth state path has no parent")?;
-    match fs::metadata(parent) {
-        Ok(metadata) if metadata.is_dir() => {}
-        Ok(_) => bail!(
-            "Bilibili auth cleanup root is not a directory: {}",
-            parent.display()
-        ),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "failed to inspect Bilibili auth cleanup root {}",
-                    parent.display()
-                )
-            });
-        }
-    }
+    let Some(state) = state else {
+        return Ok(Vec::new());
+    };
+    state.validate_root()?;
 
     let mut messages = Vec::new();
     let mut unresolved = false;
     let mut restored = false;
-    let root = RootedFs::new(parent).with_context(|| {
-        format!(
-            "failed to bind Bilibili auth cleanup directory {}",
-            parent.display()
-        )
-    })?;
     // Protected property: auth recovery considers managed quarantine entries only in the
     // exact directories where legacy state/config cleanup can create them. Rebinding the
     // active credential for every candidate makes object identity the sole restore signal;
     // unrelated sibling subtrees are outside this recovery authority.
-    let report = root
+    let report = state
+        .root
         .reconcile_remove_quarantines_in_current_directory_with_status_and_restore_decider(
             |candidate| {
                 let current_credential = bind_cleanup_target(credential_file)?;
@@ -1158,7 +1170,7 @@ fn reconcile_interrupted_auth_cleanup_unlocked(
     unresolved |= report.unresolved;
     restored |= report.restored;
 
-    if let Some(config_dir) = bind_private_stale_bbdown_config_directory(&state_path)? {
+    if let Some(config_dir) = bind_private_stale_bbdown_config_directory_from_state(state)? {
         // Object identity alone is insufficient here: a mode or ownership change leaves the
         // same directory object in place but expands who can choose recovery entries. Check the
         // app-owned private access policy on both sides of descriptor-bound recovery.
@@ -1200,6 +1212,7 @@ fn reconcile_interrupted_auth_cleanup_unlocked(
             messages.join("; ")
         );
     }
+    state.validate_root()?;
     Ok(messages)
 }
 
@@ -1566,9 +1579,13 @@ pub fn acquire_auth_reply_file_lock(
     state_path: &Path,
     credential_file: &Path,
 ) -> Result<AuthReplyFileLock> {
-    ensure_auth_state_path_has_no_symlink_components(state_path)?;
+    let state = bind_auth_state_path_before_lock(state_path)?;
     let lock = acquire_auth_mutation_file_lock(credential_file, &[state_path, credential_file])?;
-    reconcile_interrupted_auth_cleanup_and_bump_epoch(&lock, state_path, lock.credential_file())?;
+    reconcile_interrupted_auth_cleanup_and_bump_epoch(
+        &lock,
+        state.as_ref(),
+        lock.credential_file(),
+    )?;
     Ok(AuthReplyFileLock { lock })
 }
 
@@ -1600,11 +1617,11 @@ fn with_auth_mutation_transaction_inner<T>(
     expected_epoch: Option<AuthEpoch>,
     operation: impl for<'a> FnOnce(&LockedAuthMutation<'a>) -> Result<T>,
 ) -> Result<(T, AuthEpoch)> {
-    ensure_auth_state_path_has_no_symlink_components(state_path)?;
+    let state = bind_auth_state_path_before_lock(state_path)?;
     with_auth_mutation_lock(credential_file, &[state_path, credential_file], |lock| {
         reconcile_interrupted_auth_cleanup_and_bump_epoch(
             lock,
-            state_path,
+            state.as_ref(),
             lock.credential_file(),
         )?;
         if let Some(expected_epoch) = expected_epoch {
@@ -1619,7 +1636,7 @@ fn with_auth_mutation_transaction_inner<T>(
         }
         let epoch = lock.bump_epoch()?;
         let transaction = LockedAuthMutation {
-            state_path,
+            state: state.as_ref(),
             credential_file: lock.credential_file(),
             _lock: lock,
             epoch,
@@ -2072,6 +2089,30 @@ fn load_auth_state_unlocked(path: &Path) -> Result<Option<AuthState>> {
     }
 }
 
+fn load_bound_auth_state_unlocked(state: &BoundAuthStatePath) -> Result<Option<AuthState>> {
+    state.validate_root()?;
+    let Some(file) = state.root.open_bound_file(state.path()).with_context(|| {
+        format!(
+            "failed to read Bilibili auth state {}",
+            state.path().display()
+        )
+    })?
+    else {
+        state.validate_root()?;
+        return Ok(None);
+    };
+    let contents = file.read_limited(AUTH_STATE_FILE_LIMIT)?;
+    state.validate_root()?;
+    serde_json::from_slice(&contents)
+        .with_context(|| {
+            format!(
+                "failed to parse Bilibili auth state {}",
+                state.path().display()
+            )
+        })
+        .map(Some)
+}
+
 pub fn save_auth_state(path: &Path, state: &AuthState) -> Result<()> {
     let _guard = AUTH_FILE_LOCK
         .lock()
@@ -2124,27 +2165,38 @@ pub fn delete_auth_state(path: &Path, credential_file: &Path) -> Result<bool> {
     .map(|(removed, _)| removed)
 }
 
-fn delete_auth_state_unlocked(path: &Path, credential_file: &Path) -> Result<bool> {
-    let config_path = bbdown_config_path(path);
-    let legacy_config_path = legacy_bbdown_config_path(path);
+fn delete_auth_state_unlocked(
+    state: Option<&BoundAuthStatePath>,
+    credential_file: &Path,
+) -> Result<bool> {
+    let Some(state) = state else {
+        return Ok(false);
+    };
+    state.validate_root()?;
     let mut removed = false;
-    if remove_legacy_file_if_exists(path, credential_file)
-        .with_context(|| format!("failed to delete Bilibili auth state {}", path.display()))?
-    {
+    if remove_bound_state_file_if_exists(state, state.path(), credential_file).with_context(
+        || {
+            format!(
+                "failed to delete Bilibili auth state {}",
+                state.path().display()
+            )
+        },
+    )? {
         removed = true;
     }
 
-    for path in [config_path, legacy_config_path] {
-        if remove_legacy_file_if_exists(&path, credential_file)
+    for path in [state.config_path(), state.legacy_config_path()] {
+        if remove_bound_state_file_if_exists(state, &path, credential_file)
             .with_context(|| format!("failed to delete BBDown auth config {}", path.display()))?
         {
             removed = true;
         }
     }
-    if cleanup_stale_bbdown_config_files_unlocked(path, credential_file)? {
+    if cleanup_stale_bbdown_config_files_from_bound_state_unlocked(state, credential_file)? {
         removed = true;
     }
 
+    state.validate_root()?;
     Ok(removed)
 }
 
@@ -2196,16 +2248,33 @@ fn sync_bbdown_rust_credentials_from_state_with_epoch_and_hook(
     credential_profile: Option<&str>,
     after_legacy_read: impl FnOnce(),
 ) -> Result<(Result<bool>, AuthEpoch)> {
-    ensure_auth_state_path_has_no_symlink_components(state_path)?;
+    sync_bbdown_rust_credentials_from_state_with_epoch_and_hooks(
+        state_path,
+        credential_file,
+        credential_profile,
+        || {},
+        after_legacy_read,
+    )
+}
+
+fn sync_bbdown_rust_credentials_from_state_with_epoch_and_hooks(
+    state_path: &Path,
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+    before_lock: impl FnOnce(),
+    after_legacy_read: impl FnOnce(),
+) -> Result<(Result<bool>, AuthEpoch)> {
+    let state = bind_auth_state_path_before_lock(state_path)?;
+    before_lock();
     with_auth_mutation_lock(credential_file, &[state_path, credential_file], |lock| {
         reconcile_interrupted_auth_cleanup_and_bump_epoch(
             lock,
-            state_path,
+            state.as_ref(),
             lock.credential_file(),
         )?;
         let credential_file = lock.credential_file();
         let current_epoch = lock.current_epoch()?;
-        let cookie = match legacy_cookie_from_state_unlocked(state_path) {
+        let cookie = match legacy_cookie_from_state_unlocked(state.as_ref()) {
             Ok(Some(cookie)) => cookie,
             Ok(None) => return Ok((Ok(false), current_epoch)),
             Err(err) => return Ok((Err(err), current_epoch)),
@@ -2222,6 +2291,9 @@ fn sync_bbdown_rust_credentials_from_state_with_epoch_and_hook(
         if !update_needed {
             return Ok((Ok(false), current_epoch));
         }
+        if let Some(state) = state.as_ref() {
+            state.validate_root()?;
+        }
         after_legacy_read();
         let epoch = lock.bump_epoch()?;
         let result = update_bbdown_rust_cookie_unlocked(
@@ -2230,6 +2302,9 @@ fn sync_bbdown_rust_credentials_from_state_with_epoch_and_hook(
             Some(&cookie),
             false,
         );
+        if let Some(state) = state.as_ref() {
+            state.validate_root()?;
+        }
         Ok((result, epoch))
     })
 }
@@ -2251,18 +2326,33 @@ fn bbdown_rust_cookie_update_needed_unlocked(
 }
 
 fn sync_bbdown_rust_credentials_from_state_unlocked(
-    state_path: &Path,
+    state: Option<&BoundAuthStatePath>,
     credential_file: &Path,
     credential_profile: Option<&str>,
 ) -> Result<bool> {
-    let Some(cookie) = legacy_cookie_from_state_unlocked(state_path)? else {
+    let Some(cookie) = legacy_cookie_from_state_unlocked(state)? else {
         return Ok(false);
     };
-    update_bbdown_rust_cookie_unlocked(credential_file, credential_profile, Some(&cookie), false)
+    if let Some(state) = state {
+        state.validate_root()?;
+    }
+    let result = update_bbdown_rust_cookie_unlocked(
+        credential_file,
+        credential_profile,
+        Some(&cookie),
+        false,
+    );
+    if let Some(state) = state {
+        state.validate_root()?;
+    }
+    result
 }
 
-fn legacy_cookie_from_state_unlocked(state_path: &Path) -> Result<Option<String>> {
-    let Some(state) = load_auth_state_unlocked(state_path)? else {
+fn legacy_cookie_from_state_unlocked(state: Option<&BoundAuthStatePath>) -> Result<Option<String>> {
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    let Some(state) = load_bound_auth_state_unlocked(state)? else {
         return Ok(None);
     };
     let cookie = state.cookie.trim();
@@ -2614,6 +2704,39 @@ fn bind_cleanup_target(path: &Path) -> Result<Option<BoundCleanupTarget>> {
     Ok(Some(BoundCleanupTarget { root, entry, file }))
 }
 
+fn bind_cleanup_target_in_root(root: &RootedFs, path: &Path) -> Result<Option<BoundCleanupTarget>> {
+    let Some(file) = root.open_bound_file(path)? else {
+        return Ok(None);
+    };
+    let entry = root.bind_entry(path, false)?;
+    if root.bound_entry_identity(&entry)? != Some(file.identity()) {
+        bail!(
+            "Bilibili auth cleanup target identity changed while binding: {}",
+            path.display()
+        );
+    }
+    Ok(Some(BoundCleanupTarget {
+        root: root.clone(),
+        entry,
+        file,
+    }))
+}
+
+fn remove_bound_state_file_if_exists(
+    state: &BoundAuthStatePath,
+    path: &Path,
+    credential_file: &Path,
+) -> Result<bool> {
+    state.validate_root()?;
+    let Some(target) = bind_cleanup_target_in_root(&state.root, path)? else {
+        state.validate_root()?;
+        return Ok(false);
+    };
+    let result = remove_bound_cleanup_target_with_hook(path, target, credential_file, || Ok(()));
+    state.validate_root()?;
+    result
+}
+
 fn bind_private_stale_bbdown_config_directory(
     state_path: &Path,
 ) -> Result<Option<BoundStaleBbdownConfigDirectory>> {
@@ -2652,6 +2775,40 @@ fn bind_private_stale_bbdown_config_directory(
         })?;
     Ok(Some(BoundStaleBbdownConfigDirectory {
         root,
+        entry,
+        identity,
+        path,
+    }))
+}
+
+fn bind_private_stale_bbdown_config_directory_from_state(
+    state: &BoundAuthStatePath,
+) -> Result<Option<BoundStaleBbdownConfigDirectory>> {
+    state.validate_root()?;
+    let path = state.config_dir_path();
+    let Some(identity) = state.root.entry_identity(&path)? else {
+        state.validate_root()?;
+        return Ok(None);
+    };
+    let entry = state.root.bind_entry(&path, false)?;
+    if state.root.bound_entry_identity(&entry)? != Some(identity) {
+        bail!(
+            "stale BBDown auth config directory identity changed while binding: {}",
+            path.display()
+        );
+    }
+    state
+        .root
+        .validate_private_bound_directory(&entry, identity, 0o700)
+        .with_context(|| {
+            format!(
+                "stale BBDown auth config directory must be an app-owned private directory: {}",
+                path.display()
+            )
+        })?;
+    state.validate_root()?;
+    Ok(Some(BoundStaleBbdownConfigDirectory {
+        root: state.root.clone(),
         entry,
         identity,
         path,
@@ -2698,6 +2855,45 @@ fn absolute_auth_cleanup_path(path: &Path) -> Result<PathBuf> {
             .context("failed to resolve the current directory for auth cleanup")?
             .join(path))
     }
+}
+
+fn bind_auth_state_path_before_lock(path: &Path) -> Result<Option<BoundAuthStatePath>> {
+    ensure_auth_state_path_has_no_symlink_components(path)?;
+    let path = absolute_auth_cleanup_path(path)?;
+    let parent = path
+        .parent()
+        .context("Bilibili auth state path has no parent")?;
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            bail!(
+                "Bilibili auth state parent is not a directory: {}",
+                parent.display()
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to inspect Bilibili auth state parent {}",
+                    parent.display()
+                )
+            });
+        }
+    }
+
+    // Protected property: lock-protected legacy state work stays attached to the parent
+    // directory selected before waiting for the cross-process credential lock. Every later
+    // operation validates this root, so replacing the lexical parent fails closed.
+    let root = RootedFs::new(parent).with_context(|| {
+        format!(
+            "failed to bind Bilibili auth state parent before acquiring the auth lock: {}",
+            parent.display()
+        )
+    })?;
+    root.bind_entry(&path, false)?;
+    root.validate_configured_root()?;
+    Ok(Some(BoundAuthStatePath { root, path }))
 }
 
 pub(crate) fn ensure_auth_state_path_has_no_symlink_components(path: &Path) -> Result<()> {
@@ -2759,6 +2955,27 @@ fn cleanup_stale_bbdown_config_files_unlocked(path: &Path, credential_file: &Pat
     let Some(config_dir) = bind_private_stale_bbdown_config_directory(path)? else {
         return Ok(false);
     };
+    cleanup_stale_bbdown_config_files_in_directory(config_dir, credential_file)
+}
+
+fn cleanup_stale_bbdown_config_files_from_bound_state_unlocked(
+    state: &BoundAuthStatePath,
+    credential_file: &Path,
+) -> Result<bool> {
+    state.validate_root()?;
+    let Some(config_dir) = bind_private_stale_bbdown_config_directory_from_state(state)? else {
+        state.validate_root()?;
+        return Ok(false);
+    };
+    let result = cleanup_stale_bbdown_config_files_in_directory(config_dir, credential_file);
+    state.validate_root()?;
+    result
+}
+
+fn cleanup_stale_bbdown_config_files_in_directory(
+    config_dir: BoundStaleBbdownConfigDirectory,
+    credential_file: &Path,
+) -> Result<bool> {
     let active_files = active_bbdown_config_files()
         .lock()
         .expect("active BBDown config lock should not poison")
@@ -3955,6 +4172,81 @@ mod tests {
         assert!(!called.get());
         assert_eq!(fs::read(&victim).unwrap(), b"unrelated-state");
         assert!(!auth_mutation_lock_path(&credential_file).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_state_parent_replacement_while_waiting_for_lock_fails_closed() {
+        use std::sync::mpsc::sync_channel;
+        use std::thread;
+
+        let root = temp_state_file("auth-state-parent-replacement")
+            .parent()
+            .expect("test state should have a root")
+            .to_path_buf();
+        let state_parent = root.join("state");
+        let state_path = state_parent.join("state.json");
+        let credential_file = root.join("credentials.json");
+        fs::create_dir_all(&state_parent).expect("state parent should create");
+        save_auth_state(&state_path, &test_state()).expect("legacy state should save");
+
+        let held_lock = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect("test should hold the credential lock");
+        let (bound_tx, bound_rx) = sync_channel(0);
+        let migration_state = state_path.clone();
+        let migration_credentials = credential_file.clone();
+        let migration = thread::spawn(move || {
+            sync_bbdown_rust_credentials_from_state_with_epoch_and_hooks(
+                &migration_state,
+                &migration_credentials,
+                None,
+                || bound_tx.send(()).expect("state binding signal should send"),
+                || {},
+            )
+        });
+        bound_rx
+            .recv()
+            .expect("migration should bind the original state parent before waiting");
+
+        let original_parent = root.join("state-original");
+        fs::rename(&state_parent, &original_parent)
+            .expect("original state parent should move out of the configured path");
+        fs::create_dir(&state_parent).expect("replacement state parent should create");
+        let replacement_state = AuthState {
+            cookie: "SESSDATA=attacker".to_string(),
+            mid: 999,
+            uname: "replacement".to_string(),
+            stored_at_unix: 1,
+        };
+        fs::write(
+            state_parent.join("state.json"),
+            serde_json::to_vec(&replacement_state).expect("replacement state should encode"),
+        )
+        .expect("replacement state should write");
+        drop(held_lock);
+
+        let error = migration
+            .join()
+            .expect("migration thread should finish")
+            .expect_err("replaced state parent must reject the delayed migration");
+        assert!(
+            format!("{error:#}").contains("configured output root identity changed"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            load_auth_state(&original_parent.join("state.json"))
+                .expect("original state should remain readable"),
+            Some(test_state())
+        );
+        assert_eq!(
+            load_auth_state(&state_parent.join("state.json"))
+                .expect("replacement state should remain readable"),
+            Some(replacement_state)
+        );
+        assert!(
+            !credential_file.exists(),
+            "migration must not write credentials from replacement state"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
