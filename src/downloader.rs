@@ -3787,31 +3787,7 @@ async fn run_staged_video_job(
                 &staging, err,
             ));
         }
-        Err(err) => {
-            match retained_video_staging_reason(&staging.root, staging.path(), staging.identity) {
-                Ok(Some(reason)) => {
-                    staging.preserve_for_recovery();
-                    return Err(err.context(format!(
-                        "Bilibili worker retained completed outputs for manual recovery: {reason}"
-                    )));
-                }
-                Ok(None) => {
-                    let cleanup = staging.discard_incomplete();
-                    return match cleanup {
-                        Ok(()) => Err(err),
-                        Err(cleanup) => Err(err.context(format!(
-                            "failed to clean incomplete staged download; staging was retained: {cleanup:#}"
-                        ))),
-                    };
-                }
-                Err(retention_error) => {
-                    staging.preserve_for_recovery();
-                    return Err(err.context(format!(
-                    "failed to verify the staged download completion marker; staging was retained: {retention_error:#}"
-                )));
-                }
-            }
-        }
+        Err(err) => return Err(retain_or_discard_failed_staged_video_download(staging, err)),
     };
 
     staging
@@ -3931,6 +3907,53 @@ async fn run_staged_video_job(
         .context("failed to durably finalize the staged video job")?;
     guard.mark_operation_clean();
     Ok(report)
+}
+
+fn retain_or_discard_failed_staged_video_download(
+    staging: BoundStagingDir,
+    worker_error: anyhow::Error,
+) -> anyhow::Error {
+    match retained_video_staging_reason(&staging.root, staging.path(), staging.identity) {
+        Ok(Some(reason)) => {
+            staging.preserve_for_recovery();
+            worker_error.context(format!(
+                "Bilibili worker retained completed outputs for manual recovery: {reason}"
+            ))
+        }
+        Ok(None) => match bilibili_worker_lifecycle_phase(
+            &staging.root,
+            staging.path(),
+            staging.root.root_identity().device(),
+            staging.root.root_identity().inode(),
+            staging.identity.device(),
+            staging.identity.inode(),
+        ) {
+            Ok(Some(BilibiliWorkerLifecyclePhase::CoreDownloadCompleted)) => {
+                retain_completed_bilibili_staging_after_marker_failure(&staging, worker_error)
+            }
+            Ok(Some(BilibiliWorkerLifecyclePhase::Launched) | None) => {
+                let cleanup = staging.discard_incomplete();
+                match cleanup {
+                    Ok(()) => worker_error,
+                    Err(cleanup) => worker_error.context(format!(
+                        "failed to clean incomplete staged download; staging was retained: {cleanup:#}"
+                    )),
+                }
+            }
+            Err(lifecycle_error) => {
+                staging.preserve_for_recovery();
+                worker_error.context(format!(
+                    "failed to verify the Bilibili worker completion lifecycle; staging was retained: {lifecycle_error:#}"
+                ))
+            }
+        },
+        Err(retention_error) => {
+            staging.preserve_for_recovery();
+            worker_error.context(format!(
+                "failed to verify the staged download completion marker; staging was retained: {retention_error:#}"
+            ))
+        }
+    }
 }
 
 fn staged_primary_media_kind(
@@ -17043,6 +17066,85 @@ mod tests {
         }));
         assert!(staging_path.is_dir());
         assert!(completed_output.is_file());
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn completed_bilibili_lifecycle_retains_staging_after_an_unreported_worker_failure() {
+        let config = test_config();
+        let video_dir = temp_test_dir("bilibili-unreported-completion");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+        let output_lock = video_output_lock_file(&root).expect("output lock should bind");
+        let staging =
+            create_video_staging_dir(&root).expect("worker staging directory should create");
+        staging.preserve_for_recovery();
+        persist_bilibili_worker_lifecycle(&staging)
+            .expect("worker launch lifecycle should persist");
+        let request = build_bilibili_worker_request(
+            &config,
+            "https://www.bilibili.com/video/BV123",
+            None,
+            None,
+            &staging,
+            &output_lock,
+        );
+        let staging_path = staging.path().to_path_buf();
+        let completed_output = staging_path.join("Episode.mp4");
+        fs::write(&completed_output, "completed-media").expect("completed output should write");
+        let worker_root =
+            RootedFs::new(staging.path()).expect("worker should bind the staging directory");
+        persist_bilibili_worker_core_download_lifecycle(&worker_root, &request)
+            .expect("core completion lifecycle should persist before the worker fails");
+        drop(worker_root);
+
+        let error = retain_or_discard_failed_staged_video_download(
+            staging,
+            anyhow!("Bilibili worker exited before returning its completion response"),
+        );
+
+        assert!(format!("{error:#}").contains("core download completed"));
+        assert!(completed_output.is_file());
+        assert_eq!(
+            retained_video_staging_reason(
+                &root,
+                &staging_path,
+                root.entry_identity(&staging_path)
+                    .expect("staging identity should remain observable")
+                    .expect("staging directory should remain")
+            )
+            .expect("parent should persist a recovery marker")
+            .as_deref(),
+            Some(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)
+        );
+        let recovery = recover_pending_video_staging_directories_locked(&root)
+            .expect("completed staging should remain recoverable after worker failure");
+        assert!(!recovery.unresolved);
+        assert!(staging_path.is_dir());
+        assert!(completed_output.is_file());
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn launched_bilibili_lifecycle_discards_staging_after_a_generic_worker_failure() {
+        let video_dir = temp_test_dir("bilibili-unreported-launch-only-failure");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+        let staging =
+            create_video_staging_dir(&root).expect("worker staging directory should create");
+        staging.preserve_for_recovery();
+        persist_bilibili_worker_lifecycle(&staging)
+            .expect("worker launch lifecycle should persist");
+        let staging_path = staging.path().to_path_buf();
+
+        let error = retain_or_discard_failed_staged_video_download(
+            staging,
+            anyhow!("Bilibili worker exited before completing its core download"),
+        );
+
+        assert!(
+            format!("{error:#}").contains("Bilibili worker exited before completing"),
+            "original worker failure should remain visible: {error:#}"
+        );
+        assert!(!staging_path.exists());
         let _ = fs::remove_dir_all(video_dir);
     }
 

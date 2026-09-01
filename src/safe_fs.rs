@@ -464,6 +464,54 @@ impl RootedFs {
         )
     }
 
+    pub(crate) fn reconcile_remove_quarantines_in_bound_directory_with_status_and_restore_decider<
+        F,
+    >(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+        mut should_restore: F,
+    ) -> Result<RemoveQuarantineRecoveryReport>
+    where
+        F: FnMut(EntryIdentity) -> Result<bool>,
+    {
+        // Protected property: recovery must remain inside the exact directory object selected by
+        // the caller. The bound parent descriptor prevents a renamed or symlink-replaced path
+        // from redirecting cleanup to a replacement directory.
+        self.validate_bound_parent(&entry.parent)?;
+        if identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected)
+            || !expected.is_dir()
+        {
+            bail!("bound directory identity changed: {}", entry.path.display());
+        }
+        let directory = openat_directory(entry.parent.fd.as_ref(), &entry.leaf)
+            .with_context(|| format!("failed to open bound directory {}", entry.path.display()))?;
+        if identity_for_fd(&directory)? != expected {
+            bail!("bound directory identity changed: {}", entry.path.display());
+        }
+        let mut state = RemoveQuarantineScanState::default();
+        reconcile_remove_quarantines_in_directory(
+            &directory,
+            expected,
+            &entry.path,
+            &mut state,
+            &mut should_restore,
+            RemoveQuarantineScanDepth::CurrentDirectory,
+        )?;
+        if identity_for_fd(&directory)? != expected {
+            bail!(
+                "bound directory identity changed during recovery: {}",
+                entry.path.display()
+            );
+        }
+        self.validate_bound_parent(&entry.parent)?;
+        Ok(RemoveQuarantineRecoveryReport {
+            messages: state.messages,
+            unresolved: state.unresolved,
+            restored: state.restored,
+        })
+    }
+
     fn reconcile_remove_quarantines_with_status_and_restore_decider_at_depth<F>(
         &self,
         mut should_restore: F,
@@ -536,6 +584,46 @@ impl RootedFs {
             fd: Arc::new(fd),
             identity,
         }))
+    }
+
+    pub(crate) fn open_bound_file_if_identity(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+    ) -> Result<BoundFile> {
+        // Protected property: the returned descriptor must name the exact regular-file object
+        // selected through the caller's already-bound parent directory. This preserves object
+        // identity across cleanup validation without re-traversing a mutable lexical parent.
+        self.validate_bound_parent(&entry.parent)?;
+        if !expected.is_file()
+            || identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected)
+        {
+            bail!(
+                "bound file identity changed before read-only open: {}",
+                entry.path.display()
+            );
+        }
+        let fd = rustix::fs::openat(
+            entry.parent.fd.as_ref(),
+            &entry.leaf,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(errno_to_io)
+        .with_context(|| format!("failed to open bound file {}", entry.path.display()))?;
+        if identity_for_fd(&fd)? != expected
+            || identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected)
+        {
+            bail!(
+                "bound file identity changed during read-only open: {}",
+                entry.path.display()
+            );
+        }
+        self.validate_bound_parent(&entry.parent)?;
+        Ok(BoundFile {
+            fd: Arc::new(fd),
+            identity: expected,
+        })
     }
 
     pub(crate) fn open_bound_file_read_write_if_identity(

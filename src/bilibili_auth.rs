@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
@@ -1129,43 +1130,47 @@ fn reconcile_interrupted_auth_cleanup_unlocked(
         }
     }
 
-    let stale_config_dir = bbdown_config_dir(&state_path);
-    let mut cleanup_directories = vec![parent.to_path_buf()];
-    match fs::metadata(&stale_config_dir) {
-        Ok(metadata) if metadata.is_dir() => cleanup_directories.push(stale_config_dir),
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "failed to inspect Bilibili stale auth cleanup directory {}",
-                    stale_config_dir.display()
-                )
-            });
-        }
-    }
-
     let mut messages = Vec::new();
     let mut unresolved = false;
     let mut restored = false;
-    let mut scanned_directories = HashSet::new();
-    for cleanup_directory in cleanup_directories {
-        let root = RootedFs::new(&cleanup_directory).with_context(|| {
-            format!(
-                "failed to bind Bilibili auth cleanup directory {}",
-                cleanup_directory.display()
-            )
-        })?;
-        let root_identity = root.root_identity();
-        if !scanned_directories.insert((root_identity.device(), root_identity.inode())) {
-            continue;
-        }
-        // Protected property: auth recovery considers managed quarantine entries only in the
-        // exact directories where legacy state/config cleanup can create them. Rebinding the
-        // active credential for every candidate makes object identity the sole restore signal;
-        // unrelated sibling subtrees are outside this recovery authority.
-        let report = root
-            .reconcile_remove_quarantines_in_current_directory_with_status_and_restore_decider(
+    let root = RootedFs::new(parent).with_context(|| {
+        format!(
+            "failed to bind Bilibili auth cleanup directory {}",
+            parent.display()
+        )
+    })?;
+    // Protected property: auth recovery considers managed quarantine entries only in the
+    // exact directories where legacy state/config cleanup can create them. Rebinding the
+    // active credential for every candidate makes object identity the sole restore signal;
+    // unrelated sibling subtrees are outside this recovery authority.
+    let report = root
+        .reconcile_remove_quarantines_in_current_directory_with_status_and_restore_decider(
+            |candidate| {
+                let current_credential = bind_cleanup_target(credential_file)?;
+                Ok(current_credential
+                    .as_ref()
+                    .map(BoundCleanupTarget::identity)
+                    == Some(candidate))
+            },
+        )?;
+    messages.extend(report.messages);
+    unresolved |= report.unresolved;
+    restored |= report.restored;
+
+    if let Some(config_dir) = bind_private_stale_bbdown_config_directory(&state_path)? {
+        // Object identity alone is insufficient here: a mode or ownership change leaves the
+        // same directory object in place but expands who can choose recovery entries. Check the
+        // app-owned private access policy on both sides of descriptor-bound recovery.
+        config_dir.root.validate_private_bound_directory(
+            &config_dir.entry,
+            config_dir.identity,
+            0o700,
+        )?;
+        let report = config_dir
+            .root
+            .reconcile_remove_quarantines_in_bound_directory_with_status_and_restore_decider(
+                &config_dir.entry,
+                config_dir.identity,
                 |candidate| {
                     let current_credential = bind_cleanup_target(credential_file)?;
                     Ok(current_credential
@@ -1174,6 +1179,11 @@ fn reconcile_interrupted_auth_cleanup_unlocked(
                         == Some(candidate))
                 },
             )?;
+        config_dir.root.validate_private_bound_directory(
+            &config_dir.entry,
+            config_dir.identity,
+            0o700,
+        )?;
         messages.extend(report.messages);
         unresolved |= report.unresolved;
         restored |= report.restored;
@@ -2501,6 +2511,13 @@ impl BoundCleanupTarget {
     }
 }
 
+struct BoundStaleBbdownConfigDirectory {
+    root: RootedFs,
+    entry: BoundEntry,
+    identity: EntryIdentity,
+    path: PathBuf,
+}
+
 fn remove_cleanup_file_if_exists(path: &Path, credential_file: &Path) -> Result<bool> {
     remove_cleanup_file_if_exists_with_hook(path, credential_file, || Ok(()))
 }
@@ -2516,6 +2533,18 @@ where
     let Some(target) = bind_cleanup_target(path)? else {
         return Ok(false);
     };
+    remove_bound_cleanup_target_with_hook(path, target, credential_file, after_quarantine_move)
+}
+
+fn remove_bound_cleanup_target_with_hook<F>(
+    path: &Path,
+    target: BoundCleanupTarget,
+    credential_file: &Path,
+    after_quarantine_move: F,
+) -> Result<bool>
+where
+    F: FnOnce() -> Result<()>,
+{
     // Protected property: never unlink the object selected by the active credential path. Hold
     // the initial object identity, then rebind the credential after the target is quarantined so
     // a namespace replacement either rejects and restores the target or fails closed.
@@ -2577,6 +2606,82 @@ fn bind_cleanup_target(path: &Path) -> Result<Option<BoundCleanupTarget>> {
     Ok(Some(BoundCleanupTarget { root, entry, file }))
 }
 
+fn bind_private_stale_bbdown_config_directory(
+    state_path: &Path,
+) -> Result<Option<BoundStaleBbdownConfigDirectory>> {
+    let path = absolute_auth_cleanup_path(&bbdown_config_dir(state_path))?;
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to inspect stale BBDown auth config directory {}",
+                    path.display()
+                )
+            });
+        }
+    }
+    let parent = path
+        .parent()
+        .context("stale BBDown auth config directory has no parent")?;
+    let root = RootedFs::new(parent).with_context(|| {
+        format!(
+            "failed to bind stale BBDown auth config parent directory {}",
+            parent.display()
+        )
+    })?;
+    let entry = root.bind_entry(&path, false)?;
+    let Some(identity) = root.bound_entry_identity(&entry)? else {
+        return Ok(None);
+    };
+    root.validate_private_bound_directory(&entry, identity, 0o700)
+        .with_context(|| {
+            format!(
+                "stale BBDown auth config directory must be an app-owned private directory: {}",
+                path.display()
+            )
+        })?;
+    Ok(Some(BoundStaleBbdownConfigDirectory {
+        root,
+        entry,
+        identity,
+        path,
+    }))
+}
+
+fn is_managed_bbdown_config_file_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let mut parts = name.split('.');
+    let Some(kind) = parts.next() else {
+        return false;
+    };
+    let Some(config) = parts.next() else {
+        return false;
+    };
+    let Some(process_id) = parts.next() else {
+        return false;
+    };
+    let Some(counter) = parts.next() else {
+        return false;
+    };
+    let Some(nanos) = parts.next() else {
+        return false;
+    };
+    let Some(extension) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && matches!(kind, "cookie" | "probe")
+        && config == "config"
+        && extension == "tmp"
+        && [process_id, counter, nanos]
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 fn absolute_auth_cleanup_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         Ok(path.to_path_buf())
@@ -2602,41 +2707,75 @@ fn ensure_cleanup_identity_is_not_credential(
 }
 
 fn cleanup_stale_bbdown_config_files_unlocked(path: &Path, credential_file: &Path) -> Result<bool> {
-    let config_dir = bbdown_config_dir(path);
-    let entries = match fs::read_dir(&config_dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to read {}", config_dir.display()));
-        }
+    let Some(config_dir) = bind_private_stale_bbdown_config_directory(path)? else {
+        return Ok(false);
     };
     let active_files = active_bbdown_config_files()
         .lock()
         .expect("active BBDown config lock should not poison")
-        .clone();
+        .iter()
+        .map(|active| absolute_auth_cleanup_path(active))
+        .collect::<Result<HashSet<_>>>()?;
+    let entries = config_dir
+        .root
+        .list_bound_directory(&config_dir.entry, config_dir.identity)?;
     let mut removed = false;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if active_files.contains(&path) {
+    for (name, expected) in entries {
+        if !expected.is_file() || !is_managed_bbdown_config_file_name(&name) {
             continue;
         }
-        match entry.file_type() {
-            Ok(file_type) if file_type.is_file() => {}
-            Ok(_) => continue,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err.into()),
+        let child_path = config_dir.path.join(&name);
+        if active_files.contains(&child_path) {
+            continue;
         }
-        if remove_cleanup_file_if_exists(&path, credential_file).with_context(|| {
-            format!(
-                "failed to delete stale BBDown auth config {}",
-                path.display()
-            )
-        })? {
+        // Keep both checks around child binding: the first proves the directory is private before
+        // we select a child, while the second proves that child is attached to the same directory
+        // object. Later removal uses that bound parent descriptor rather than this pathname.
+        config_dir.root.validate_private_bound_directory(
+            &config_dir.entry,
+            config_dir.identity,
+            0o700,
+        )?;
+        let entry = config_dir.root.bind_entry(&child_path, false)?;
+        config_dir.root.validate_private_bound_directory(
+            &config_dir.entry,
+            config_dir.identity,
+            0o700,
+        )?;
+        let current = config_dir
+            .root
+            .bound_entry_identity(&entry)?
+            .with_context(|| {
+                format!(
+                    "stale BBDown auth config disappeared during cleanup: {}",
+                    child_path.display()
+                )
+            })?;
+        if current != expected || !current.is_file() {
+            bail!(
+                "stale BBDown auth config identity changed during cleanup: {}",
+                child_path.display()
+            );
+        }
+        let file = config_dir
+            .root
+            .open_bound_file_if_identity(&entry, current)?;
+        let target = BoundCleanupTarget {
+            root: config_dir.root.clone(),
+            entry,
+            file,
+        };
+        if remove_bound_cleanup_target_with_hook(&child_path, target, credential_file, || Ok(()))
+            .with_context(|| {
+                format!(
+                    "failed to delete stale BBDown auth config {}",
+                    child_path.display()
+                )
+            })?
+        {
             removed = true;
         }
     }
-    let _ = fs::remove_dir(&config_dir);
     Ok(removed)
 }
 
@@ -2716,6 +2855,14 @@ mod tests {
             uname: "Joey".to_string(),
             stored_at_unix: 1_717_171_717,
         }
+    }
+
+    #[cfg(unix)]
+    fn make_test_directory_private(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("test directory should become private");
     }
 
     #[test]
@@ -2922,11 +3069,12 @@ mod tests {
     fn logout_refuses_to_unlink_a_stale_config_hard_link_to_credentials() {
         let state_path = temp_state_file("logout-stale-config-hard-link");
         let credential_file = state_path.with_file_name("credentials.json");
-        let stale_config = bbdown_config_dir(&state_path).join("stale.config.tmp");
+        let stale_config = bbdown_config_dir(&state_path).join("cookie.config.1.2.3.tmp");
         save_auth_state(&state_path, &test_state()).expect("state should save");
         fs::write(&credential_file, b"active-credentials").expect("credential file should write");
-        fs::create_dir_all(stale_config.parent().expect("config should have a parent"))
-            .expect("config directory should create");
+        let config_dir = stale_config.parent().expect("config should have a parent");
+        fs::create_dir_all(config_dir).expect("config directory should create");
+        make_test_directory_private(config_dir);
         fs::hard_link(&credential_file, &stale_config)
             .expect("stale config hard link should create");
 
@@ -2946,9 +3094,10 @@ mod tests {
     fn isolated_config_cleanup_refuses_a_stale_hard_link_to_credentials() {
         let state_path = temp_state_file("isolated-config-stale-hard-link");
         let credential_file = state_path.with_file_name("credentials.json");
-        let stale_config = bbdown_config_dir(&state_path).join("stale.config.tmp");
-        fs::create_dir_all(stale_config.parent().expect("config should have a parent"))
-            .expect("config directory should create");
+        let stale_config = bbdown_config_dir(&state_path).join("cookie.config.1.2.3.tmp");
+        let config_dir = stale_config.parent().expect("config should have a parent");
+        fs::create_dir_all(config_dir).expect("config directory should create");
+        make_test_directory_private(config_dir);
         fs::write(&credential_file, b"active-credentials").expect("credential file should write");
         fs::hard_link(&credential_file, &stale_config)
             .expect("stale config hard link should create");
@@ -2960,6 +3109,70 @@ mod tests {
         assert!(format!("{error:#}").contains("aliases the active credential file"));
         assert_eq!(fs::read(&credential_file).unwrap(), b"active-credentials");
         assert_eq!(fs::read(&stale_config).unwrap(), b"active-credentials");
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_config_cleanup_rejects_a_symlinked_directory_without_deleting_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let state_path = temp_state_file("stale-config-symlink");
+        let root = state_path
+            .parent()
+            .expect("state path should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        let stale_config_dir = bbdown_config_dir(&state_path);
+        let unrelated = root.join("unrelated-private-data");
+        let sentinel = unrelated.join("sentinel");
+        save_auth_state(&state_path, &test_state()).expect("state should save");
+        fs::write(&credential_file, b"active-credentials").expect("credential file should write");
+        fs::create_dir_all(&unrelated).expect("unrelated directory should create");
+        make_test_directory_private(&unrelated);
+        fs::write(&sentinel, b"do-not-delete").expect("sentinel should write");
+        symlink(&unrelated, &stale_config_dir).expect("stale config symlink should create");
+
+        let error = delete_auth_state(&state_path, &credential_file)
+            .expect_err("cleanup must reject a symlinked stale config directory");
+
+        assert!(
+            format!("{error:#}").contains("must be an app-owned private directory"),
+            "unexpected cleanup error: {error:#}"
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"do-not-delete");
+        assert!(
+            fs::symlink_metadata(&stale_config_dir)
+                .expect("stale config symlink should remain")
+                .file_type()
+                .is_symlink()
+        );
+        let _ = fs::remove_file(&stale_config_dir);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_config_cleanup_removes_only_managed_file_names() {
+        let state_path = temp_state_file("stale-config-recognized-files");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let stale_config_dir = bbdown_config_dir(&state_path);
+        let managed = stale_config_dir.join("cookie.config.1.2.3.tmp");
+        let unrelated = stale_config_dir.join("unrelated.txt");
+        save_auth_state(&state_path, &test_state()).expect("state should save");
+        fs::write(&credential_file, b"active-credentials").expect("credential file should write");
+        create_private_dir_if_missing(&stale_config_dir)
+            .expect("stale config directory should become private");
+        fs::write(&managed, b"legacy-cookie").expect("managed config should write");
+        fs::write(&unrelated, b"do-not-delete").expect("unrelated file should write");
+
+        assert!(
+            delete_auth_state(&state_path, &credential_file)
+                .expect("managed stale config cleanup should complete")
+        );
+        assert!(!managed.exists());
+        assert_eq!(fs::read(&unrelated).unwrap(), b"do-not-delete");
         if let Some(parent) = state_path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
@@ -3248,6 +3461,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn startup_auth_recovery_scans_the_known_stale_config_directory() {
         let state_path = temp_state_file("auth-recovery-stale-config-directory");
@@ -3259,6 +3473,7 @@ mod tests {
         let stale_config_dir = bbdown_config_dir(&state_path);
         let stale_config = stale_config_dir.join("stale.config");
         fs::create_dir_all(&stale_config_dir).expect("stale config directory should create");
+        make_test_directory_private(&stale_config_dir);
         fs::write(&stale_config, b"legacy-cookie").expect("stale config should write");
         fs::write(&credential_file, b"active-credentials")
             .expect("active credentials should write");
@@ -3286,6 +3501,50 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".telegram-video-downloader-remove")
         }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_auth_recovery_rejects_a_symlinked_stale_config_directory_without_scanning_it() {
+        use std::os::unix::fs::symlink;
+
+        let state_path = temp_state_file("auth-recovery-stale-config-symlink");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        let stale_config_dir = bbdown_config_dir(&state_path);
+        let unrelated = root.join("unrelated-private-data");
+        let sentinel = unrelated.join("sentinel");
+        fs::create_dir_all(&unrelated).expect("unrelated directory should create");
+        make_test_directory_private(&unrelated);
+        fs::write(&sentinel, b"do-not-remove").expect("sentinel should write");
+        fs::write(&credential_file, b"active-credentials")
+            .expect("active credentials should write");
+        let target = bind_cleanup_target(&sentinel)
+            .expect("sentinel should bind")
+            .expect("sentinel should exist");
+        target
+            .root
+            .leave_validated_file_removal_quarantined_for_test(&target.entry, target.identity())
+            .expect("interrupted unrelated cleanup should persist");
+        drop(target);
+        symlink(&unrelated, &stale_config_dir).expect("stale config symlink should create");
+
+        let error = recover_interrupted_auth_cleanup(&state_path, &credential_file)
+            .expect_err("symlinked stale config directory must block recovery");
+
+        assert!(format!("{error:#}").contains("app-owned private directory"));
+        assert!(fs::read_dir(&unrelated).unwrap().any(|entry| {
+            entry
+                .expect("unrelated directory entry should read")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".telegram-video-downloader-remove")
+        }));
+        fs::remove_file(&stale_config_dir).expect("stale config symlink should remove");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3816,7 +4075,7 @@ mod tests {
         assert!(config_path.exists());
         release_bbdown_config_file(&config_path);
         assert!(!config_path.exists());
-        let stale_config_path = bbdown_config_dir(&path).join("stale.config.tmp");
+        let stale_config_path = bbdown_config_dir(&path).join("cookie.config.1.2.3.tmp");
         fs::write(&stale_config_path, "--cookie\nstale\n").expect("stale config should write");
         assert!(delete_auth_state(&path, &credential_file).expect("stale config should delete"));
         assert!(!stale_config_path.exists());
