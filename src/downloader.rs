@@ -77,6 +77,7 @@ const VIDEO_RECOVERY_STATE_CLEAN: u8 = b'C';
 const VIDEO_RECOVERY_STATE_DIRTY: u8 = b'D';
 const VIDEO_RECOVERY_STATE_INCOMPLETE: u8 = b'I';
 const BILIBILI_FFMPEG_CONCAT_FILE_PREFIX: &str = ".telegram-video-downloader-ffmpeg-concat";
+const BILIBILI_FFMPEG_CONCAT_PROTOCOL_WHITELIST: &str = "fd,pipe,crypto,data";
 const BILIBILI_MUX_STAGING_DIR_PREFIX: &str = ".telegram-video-downloader-mux";
 const BILIBILI_MUX_RECOVERY_MANIFEST_NAME: &str = "manifest.json";
 const BILIBILI_MUX_RECOVERY_MANIFEST_TEMP_NAME: &str = "manifest.next.json";
@@ -2276,12 +2277,16 @@ fn bilibili_local_mux_command_spec(
             ffmpeg_concat_file_list(media_inputs.len(), 1, inherited_fd_base)?.as_bytes(),
         )?;
         args.extend([
+            "-protocol_whitelist".to_string(),
+            BILIBILI_FFMPEG_CONCAT_PROTOCOL_WHITELIST.to_string(),
             "-f".to_string(),
             "concat".to_string(),
             "-safe".to_string(),
             "0".to_string(),
+            "-fd".to_string(),
+            inherited_command_descriptor(0, inherited_fd_base)?.to_string(),
             "-i".to_string(),
-            inherited_command_path(0, inherited_fd_base)?,
+            "fd:".to_string(),
         ]);
         let mut inherited_files = Vec::with_capacity(bound_inputs.len() + 1);
         inherited_files.push(concat_file.bound_file().clone());
@@ -2289,8 +2294,11 @@ fn bilibili_local_mux_command_spec(
         (Some(concat_file), inherited_files)
     } else {
         for index in 0..media_inputs.len() {
+            let descriptor = inherited_command_descriptor(index, inherited_fd_base)?;
+            args.push("-fd".to_string());
+            args.push(descriptor.to_string());
             args.push("-i".to_string());
-            args.push(inherited_command_path(index, inherited_fd_base)?);
+            args.push("fd:".to_string());
         }
         for index in 0..media_inputs.len() {
             args.push("-map".to_string());
@@ -2478,16 +2486,16 @@ fn ffmpeg_concat_file_list(
 ) -> Result<String> {
     (0..input_count)
         .map(|index| {
-            inherited_command_path(inherited_offset + index, inherited_fd_base)
+            inherited_command_pipe_url(inherited_offset + index, inherited_fd_base)
                 .map(|path| format!("file '{path}'\n"))
         })
         .collect()
 }
 
 #[cfg(unix)]
-fn inherited_command_path(index: usize, inherited_fd_base: i32) -> Result<String> {
+fn inherited_command_pipe_url(index: usize, inherited_fd_base: i32) -> Result<String> {
     Ok(format!(
-        "/dev/fd/{}",
+        "pipe:{}",
         inherited_command_descriptor(index, inherited_fd_base)?
     ))
 }
@@ -2501,7 +2509,7 @@ fn inherited_command_descriptor(index: usize, inherited_fd_base: i32) -> Result<
 }
 
 #[cfg(not(unix))]
-fn inherited_command_path(_index: usize, _inherited_fd_base: i32) -> Result<String> {
+fn inherited_command_pipe_url(_index: usize, _inherited_fd_base: i32) -> Result<String> {
     bail!("descriptor-bound Bilibili muxing requires a Unix platform")
 }
 
@@ -18086,9 +18094,17 @@ mod tests {
         assert_eq!(spec.program, PathBuf::from("/opt/bin/ffmpeg"));
         assert_eq!(spec.cwd, entry_dir);
         assert!(spec.args.contains(&"-nostdin".to_string()));
-        assert!(spec.args.contains(&"/dev/fd/64".to_string()));
-        assert!(spec.args.contains(&"/dev/fd/65".to_string()));
-        assert!(!spec.args.contains(&"/dev/fd/66".to_string()));
+        assert!(
+            spec.args
+                .windows(4)
+                .any(|args| args == ["-fd", "64", "-i", "fd:"])
+        );
+        assert!(
+            spec.args
+                .windows(4)
+                .any(|args| args == ["-fd", "65", "-i", "fd:"])
+        );
+        assert!(!spec.args.iter().any(|arg| arg.starts_with("/dev/fd/")));
         assert!(!spec.args.iter().any(|arg| arg.ends_with("video.m4s")));
         assert!(!spec.args.iter().any(|arg| arg.ends_with("audio.m4s")));
         assert!(spec.args.windows(2).any(|args| args == ["-map", "0:0"]));
@@ -18322,6 +18338,7 @@ printf ancestor-replacement > ancestor-replacement-proof
             &fake_ffmpeg,
             r#"#!/bin/sh
 input=
+input_fd=
 output_fd=
 next_is_input=no
 next_is_fd=no
@@ -18331,6 +18348,7 @@ for arg do
         next_is_fd=no
     elif test "$next_is_input" = yes; then
         input=$arg
+        input_fd=$output_fd
         next_is_input=no
     elif test "$arg" = -fd; then
         next_is_fd=yes
@@ -18338,11 +18356,12 @@ for arg do
         next_is_input=yes
     fi
 done
-test -n "$input" || exit 41
+test "$input" = fd: || exit 41
+test "$input_fd" = 64 || exit 48
 test "$output_fd" = 65 || exit 47
 mv video.m4s video.original || exit 42
 printf replacement > video.m4s || exit 43
-cat "$input" >&65 || exit 44
+eval "/bin/cat <&$input_fd >&$output_fd" || exit 44
 rm video.m4s || exit 45
 mv video.original video.m4s || exit 46
 "#,
@@ -18421,7 +18440,7 @@ mv video.original video.m4s || exit 46
         assert_eq!(inherited_files.len(), 4);
         let concat_path = concat_file.path().to_path_buf();
         let concat = fs::read_to_string(&concat_path).expect("concat list should read");
-        assert_eq!(concat, "file '/dev/fd/65'\nfile '/dev/fd/66'\n");
+        assert_eq!(concat, "file 'pipe:65'\nfile 'pipe:66'\n");
         assert_ne!(concat_path, user_concat);
         assert!(
             concat_path
@@ -18429,12 +18448,19 @@ mv video.original video.m4s || exit 46
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with(BILIBILI_FFMPEG_CONCAT_FILE_PREFIX))
         );
+        assert!(spec.args.windows(2).any(|args| {
+            args == [
+                "-protocol_whitelist",
+                BILIBILI_FFMPEG_CONCAT_PROTOCOL_WHITELIST,
+            ]
+        }));
         assert!(spec.args.windows(2).any(|args| args == ["-f", "concat"]));
         assert!(
             spec.args
-                .windows(2)
-                .any(|args| args[0] == "-i" && args[1] == "/dev/fd/64")
+                .windows(4)
+                .any(|args| args == ["-fd", "64", "-i", "fd:"])
         );
+        assert!(!spec.args.iter().any(|arg| arg.starts_with("/dev/fd/")));
         assert!(spec.args.windows(2).any(|args| args == ["-f", "mp4"]));
         assert!(spec.args.windows(2).any(|args| args == ["-fd", "67"]));
         assert_eq!(spec.args.last().map(String::as_str), Some("fd:"));
@@ -20333,7 +20359,7 @@ mv video.original video.m4s || exit 46
             .map(|index| {
                 let descriptor = inherited_command_descriptor(index, BILIBILI_MUX_MIN_FD_BASE)
                     .expect("target descriptor should fit");
-                format!("/bin/test -r /dev/fd/{descriptor} || exit 41")
+                format!("/bin/dd bs=1 count=1 <&{descriptor} >/dev/null 2>&1 || exit 41")
             })
             .collect::<Vec<_>>()
             .join("; ");
