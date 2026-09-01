@@ -255,6 +255,30 @@ impl BoundFile {
         self.validate_identity()
     }
 
+    pub(crate) fn write_private_unlinked(&self, contents: &[u8], mode: u16) -> Result<()> {
+        // Protected property: the contents must never be reachable through a directory entry.
+        // Link count zero proves this descriptor's inode is already unlinked; identity and mode
+        // checks prevent a descriptor replacement or permission change from weakening that rule.
+        self.validate_private_unlinked(mode)?;
+        let duplicate = rustix::io::dup(self.fd.as_ref())
+            .map_err(errno_to_io)
+            .context("failed to duplicate private unlinked bound file for writing")?;
+        let mut writer = File::from(duplicate);
+        writer
+            .seek(SeekFrom::Start(0))
+            .context("failed to seek private unlinked bound file")?;
+        writer
+            .set_len(0)
+            .context("failed to truncate private unlinked bound file")?;
+        writer
+            .write_all(contents)
+            .context("failed to write private unlinked bound file")?;
+        writer
+            .sync_all()
+            .context("failed to sync private unlinked bound file")?;
+        self.validate_private_unlinked(mode)
+    }
+
     pub(crate) fn set_mode(&self, mode: u16) -> Result<()> {
         self.validate_identity()?;
         rustix::fs::fchmod(self.fd.as_ref(), Mode::from_raw_mode(mode))

@@ -1024,21 +1024,38 @@ fn create_unlinked_bilibili_worker_request(
     staging: &BoundStagingDir,
     contents: &[u8],
 ) -> Result<BoundFile> {
+    create_unlinked_bilibili_worker_request_with_hook(staging, contents, &mut |_| Ok(()))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BilibiliWorkerRequestCheckpoint {
+    CreatedBeforeUnlink,
+    UnlinkedBeforeWrite,
+    WrittenUnlinked,
+}
+
+fn create_unlinked_bilibili_worker_request_with_hook<F>(
+    staging: &BoundStagingDir,
+    contents: &[u8],
+    hook: &mut F,
+) -> Result<BoundFile>
+where
+    F: FnMut(BilibiliWorkerRequestCheckpoint) -> Result<()>,
+{
     staging.validate_for_path_access()?;
     let request_path = staging.path().join(BILIBILI_WORKER_REQUEST_FILE_NAME);
-    let (_, request_identity) = staging
+    let (request_entry, request_identity) = staging
         .root
-        .create_new_bound_file(&request_path, contents, 0o600)
+        // The request contains BBDown cookies and proxy credentials. The only named inode is
+        // intentionally empty; contents are written only after its durable unlink below.
+        .create_new_bound_file(&request_path, b"", 0o600)
         .context("failed to create Bilibili worker request")?;
     let request_file = staging
         .root
-        .open_bound_file(&request_path)?
-        .context("Bilibili worker request disappeared")?;
-    if request_file.identity() != request_identity {
-        bail!("Bilibili worker request identity changed after creation");
-    }
+        .open_bound_file_read_write_if_identity(&request_entry, request_identity)
+        .context("failed to open Bilibili worker request for anonymous writing")?;
     request_file.validate_private_single_link(0o600)?;
-    let request_entry = staging.root.bind_entry(&request_path, false)?;
+    hook(BilibiliWorkerRequestCheckpoint::CreatedBeforeUnlink)?;
     if staging.root.bound_entry_identity(&request_entry)? != Some(request_identity) {
         bail!("Bilibili worker request identity changed before unlink");
     }
@@ -1050,6 +1067,10 @@ fn create_unlinked_bilibili_worker_request(
     if staging.root.entry_identity(&request_path)?.is_some() {
         bail!("Bilibili worker request path remained after unlink");
     }
+    hook(BilibiliWorkerRequestCheckpoint::UnlinkedBeforeWrite)?;
+    request_file.write_private_unlinked(contents, 0o600)?;
+    hook(BilibiliWorkerRequestCheckpoint::WrittenUnlinked)?;
+    request_file.validate_private_unlinked(0o600)?;
     staging.validate_for_path_access()?;
     Ok(request_file)
 }
@@ -16425,6 +16446,60 @@ mod tests {
         drop(request_file);
         drop(staging);
         let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn bilibili_worker_request_interruption_never_persists_credentials() {
+        let contents = b"SESSDATA=worker-cookie-secret; proxy-password=worker-proxy-secret";
+
+        for checkpoint in [
+            BilibiliWorkerRequestCheckpoint::CreatedBeforeUnlink,
+            BilibiliWorkerRequestCheckpoint::UnlinkedBeforeWrite,
+            BilibiliWorkerRequestCheckpoint::WrittenUnlinked,
+        ] {
+            let video_dir = temp_test_dir("bilibili-worker-request-interruption");
+            let root = RootedFs::new(&video_dir).expect("output root should bind");
+            let staging =
+                create_video_staging_dir(&root).expect("worker staging directory should create");
+            let request_path = staging.path().join(BILIBILI_WORKER_REQUEST_FILE_NAME);
+
+            let error = create_unlinked_bilibili_worker_request_with_hook(
+                &staging,
+                contents,
+                &mut |observed| {
+                    if observed == checkpoint {
+                        bail!("simulated interruption");
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("interruption checkpoint should stop worker request creation");
+
+            assert!(error.to_string().contains("simulated interruption"));
+            match checkpoint {
+                BilibiliWorkerRequestCheckpoint::CreatedBeforeUnlink => assert_eq!(
+                    fs::read(&request_path).expect("only the empty request placeholder remains"),
+                    b""
+                ),
+                BilibiliWorkerRequestCheckpoint::UnlinkedBeforeWrite
+                | BilibiliWorkerRequestCheckpoint::WrittenUnlinked => {
+                    assert!(!request_path.exists());
+                }
+            }
+
+            let retained_contents = fs::read_dir(staging.path())
+                .expect("staging should remain readable")
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| fs::read(entry.path()).ok())
+                .flatten()
+                .collect::<Vec<_>>();
+            let retained_contents = String::from_utf8_lossy(&retained_contents);
+            assert!(!retained_contents.contains("worker-cookie-secret"));
+            assert!(!retained_contents.contains("worker-proxy-secret"));
+
+            drop(staging);
+            let _ = fs::remove_dir_all(video_dir);
+        }
     }
 
     #[test]
