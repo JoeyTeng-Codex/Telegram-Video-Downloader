@@ -3,7 +3,7 @@ id: 20260618-bbd04f
 title: BBDown-rust Bilibili Migration
 status: completed
 created: 2026-06-18
-updated: 2026-09-01
+updated: 2026-09-02
 branch: wip/bbdown-rust-migration
 pr: 12
 supersedes: []
@@ -189,3 +189,5 @@ superseded_by:
 - 2026-09-01 fifty-eighth-review validation: `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets --quiet` (410 passed, 10 ignored), `cargo build --release`, `uv run ruff format --check .`, `uv run ruff check .`, `uv run python -m unittest discover -s tests` (20 passed), and `git diff --check`.
 - 2026-09-02 fifty-ninth review follow-up addresses a current GitHub Codex P2: Bilibili local mux inputs no longer depend on a mounted `/dev/fd`. Regular DASH inputs now use FFmpeg's seekable `fd:` protocol with an explicit descriptor per input. Generated FLV concat lists use `pipe:N` entries, while the descriptor-backed list itself uses `fd:` and an explicit minimal `fd,pipe,crypto,data` protocol whitelist. Command-construction and low-descriptor remap coverage assert the new protocol forms; the ABA replacement regression continues to prove the inherited descriptor reads the original selected input.
 - 2026-09-02 fifty-ninth-review validation: local FFmpeg probes confirmed multi-input `fd:` muxing and `pipe:N` FLV concat output; `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets --quiet` (410 passed, 10 ignored), `cargo build --release`, `uv run ruff format --check .`, `uv run ruff check .`, `uv run python -m unittest discover -s tests` (20 passed), project journal validation, and `git diff --check` passed.
+- 2026-09-02 sixtieth review follow-up closes two local Codex findings. Logout now persists a private `0600` intent before removing legacy state, binds it to the auth-lock object and the concrete selected profile, and resumes both legacy cleanup and idempotent profile removal after interruption before deleting that intent. Default-profile recovery records the profile selected at logout start, so a later default change cannot clear a different account. Local mux activity tracking now watches its actual private staging output directory, preventing a quiet but continuously writing FFmpeg process from being killed by the command idle timeout. The obsolete runtime-only logout helper was removed.
+- 2026-09-02 sixtieth-review validation: `cargo fmt --all -- --check`, focused default-profile logout recovery and silent mux-staging activity regressions, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets --quiet` (412 passed, 10 ignored), `cargo build --release`, `uv run ruff format --check .`, `uv run ruff check .`, `uv run python -m unittest discover -s tests` (20 passed), project journal validation, and `git diff --check` passed.

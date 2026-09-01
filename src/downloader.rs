@@ -1748,6 +1748,10 @@ impl ReservedMuxOutput {
         &self.file
     }
 
+    fn activity_dir(&self) -> &Path {
+        self.staging_dir_entry.path()
+    }
+
     #[cfg(test)]
     fn staged_path(&self) -> &Path {
         self.staged_entry.path()
@@ -2166,6 +2170,7 @@ async fn mux_bilibili_report_media(
             &bound_inputs,
             &entry_dir,
             output_reservation.bound_file(),
+            output_reservation.activity_dir(),
         )?;
         let output_result = run_command_with_execution_context(
             config,
@@ -2250,6 +2255,7 @@ fn bilibili_local_mux_command_spec(
     bound_inputs: &[BoundBilibiliMuxInput],
     entry_dir: &Path,
     output: &BoundFile,
+    activity_dir: &Path,
 ) -> Result<BilibiliMuxCommand> {
     if media_inputs.len() != bound_inputs.len()
         || media_inputs
@@ -2331,7 +2337,7 @@ fn bilibili_local_mux_command_spec(
             program: config.tools.ffmpeg.clone(),
             args,
             cwd: entry_dir.to_path_buf(),
-            activity_dir: Some(entry_dir.to_path_buf()),
+            activity_dir: Some(activity_dir.to_path_buf()),
             cleanup_paths: Vec::new(),
             inherited_fd_base: Some(inherited_fd_base),
         },
@@ -18086,6 +18092,7 @@ mod tests {
             &bound_inputs,
             &entry_dir,
             &output_file,
+            &entry_dir,
         )
         .expect("dash mux spec should build");
 
@@ -18433,6 +18440,7 @@ mv video.original video.m4s || exit 46
             &bound_inputs,
             &entry_dir,
             &output_file,
+            &entry_dir,
         )
         .expect("flv mux spec should build");
 
@@ -19718,6 +19726,93 @@ mv video.original video.m4s || exit 46
                 .any(|message| message.contains("Last file change:"))
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bilibili_mux_tracks_a_silent_writer_in_its_private_staging_directory() {
+        let root = temp_test_dir("bilibili-mux-silent-staging-activity");
+        let entry_dir = root.join("entry");
+        fs::create_dir_all(&entry_dir).expect("entry directory should create");
+        let input = entry_dir.join("video.m4s");
+        fs::write(&input, b"video").expect("mux input should write");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+        let inputs = vec![BilibiliMediaInput {
+            kind: "video".to_string(),
+            path: input,
+        }];
+        let bound_inputs =
+            bind_bilibili_mux_inputs(&rooted, &inputs).expect("mux input should bind");
+        let reservation =
+            ReservedMuxOutput::create(&rooted, &entry_dir.join("Episode.mp4"), &bound_inputs)
+                .expect("mux output should reserve");
+        let mut config = test_config();
+        config.bot.command_timeout_seconds = 8;
+        config.bot.command_idle_timeout_seconds = 2;
+        config.bot.progress_update_seconds = 1;
+        let BilibiliMuxCommand {
+            mut spec,
+            concat_file,
+            inherited_files,
+        } = bilibili_local_mux_command_spec(
+            &config,
+            &rooted,
+            &inputs,
+            &bound_inputs,
+            &entry_dir,
+            reservation.bound_file(),
+            reservation.activity_dir(),
+        )
+        .expect("mux spec should build");
+        assert!(concat_file.is_none());
+        assert_eq!(
+            spec.activity_dir.as_deref(),
+            Some(reservation.activity_dir())
+        );
+        let output_descriptor = inherited_command_descriptor(
+            inherited_files
+                .len()
+                .checked_sub(1)
+                .expect("mux must inherit its output file"),
+            spec.inherited_fd_base
+                .expect("mux should select inherited descriptors"),
+        )
+        .expect("mux output descriptor should fit");
+        spec.program = PathBuf::from("/bin/sh");
+        spec.args = vec![
+            "-c".to_string(),
+            "for _ in 1 2 3 4; do eval \"/usr/bin/printf x >&$0\"; sleep 1; done".to_string(),
+            output_descriptor.to_string(),
+        ];
+
+        let result = tokio_timeout(
+            Duration::from_secs(7),
+            run_command_with_execution_context(
+                &config,
+                &spec,
+                None,
+                &inherited_files,
+                None,
+                CommandExecutionPolicy::BILIBILI_MUX,
+            ),
+        )
+        .await
+        .expect("silent mux writer should not hit the outer timeout")
+        .expect("silent mux writer should not hit the idle timeout");
+
+        assert!(result.status.success());
+        assert!(
+            reservation
+                .staged_path()
+                .metadata()
+                .expect("staged mux output should remain accessible")
+                .len()
+                >= 4
+        );
+        drop(inherited_files);
+        drop(reservation);
+        drop(rooted);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

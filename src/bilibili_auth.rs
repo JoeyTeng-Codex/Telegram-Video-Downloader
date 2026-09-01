@@ -37,6 +37,9 @@ const AUTH_MUTATION_LOCK_ANCHOR_SUFFIX: &str = ".anchor";
 const AUTH_MUTATION_LOCK_OWNER_SUFFIX: &str = ".telegram-video-downloader.auth-owner";
 const AUTH_MUTATION_LOCK_OWNER_VERSION: u32 = 1;
 const AUTH_MUTATION_LOCK_OWNER_LIMIT: usize = 256;
+const AUTH_LOGOUT_INTENT_SUFFIX: &str = ".telegram-video-downloader.logout-intent";
+const AUTH_LOGOUT_INTENT_VERSION: u32 = 1;
+const AUTH_LOGOUT_INTENT_LIMIT: usize = 1024;
 const AUTH_EPOCH_LOG_LIMIT: u64 = 64 * 1024;
 const AUTH_EPOCH_SLOT_SIZE: usize = 64;
 const AUTH_EPOCH_SLOT_COUNT: usize = 2;
@@ -150,6 +153,22 @@ struct AuthMutationLockOwner {
     version: u32,
     device: u64,
     inode: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AuthLogoutIntent {
+    version: u32,
+    lock_owner: AuthMutationLockOwner,
+    credential_profile: String,
+}
+
+#[derive(Debug)]
+struct BoundAuthLogoutIntent {
+    root: RootedFs,
+    entry: BoundEntry,
+    file: BoundFile,
+    intent: AuthLogoutIntent,
 }
 
 #[derive(Debug)]
@@ -328,6 +347,18 @@ impl LockedAuthMutation<'_> {
 
     pub fn delete_legacy_state(&self) -> Result<bool> {
         delete_auth_state_unlocked(self.state, self.credential_control_path)
+    }
+
+    fn persist_logout_intent(&self, credential_profile: Option<&str>) -> Result<AuthLogoutIntent> {
+        persist_auth_logout_intent(self._lock, self.epoch, credential_profile)
+    }
+
+    fn clear_logout_intent(&self, intent: &AuthLogoutIntent) -> Result<()> {
+        clear_auth_logout_intent(self._lock, self.epoch, intent)
+    }
+
+    fn clear_selected_credential_profile(&self, credential_profile: &str) -> Result<()> {
+        clear_bbdown_rust_credential_profile_unlocked(&self.credential_file()?, credential_profile)
     }
 
     pub fn epoch(&self) -> AuthEpoch {
@@ -1223,7 +1254,10 @@ fn reconcile_interrupted_auth_cleanup_and_bump_epoch(
     state: Option<&BoundAuthStatePath>,
     credential_file: &Path,
 ) -> Result<Vec<String>> {
-    let messages = reconcile_interrupted_auth_cleanup_unlocked(state, credential_file)?;
+    let mut messages = reconcile_interrupted_auth_cleanup_unlocked(state, credential_file)?;
+    if recover_pending_auth_logout_unlocked(lock, state, credential_file)? {
+        messages.push("Recovered interrupted BBDown logout".to_string());
+    }
     if !messages.is_empty() {
         lock.bump_epoch()?;
     }
@@ -1307,13 +1341,176 @@ fn reconcile_interrupted_auth_cleanup_unlocked(
     Ok(messages)
 }
 
+fn recover_pending_auth_logout_unlocked(
+    lock: &AuthMutationFileLock,
+    state: Option<&BoundAuthStatePath>,
+    credential_file: &Path,
+) -> Result<bool> {
+    let Some(intent) = load_auth_logout_intent(lock)? else {
+        return Ok(false);
+    };
+
+    // Protected property: a pending logout may only clear the profile selected by the same
+    // authenticated lock object that durably recorded the intent. The private, single-link
+    // intent file establishes the access policy; the lock-owner identity prevents a reused
+    // credential control pathname from authorizing cleanup in another lock domain.
+    let current_owner = lock.current_epoch()?.lock_owner;
+    if intent.intent.lock_owner != current_owner {
+        bail!("pending BBDown logout intent does not match the active credential lock");
+    }
+    if let Some(state) = state {
+        state.validate_root()?;
+    }
+    delete_auth_state_unlocked(state, credential_file)
+        .context("failed to resume legacy BBDown state cleanup for a pending logout")?;
+    let credential_file = lock.credential_store_path()?;
+    clear_bbdown_rust_credential_profile_unlocked(
+        &credential_file,
+        &intent.intent.credential_profile,
+    )
+    .context("failed to resume BBDown credential profile cleanup for a pending logout")?;
+    if let Some(state) = state {
+        state.validate_root()?;
+    }
+    remove_auth_logout_intent(intent)?;
+    Ok(true)
+}
+
+fn logout_intent_for_lock(
+    lock: &AuthMutationFileLock,
+    epoch: AuthEpoch,
+    credential_profile: Option<&str>,
+) -> Result<AuthLogoutIntent> {
+    let selection = bbdown_rust_profile_selection(credential_profile)?;
+    let credential_file = lock.credential_store_path()?;
+    let profile = match selection.profile_name() {
+        Some(profile) => profile.to_string(),
+        None => CredentialStore::new(credential_file)
+            .load_profiles()
+            .context("failed to resolve the default BBDown credential profile for logout")?
+            .default_profile
+            .clone(),
+    };
+    let current_owner = lock.current_epoch()?.lock_owner;
+    if epoch.lock_owner != current_owner {
+        bail!("BBDown credential lock changed while preparing logout intent");
+    }
+    Ok(AuthLogoutIntent {
+        version: AUTH_LOGOUT_INTENT_VERSION,
+        lock_owner: current_owner,
+        credential_profile: profile,
+    })
+}
+
+fn persist_auth_logout_intent(
+    lock: &AuthMutationFileLock,
+    epoch: AuthEpoch,
+    credential_profile: Option<&str>,
+) -> Result<AuthLogoutIntent> {
+    let expected = logout_intent_for_lock(lock, epoch, credential_profile)?;
+    let path = auth_logout_intent_path(lock.credential_file());
+    let (root, bound_path) = rooted_auth_lock_path(&path)?;
+    if let Some(file) = root.open_bound_file(&bound_path)? {
+        let entry = root.bind_entry(&bound_path, false)?;
+        if root.bound_entry_identity(&entry)? != Some(file.identity()) {
+            bail!("pending BBDown logout intent identity changed while binding");
+        }
+        let actual = parse_auth_logout_intent(&file, &bound_path)?;
+        if actual != expected {
+            bail!("pending BBDown logout intent does not match the requested logout");
+        }
+        return Ok(expected);
+    }
+
+    let contents =
+        serde_json::to_vec(&expected).context("failed to encode pending BBDown logout intent")?;
+    if contents.len() > AUTH_LOGOUT_INTENT_LIMIT {
+        bail!("pending BBDown logout intent exceeds its size limit");
+    }
+    root.create_new_bound_file(&bound_path, &contents, 0o600)
+        .context("failed to persist pending BBDown logout intent")?;
+    let Some(intent) = load_auth_logout_intent(lock)? else {
+        bail!("pending BBDown logout intent disappeared after creation");
+    };
+    if intent.intent != expected {
+        bail!("pending BBDown logout intent changed after creation");
+    }
+    Ok(expected)
+}
+
+fn clear_auth_logout_intent(
+    lock: &AuthMutationFileLock,
+    epoch: AuthEpoch,
+    expected: &AuthLogoutIntent,
+) -> Result<()> {
+    let current_owner = lock.current_epoch()?.lock_owner;
+    if epoch.lock_owner != current_owner || expected.lock_owner != current_owner {
+        bail!("BBDown credential lock changed while finalizing logout intent");
+    }
+    let intent = load_auth_logout_intent(lock)?
+        .context("pending BBDown logout intent disappeared before completion")?;
+    if intent.intent != *expected {
+        bail!("pending BBDown logout intent changed before completion");
+    }
+    remove_auth_logout_intent(intent)
+}
+
+fn load_auth_logout_intent(lock: &AuthMutationFileLock) -> Result<Option<BoundAuthLogoutIntent>> {
+    let path = auth_logout_intent_path(lock.credential_file());
+    let (root, bound_path) = rooted_auth_lock_path(&path)?;
+    let Some(file) = root.open_bound_file(&bound_path)? else {
+        return Ok(None);
+    };
+    let entry = root.bind_entry(&bound_path, false)?;
+    if root.bound_entry_identity(&entry)? != Some(file.identity()) {
+        bail!("pending BBDown logout intent identity changed while binding");
+    }
+    let intent = parse_auth_logout_intent(&file, &bound_path)?;
+    Ok(Some(BoundAuthLogoutIntent {
+        root,
+        entry,
+        file,
+        intent,
+    }))
+}
+
+fn parse_auth_logout_intent(file: &BoundFile, path: &Path) -> Result<AuthLogoutIntent> {
+    file.validate_private_single_link(0o600)?;
+    let intent =
+        serde_json::from_slice::<AuthLogoutIntent>(&file.read_limited(AUTH_LOGOUT_INTENT_LIMIT)?)
+            .with_context(|| {
+            format!(
+                "failed to parse pending BBDown logout intent {}",
+                path.display()
+            )
+        })?;
+    if intent.version != AUTH_LOGOUT_INTENT_VERSION {
+        bail!(
+            "unsupported pending BBDown logout intent version: {}",
+            intent.version
+        );
+    }
+    Ok(intent)
+}
+
+fn remove_auth_logout_intent(intent: BoundAuthLogoutIntent) -> Result<()> {
+    intent.file.validate_private_single_link(0o600)?;
+    if intent.root.bound_entry_identity(&intent.entry)? != Some(intent.file.identity()) {
+        bail!("pending BBDown logout intent identity changed before removal");
+    }
+    intent
+        .root
+        .remove_bound_file_if_identity(&intent.entry, intent.file.identity())
+        .context("failed to remove completed BBDown logout intent")
+}
+
 fn acquire_auth_mutation_file_lock(
     credential_file: &Path,
     protected_paths: &[&Path],
 ) -> Result<AuthMutationFileLock> {
     let configured_credential_file = credential_file;
     let credential_file = bind_auth_credential_file(credential_file)?;
-    let [lock_path, anchor_path, owner_path] =
+    let [lock_path, anchor_path, owner_path, logout_intent_path] =
         auth_mutation_control_paths(credential_file.control_path());
     let protected_paths = normalize_auth_protected_paths(
         configured_credential_file,
@@ -1322,7 +1519,12 @@ fn acquire_auth_mutation_file_lock(
     )?;
     validate_auth_control_paths_are_distinct(
         &protected_paths,
-        &[lock_path.clone(), anchor_path.clone(), owner_path.clone()],
+        &[
+            lock_path.clone(),
+            anchor_path.clone(),
+            owner_path.clone(),
+            logout_intent_path,
+        ],
     )?;
 
     let owner_exists = load_auth_mutation_lock_owner(&owner_path)?.is_some();
@@ -2289,12 +2491,13 @@ fn auth_mutation_lock_path(credential_file: &Path) -> PathBuf {
     PathBuf::from(value)
 }
 
-pub(crate) fn auth_mutation_control_paths(credential_file: &Path) -> [PathBuf; 3] {
+pub(crate) fn auth_mutation_control_paths(credential_file: &Path) -> [PathBuf; 4] {
     let lock_path = auth_mutation_lock_path(credential_file);
     [
         lock_path.clone(),
         auth_mutation_lock_anchor_path(credential_file),
         auth_mutation_lock_owner_path(credential_file),
+        auth_logout_intent_path(credential_file),
     ]
 }
 
@@ -2307,6 +2510,12 @@ fn auth_mutation_lock_anchor_path(credential_file: &Path) -> PathBuf {
 fn auth_mutation_lock_owner_path(credential_file: &Path) -> PathBuf {
     let mut value = credential_file.as_os_str().to_os_string();
     value.push(AUTH_MUTATION_LOCK_OWNER_SUFFIX);
+    PathBuf::from(value)
+}
+
+fn auth_logout_intent_path(credential_file: &Path) -> PathBuf {
+    let mut value = credential_file.as_os_str().to_os_string();
+    value.push(AUTH_LOGOUT_INTENT_SUFFIX);
     PathBuf::from(value)
 }
 
@@ -2619,6 +2828,46 @@ pub fn clear_bbdown_rust_cookie(
     })
 }
 
+pub fn logout_bbdown_auth_with_epoch(
+    state_path: &Path,
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+) -> Result<(AuthCleanupResult, AuthEpoch)> {
+    logout_bbdown_auth_with_epoch_and_hook(state_path, credential_file, credential_profile, || {
+        Ok(())
+    })
+}
+
+fn logout_bbdown_auth_with_epoch_and_hook(
+    state_path: &Path,
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+    after_legacy_state_cleanup: impl FnOnce() -> Result<()>,
+) -> Result<(AuthCleanupResult, AuthEpoch)> {
+    with_auth_mutation_transaction(state_path, credential_file, |transaction| {
+        let intent = transaction.persist_logout_intent(credential_profile)?;
+        let legacy_state = transaction.delete_legacy_state();
+        let credential_state = if legacy_state.is_ok() {
+            after_legacy_state_cleanup().and_then(|()| {
+                transaction.clear_selected_credential_profile(&intent.credential_profile)
+            })
+        } else {
+            Err(anyhow!(
+                "BBDown credential cleanup skipped because legacy login state cleanup failed"
+            ))
+        };
+        let credential_state = if credential_state.is_ok() && legacy_state.is_ok() {
+            transaction
+                .clear_logout_intent(&intent)
+                .context("failed to finalize BBDown logout")
+        } else {
+            credential_state
+        };
+        Ok((legacy_state, credential_state))
+    })
+}
+
+#[cfg(test)]
 pub fn clear_auth_state_and_credentials(
     state_path: &Path,
     credential_file: &Path,
@@ -2628,6 +2877,7 @@ pub fn clear_auth_state_and_credentials(
         .map(|(result, _)| result)
 }
 
+#[cfg(test)]
 pub fn clear_auth_state_and_credentials_with_epoch(
     state_path: &Path,
     credential_file: &Path,
@@ -2675,6 +2925,28 @@ fn update_bbdown_rust_cookie_unlocked(
             )
         })?;
     Ok(changed.get())
+}
+
+fn clear_bbdown_rust_credential_profile_unlocked(
+    credential_file: &Path,
+    credential_profile: &str,
+) -> Result<()> {
+    let profile = CredentialProfileSelection::named(credential_profile)
+        .context("invalid BBDown-rust credential profile in pending logout intent")?
+        .profile_name()
+        .expect("named credential profile should retain its name")
+        .to_string();
+    CredentialStore::new(credential_file.to_path_buf())
+        .update_profiles(|profiles| {
+            profiles.remove_profile(&profile)?;
+            Ok(())
+        })
+        .with_context(|| {
+            format!(
+                "failed to clear BBDown-rust credential profile in {}",
+                credential_file.display()
+            )
+        })
 }
 
 fn bbdown_rust_profile_selection(
@@ -4824,6 +5096,136 @@ mod tests {
         );
         assert!(!state_path.exists());
         assert!(!credential_file.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_recovery_finishes_a_logout_interrupted_after_legacy_state_cleanup() {
+        let state_path = temp_state_file("interrupted-profile-logout");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        fs::create_dir_all(&root).expect("auth root should create");
+        save_auth_state(&state_path, &test_state()).expect("legacy state should save");
+        fs::write(
+            &credential_file,
+            r#"{"version":1,"default_profile":"default","profiles":{"default":{"cookie":"SESSDATA=default"},"intl":{"cookie":"SESSDATA=intl"}}}"#,
+        )
+        .expect("credential profiles should write");
+        set_file_private(&credential_file);
+
+        let ((legacy_state, credential_state), _) = logout_bbdown_auth_with_epoch_and_hook(
+            &state_path,
+            &credential_file,
+            Some("  intl  "),
+            || Err(anyhow!("simulated crash after legacy state cleanup")),
+        )
+        .expect("logout transaction should persist its recovery intent");
+
+        assert!(legacy_state.expect("legacy state should be removed"));
+        assert!(credential_state.is_err());
+        assert!(!state_path.exists());
+        assert!(
+            auth_logout_intent_path(&credential_file).is_file(),
+            "interrupted logout must retain its durable intent"
+        );
+        let store = CredentialStore::new(credential_file.clone());
+        assert_eq!(
+            store
+                .load_selected_profile(
+                    &CredentialProfileSelection::named("intl").expect("profile should parse"),
+                )
+                .expect("interrupted profile should load")
+                .cookie
+                .as_deref(),
+            Some("SESSDATA=intl")
+        );
+
+        let messages = recover_interrupted_auth_cleanup(&state_path, &credential_file)
+            .expect("startup should finish the interrupted logout");
+
+        assert!(
+            messages
+                .iter()
+                .any(|message| message == "Recovered interrupted BBDown logout")
+        );
+        assert!(!auth_logout_intent_path(&credential_file).exists());
+        let store = CredentialStore::new(credential_file.clone());
+        assert!(
+            store
+                .load_selected_profile(
+                    &CredentialProfileSelection::named("intl").expect("profile should parse"),
+                )
+                .expect("recovered profile should load")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .load_selected_profile(&CredentialProfileSelection::default_profile())
+                .expect("default profile should remain")
+                .cookie
+                .as_deref(),
+            Some("SESSDATA=default")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_recovery_clears_the_default_profile_selected_when_logout_started() {
+        let state_path = temp_state_file("interrupted-default-profile-logout");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        fs::create_dir_all(&root).expect("auth root should create");
+        save_auth_state(&state_path, &test_state()).expect("legacy state should save");
+        fs::write(
+            &credential_file,
+            r#"{"version":1,"default_profile":"current","profiles":{"current":{"cookie":"SESSDATA=current"},"replacement":{"cookie":"SESSDATA=replacement"}}}"#,
+        )
+        .expect("credential profiles should write");
+        set_file_private(&credential_file);
+
+        let ((legacy_state, credential_state), _) =
+            logout_bbdown_auth_with_epoch_and_hook(&state_path, &credential_file, None, || {
+                Err(anyhow!("simulated crash after legacy state cleanup"))
+            })
+            .expect("logout transaction should persist its recovery intent");
+
+        assert!(legacy_state.expect("legacy state should be removed"));
+        assert!(credential_state.is_err());
+        let store = CredentialStore::new(credential_file.clone());
+        store
+            .update_profiles(|profiles| {
+                profiles.set_default_profile("replacement")?;
+                Ok(())
+            })
+            .expect("test should change the default profile after interruption");
+        set_file_private(&credential_file);
+
+        recover_interrupted_auth_cleanup(&state_path, &credential_file)
+            .expect("startup should finish the interrupted logout");
+
+        let store = CredentialStore::new(credential_file.clone());
+        assert!(
+            store
+                .load_selected_profile(
+                    &CredentialProfileSelection::named("current").expect("profile should parse"),
+                )
+                .expect("recorded profile should load")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .load_selected_profile(&CredentialProfileSelection::default_profile())
+                .expect("replacement default profile should load")
+                .cookie
+                .as_deref(),
+            Some("SESSDATA=replacement")
+        );
         let _ = fs::remove_dir_all(root);
     }
 

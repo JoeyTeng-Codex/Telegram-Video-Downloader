@@ -1486,16 +1486,10 @@ async fn run_bbdown_logout(telegram: TelegramClient, config: Arc<AppConfig>, cha
         let credential_file = config.bilibili.auth.credential_file.clone();
         let credential_profile = config.bilibili.auth.credential_profile.clone();
         let cleanup = tokio::task::spawn_blocking(move || {
-            bilibili_auth::clear_auth_state_and_credentials_with_epoch(
+            bilibili_auth::logout_bbdown_auth_with_epoch(
                 &state_path,
                 &credential_file,
-                |transaction| {
-                    bilibili_core::CredentialRuntime::from_credential_file(
-                        transaction.credential_file()?,
-                        credential_profile.as_deref(),
-                    )
-                    .and_then(|runtime| runtime.logout())
-                },
+                credential_profile.as_deref(),
             )
         })
         .await
