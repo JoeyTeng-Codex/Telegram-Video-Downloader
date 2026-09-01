@@ -175,6 +175,7 @@ struct PreparedCommandFds {
 enum ChildFdRemapOperation {
     Duplicate { source: RawFd, target: RawFd },
     ClearCloseOnExec { fd: RawFd },
+    Close { fd: RawFd },
 }
 
 #[cfg(not(unix))]
@@ -6058,6 +6059,13 @@ fn apply_child_fd_remap_operation(operation: ChildFdRemapOperation) -> std::io::
                 return Err(std::io::Error::last_os_error());
             }
         }
+        ChildFdRemapOperation::Close { fd } => {
+            // SAFETY: scratch is distinct from every target and only exists to break a remap
+            // cycle, so it must be closed before the child executes the requested program.
+            if unsafe { libc::close(fd) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
     }
     Ok(())
 }
@@ -6155,19 +6163,23 @@ fn allocate_child_fd_remap_scratch(mappings: &[(RawFd, i32)]) -> Result<OwnedFd>
         .first()
         .map(|(source, _)| *source)
         .context("command descriptor remapping has no source descriptor")?;
-    let minimum = mappings
+    let targets = mappings
         .iter()
-        .flat_map(|(source, target)| [*source, *target])
-        .max()
-        .context("command descriptor remapping has no descriptor numbers")?
-        .checked_add(1)
-        .context("command descriptor remapping descriptor range is exhausted")?;
+        .map(|(_, target)| *target)
+        .collect::<BTreeSet<_>>();
     // Protected property: each child target must retain the original open description of its
     // bound source. A single scratch descriptor breaks a source-target cycle without reopening
-    // a filesystem path or allocating one duplicate per overlapping input.
+    // a filesystem path or allocating one duplicate per overlapping input. Starting at the
+    // lowest safe descriptor lets a low process limit reuse a free gap below a high source.
     let source = unsafe { BorrowedFd::borrow_raw(source) };
-    rustix::io::fcntl_dupfd_cloexec(source, minimum)
-        .context("command descriptor remapping requires one spare file descriptor")
+    duplicate_command_fd_avoiding_targets(
+        |minimum| {
+            rustix::io::fcntl_dupfd_cloexec(source, minimum)
+                .context("failed to allocate a command descriptor remapping scratch descriptor")
+        },
+        &targets,
+    )
+    .context("command descriptor remapping requires one spare file descriptor")
 }
 
 #[cfg(unix)]
@@ -6176,7 +6188,8 @@ fn build_child_fd_remap_plan(
     scratch: Option<RawFd>,
 ) -> Result<Vec<ChildFdRemapOperation>> {
     let mut pending = mappings.to_vec();
-    let mut operations = Vec::with_capacity(mappings.len().saturating_add(1));
+    let mut operations = Vec::with_capacity(mappings.len().saturating_add(2));
+    let mut used_scratch = false;
     while !pending.is_empty() {
         if let Some(index) = pending.iter().position(|(source, target)| {
             source == target
@@ -6201,11 +6214,17 @@ fn build_child_fd_remap_plan(
             source,
             target: scratch,
         });
+        used_scratch = true;
         for (candidate_source, _) in &mut pending {
             if *candidate_source == source {
                 *candidate_source = scratch;
             }
         }
+    }
+    if used_scratch {
+        operations.push(ChildFdRemapOperation::Close {
+            fd: scratch.expect("scratch was required before it was used"),
+        });
     }
     Ok(operations)
 }
@@ -19687,6 +19706,11 @@ mv video.original video.m4s || exit 46
                 if libc::setrlimit(libc::RLIMIT_NOFILE, &limits) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
+                // Keep only standard streams before exec so concurrent parent test threads do
+                // not consume this helper's deliberately small descriptor budget.
+                for descriptor in (libc::STDERR_FILENO + 1)..80 {
+                    libc::close(descriptor);
+                }
                 Ok(())
             });
         }
@@ -19793,11 +19817,17 @@ mv video.original video.m4s || exit 46
 
         let mut descriptors = BTreeMap::from([(9, 'a'), (10, 'b'), (12, 'c'), (13, 'd')]);
         for operation in operations {
-            if let ChildFdRemapOperation::Duplicate { source, target } = operation {
-                let value = *descriptors
-                    .get(&source)
-                    .expect("remap source should retain its original open description");
-                descriptors.insert(target, value);
+            match operation {
+                ChildFdRemapOperation::Duplicate { source, target } => {
+                    let value = *descriptors
+                        .get(&source)
+                        .expect("remap source should retain its original open description");
+                    descriptors.insert(target, value);
+                }
+                ChildFdRemapOperation::ClearCloseOnExec { .. } => {}
+                ChildFdRemapOperation::Close { fd } => {
+                    descriptors.remove(&fd);
+                }
             }
         }
 
@@ -19805,6 +19835,109 @@ mv video.original video.m4s || exit 46
         assert_eq!(descriptors.get(&10), Some(&'a'));
         assert_eq!(descriptors.get(&12), Some(&'d'));
         assert_eq!(descriptors.get(&13), Some(&'c'));
+        assert!(!descriptors.contains_key(&20));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_fd_remap_uses_a_lower_free_scratch_descriptor_below_a_low_process_limit() {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new(
+            std::env::current_exe().expect("test binary should resolve"),
+        );
+        command
+            .arg("--ignored")
+            .arg("--exact")
+            .arg(
+                "downloader::tests::child_fd_remap_uses_a_lower_free_scratch_descriptor_low_limit_child",
+            )
+            .arg("--nocapture")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+                if libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut limits = limits.assume_init();
+                limits.rlim_cur = limits.rlim_cur.min(64 as libc::rlim_t);
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limits) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Keep only standard streams before exec so the high test descriptors are free.
+                for descriptor in (libc::STDERR_FILENO + 1)..64 {
+                    libc::close(descriptor);
+                }
+                Ok(())
+            });
+        }
+
+        let output = command.output().expect("low-limit helper should run");
+        assert!(
+            output.status.success(),
+            "low-limit scratch helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "spawned by child_fd_remap_uses_a_lower_free_scratch_descriptor_below_a_low_process_limit"]
+    fn child_fd_remap_uses_a_lower_free_scratch_descriptor_low_limit_child() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+
+        const PROCESS_LIMIT: RawFd = 64;
+        const FIRST_SOURCE: RawFd = PROCESS_LIMIT - 2;
+        const SECOND_SOURCE: RawFd = PROCESS_LIMIT - 1;
+
+        fn duplicate_to(source: RawFd, target: RawFd) -> OwnedFd {
+            assert_ne!(
+                source, target,
+                "test source should not already use the target"
+            );
+            let duplicated = unsafe { libc::dup2(source, target) };
+            assert_eq!(
+                duplicated, target,
+                "test descriptor should duplicate to its target"
+            );
+            // SAFETY: dup2 returned target, which is now a distinct descriptor owned by this test.
+            unsafe { OwnedFd::from_raw_fd(duplicated) }
+        }
+
+        let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) },
+            0,
+            "process file descriptor limit should read"
+        );
+        let limits = unsafe { limits.assume_init() };
+        assert!(limits.rlim_cur <= PROCESS_LIMIT as libc::rlim_t);
+
+        let source = std::fs::File::open("/dev/null").expect("test source should open");
+        assert!(
+            source.as_raw_fd() < FIRST_SOURCE,
+            "test source must leave room for high descriptor sources"
+        );
+        let first = duplicate_to(source.as_raw_fd(), FIRST_SOURCE);
+        let second = duplicate_to(source.as_raw_fd(), SECOND_SOURCE);
+        let lower_free = rustix::io::fcntl_dupfd_cloexec(&first, libc::STDERR_FILENO + 1)
+            .expect("test should reserve a lower free descriptor");
+        assert!(
+            lower_free.as_raw_fd() < FIRST_SOURCE,
+            "test must reserve a free descriptor below the high cycle"
+        );
+        drop(lower_free);
+
+        let scratch = allocate_child_fd_remap_scratch(&[
+            (first.as_raw_fd(), SECOND_SOURCE),
+            (second.as_raw_fd(), FIRST_SOURCE),
+        ])
+        .expect("a lower free scratch descriptor should fit below the process limit");
+        assert!(scratch.as_raw_fd() < FIRST_SOURCE);
+        assert_ne!(scratch.as_raw_fd(), FIRST_SOURCE);
+        assert_ne!(scratch.as_raw_fd(), SECOND_SOURCE);
     }
 
     #[cfg(unix)]
@@ -19960,6 +20093,11 @@ mv video.original video.m4s || exit 46
                 limits.rlim_cur = limits.rlim_cur.min(80 as libc::rlim_t);
                 if libc::setrlimit(libc::RLIMIT_NOFILE, &limits) == -1 {
                     return Err(std::io::Error::last_os_error());
+                }
+                // Keep only standard streams before exec so concurrent parent test threads do
+                // not consume this helper's deliberately small descriptor budget.
+                for descriptor in (libc::STDERR_FILENO + 1)..80 {
+                    libc::close(descriptor);
                 }
                 Ok(())
             });
