@@ -635,7 +635,7 @@ impl RootedFs {
         let fd = match rustix::fs::openat(
             entry.parent.fd.as_ref(),
             &entry.leaf,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
             Mode::empty(),
         ) {
             Ok(fd) => fd,
@@ -683,7 +683,7 @@ impl RootedFs {
         let fd = rustix::fs::openat(
             entry.parent.fd.as_ref(),
             &entry.leaf,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
             Mode::empty(),
         )
         .map_err(errno_to_io)
@@ -722,7 +722,7 @@ impl RootedFs {
         let fd = rustix::fs::openat(
             entry.parent.fd.as_ref(),
             &entry.leaf,
-            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
             Mode::empty(),
         )
         .map_err(errno_to_io)
@@ -2443,7 +2443,7 @@ fn read_remove_quarantine_manifest_at(
     let fd = rustix::fs::openat(
         parent,
         name,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
     )
     .map_err(errno_to_io)
@@ -3248,6 +3248,64 @@ mod tests {
         let converted = os_string_from_directory_name(name);
 
         assert_eq!(converted.into_vec(), b"name-\xff");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_bound_file_rejects_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::process::Command;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        const FIFO_PATH_ENV: &str = "TELEGRAM_VIDEO_DOWNLOADER_SAFE_FS_FIFO_PATH";
+        if let Some(path) = std::env::var_os(FIFO_PATH_ENV) {
+            let fifo = PathBuf::from(path);
+            let root = fifo.parent().expect("FIFO should have a parent directory");
+            let rooted = RootedFs::new(root).expect("FIFO parent should bind");
+            let error = rooted
+                .open_bound_file(&fifo)
+                .expect_err("a FIFO must not be accepted as a bound regular file");
+            assert!(format!("{error:#}").contains("not a regular file"));
+            return;
+        }
+
+        let root = temp_dir("bound-fifo");
+        fs::create_dir_all(&root).expect("FIFO root should create");
+        let fifo = root.join("credential.fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path should be valid");
+        assert_eq!(
+            unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) },
+            0,
+            "failed to create FIFO: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let mut child = Command::new(std::env::current_exe().expect("test binary should resolve"))
+            .arg("--exact")
+            .arg("safe_fs::tests::open_bound_file_rejects_fifo_without_blocking")
+            .arg("--nocapture")
+            .env(FIFO_PATH_ENV, &fifo)
+            .spawn()
+            .expect("FIFO helper should start");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(status) = child.try_wait().expect("FIFO helper status should read") {
+                assert!(
+                    status.success(),
+                    "FIFO helper should reject the FIFO: {status}"
+                );
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = fs::remove_dir_all(&root);
+                panic!("open_bound_file blocked on a FIFO");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

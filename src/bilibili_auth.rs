@@ -1126,7 +1126,10 @@ fn validate_auth_lock_in_bound_parent(
     let linked = rustix::fs::openat(
         directory,
         leaf,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK,
         rustix::fs::Mode::empty(),
     )
     .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
