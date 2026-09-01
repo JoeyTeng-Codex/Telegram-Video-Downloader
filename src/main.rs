@@ -2595,6 +2595,8 @@ fn redact_bbdown_auth_secrets(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::anyhow;
@@ -2868,6 +2870,12 @@ mod tests {
         config.bilibili.auth.credential_file = root.join("bbdown-credentials.json");
         fs::write(&config.bilibili.auth.state_path, "{not-json")
             .expect("malformed legacy state should write");
+        #[cfg(unix)]
+        fs::set_permissions(
+            &config.bilibili.auth.state_path,
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("malformed legacy state permissions should update");
         let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
         let auth_epoch = current_bbdown_auth_epoch(&config)
             .await

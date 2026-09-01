@@ -2267,14 +2267,10 @@ pub fn load_auth_state(path: &Path) -> Result<Option<AuthState>> {
 }
 
 fn load_auth_state_unlocked(path: &Path) -> Result<Option<AuthState>> {
-    match fs::read(path) {
-        Ok(content) => serde_json::from_slice(&content)
-            .with_context(|| format!("failed to parse Bilibili auth state {}", path.display()))
-            .map(Some),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err)
-            .with_context(|| format!("failed to read Bilibili auth state {}", path.display())),
-    }
+    let Some(state) = bind_auth_state_path_before_lock(path)? else {
+        return Ok(None);
+    };
+    load_bound_auth_state_unlocked(&state)
 }
 
 fn load_bound_auth_state_unlocked(state: &BoundAuthStatePath) -> Result<Option<AuthState>> {
@@ -2289,6 +2285,12 @@ fn load_bound_auth_state_unlocked(state: &BoundAuthStatePath) -> Result<Option<A
         state.validate_root()?;
         return Ok(None);
     };
+    // Protected property: only an app-owned legacy state object may populate the durable
+    // credential store. The bound descriptor holds object identity through the read; its mode,
+    // owner, and single link establish the access policy. Binding only the parent directory would
+    // not prove that the selected state leaf was created by the current user.
+    file.validate_private_single_link(0o600)
+        .context("Bilibili auth state must be a current-user-owned private single-link file")?;
     let contents = file.read_limited(AUTH_STATE_FILE_LIMIT)?;
     state.validate_root()?;
     serde_json::from_slice(&contents)
@@ -3759,6 +3761,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn rejects_nonprivate_legacy_state_before_loading_or_credential_sync() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_path = temp_state_file("nonprivate-legacy-state");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        fs::create_dir_all(&root).expect("state directory should create");
+        fs::write(
+            &state_path,
+            serde_json::to_vec(&test_state()).expect("state should encode"),
+        )
+        .expect("state should write");
+        fs::set_permissions(&state_path, fs::Permissions::from_mode(0o644))
+            .expect("state permissions should update");
+
+        let load_error = load_auth_state(&state_path)
+            .expect_err("nonprivate state must not be returned to status callers");
+        assert!(format!("{load_error:#}").contains("current-user-owned private single-link file"));
+
+        let sync_error =
+            sync_bbdown_rust_credentials_from_state(&state_path, &credential_file, None)
+                .expect_err("nonprivate state must not populate credentials");
+        assert!(format!("{sync_error:#}").contains("current-user-owned private single-link file"));
+        assert!(!credential_file.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn auth_lock_rejects_state_control_aliases_and_symlinked_state_parents() {
         use std::os::unix::fs::symlink;
 
@@ -4143,6 +4177,7 @@ mod tests {
             fs::create_dir_all(parent).expect("state parent should create");
         }
         fs::write(&path, "{not-json").expect("malformed state should write");
+        set_file_private(&path);
         fs::write(&credential_file, r#"{"access_key":"access"}"#)
             .expect("credential file should write");
 
@@ -4587,6 +4622,7 @@ mod tests {
             serde_json::to_vec(&replacement_state).expect("replacement state should encode"),
         )
         .expect("replacement state should write");
+        set_file_private(&state_parent.join("state.json"));
         drop(held_lock);
 
         let error = migration
