@@ -58,6 +58,9 @@ const VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON: &str =
 const BILIBILI_WORKER_REQUEST_FILE_NAME: &str = ".bilibili-worker.json";
 const BILIBILI_WORKER_REQUEST_VERSION: u32 = 3;
 const BILIBILI_WORKER_REQUEST_LIMIT: usize = 1024 * 1024;
+const BILIBILI_WORKER_LIFECYCLE_FILE_NAME: &str = ".bilibili-worker-lifecycle.json";
+const BILIBILI_WORKER_LIFECYCLE_VERSION: u32 = 1;
+const BILIBILI_WORKER_LIFECYCLE_LIMIT: usize = 1024;
 const VIDEO_OUTPUT_LOCK_FILE_NAME: &str = ".telegram-video-downloader.lock";
 const VIDEO_CONTROL_DIR_NAME: &str = ".telegram-video-downloader-control";
 const VIDEO_OUTPUT_LOCK_ANCHOR_FILE_NAME: &str = "output-lock";
@@ -3719,10 +3722,13 @@ async fn run_staged_video_job(
     let mut youtube_metadata = None;
     let result = match job {
         JobRequest::Bilibili { url, selection } => {
-            // Cancellation drops the task without awaiting the worker process. Preserve staging
-            // before launch so only the next startup, when no old worker can exist, may discard an
-            // unmarked incomplete download.
+            // Cancellation drops the task without awaiting the worker process. Persist a
+            // non-sensitive lifecycle record before launch, so a restart never mistakes a
+            // Bilibili worker whose completion marker could not be written for a generic
+            // incomplete download.
             staging.preserve_for_recovery();
+            persist_bilibili_worker_lifecycle(&staging)
+                .context("failed to persist Bilibili worker lifecycle before launch")?;
             let expected_identity =
                 matches!(action, VideoDuplicateAction::Overwrite).then_some(&duplicate.identity);
             run_staged_bilibili_worker(
@@ -4587,6 +4593,16 @@ struct VideoStagingRetention {
     staging_device: u64,
     staging_inode: u64,
     reason: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BilibiliWorkerLifecycle {
+    version: u32,
+    root_device: u64,
+    root_inode: u64,
+    staging_device: u64,
+    staging_inode: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -7460,6 +7476,7 @@ fn is_staging_support_file(staging_dir: &Path, path: &Path) -> bool {
         || path == staging_dir.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME)
         || path == staging_dir.join(VIDEO_STAGING_RETENTION_FILE_NAME)
         || path == staging_dir.join(BILIBILI_WORKER_REQUEST_FILE_NAME)
+        || path == staging_dir.join(BILIBILI_WORKER_LIFECYCLE_FILE_NAME)
 }
 
 fn remove_sensitive_staging_support_files(root: &RootedFs, staging_dir: &Path) -> Result<()> {
@@ -7540,6 +7557,69 @@ fn retained_video_staging_reason(
         expected_identity.device(),
         expected_identity.inode(),
     )
+}
+
+fn persist_bilibili_worker_lifecycle(staging: &BoundStagingDir) -> Result<()> {
+    staging.validate_for_path_access()?;
+    if has_valid_bilibili_worker_lifecycle(&staging.root, staging.path(), staging.identity)? {
+        return Ok(());
+    }
+    let lifecycle = BilibiliWorkerLifecycle {
+        version: BILIBILI_WORKER_LIFECYCLE_VERSION,
+        root_device: staging.root.root_identity().device(),
+        root_inode: staging.root.root_identity().inode(),
+        staging_device: staging.identity.device(),
+        staging_inode: staging.identity.inode(),
+    };
+    let contents =
+        serde_json::to_vec(&lifecycle).context("failed to encode Bilibili worker lifecycle")?;
+    if contents.len() > BILIBILI_WORKER_LIFECYCLE_LIMIT {
+        bail!("Bilibili worker lifecycle record exceeds its size limit");
+    }
+    let lifecycle_path = staging.path().join(BILIBILI_WORKER_LIFECYCLE_FILE_NAME);
+    let (entry, identity) = staging
+        .root
+        .create_new_bound_file(&lifecycle_path, &contents, 0o600)
+        .context("failed to persist Bilibili worker lifecycle before launch")?;
+    let file = staging
+        .root
+        .open_bound_file(&lifecycle_path)?
+        .context("Bilibili worker lifecycle disappeared after creation")?;
+    if file.identity() != identity || staging.root.bound_entry_identity(&entry)? != Some(identity) {
+        bail!("Bilibili worker lifecycle identity changed after creation");
+    }
+    file.validate_private_single_link(0o600)?;
+    if !has_valid_bilibili_worker_lifecycle(&staging.root, staging.path(), staging.identity)? {
+        bail!("Bilibili worker lifecycle disappeared after validation");
+    }
+    staging.validate_for_path_access()
+}
+
+fn has_valid_bilibili_worker_lifecycle(
+    root: &RootedFs,
+    staging_path: &Path,
+    staging_identity: EntryIdentity,
+) -> Result<bool> {
+    let lifecycle_path = staging_path.join(BILIBILI_WORKER_LIFECYCLE_FILE_NAME);
+    let Some(file) = root.open_bound_file(&lifecycle_path)? else {
+        return Ok(false);
+    };
+    file.validate_private_single_link(0o600)?;
+    let lifecycle: BilibiliWorkerLifecycle =
+        serde_json::from_slice(&file.read_limited(BILIBILI_WORKER_LIFECYCLE_LIMIT)?)
+            .context("failed to parse Bilibili worker lifecycle")?;
+    if lifecycle.version != BILIBILI_WORKER_LIFECYCLE_VERSION
+        || lifecycle.root_device != root.root_identity().device()
+        || lifecycle.root_inode != root.root_identity().inode()
+        || lifecycle.staging_device != staging_identity.device()
+        || lifecycle.staging_inode != staging_identity.inode()
+    {
+        bail!("Bilibili worker lifecycle does not match the owned staging directory");
+    }
+    if root.entry_identity(&lifecycle_path)? != Some(file.identity()) {
+        bail!("Bilibili worker lifecycle identity changed after validation");
+    }
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7751,21 +7831,26 @@ where
         let manifest_path = path.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME);
         let Some(manifest_file) = root.open_bound_file(&manifest_path)? else {
             if let Some(reason) = retained_video_staging_reason(root, path, identity)? {
-                let mux_recovery = recover_pending_bilibili_mux_transactions_locked(root, path)?;
-                if mux_recovery.unresolved {
-                    bail!(
-                        "retained staged job has unresolved Bilibili mux recovery: {}",
-                        mux_recovery.messages.join("; ")
-                    );
-                }
-                validate_video_staging_directory(root, path, identity)
-                    .context("retained staged job changed during Bilibili mux recovery")?;
-                let mut messages = mux_recovery.messages;
-                messages.push(format!(
-                    "Retained completed staged video job for manual recovery: {} ({reason})",
-                    path.display()
-                ));
-                return Ok(messages);
+                return retain_bilibili_staging_for_manual_recovery(
+                    root,
+                    path,
+                    identity,
+                    format!(
+                        "Retained completed staged video job for manual recovery: {} ({reason})",
+                        path.display()
+                    ),
+                );
+            }
+            if has_valid_bilibili_worker_lifecycle(root, path, identity)? {
+                return retain_bilibili_staging_for_manual_recovery(
+                    root,
+                    path,
+                    identity,
+                    format!(
+                        "Retained Bilibili staged video job for manual recovery because its completion marker could not be verified: {}",
+                        path.display()
+                    ),
+                );
             }
             root.remove_bound_tree_durably_if_identity(entry, identity)?;
             return Ok(vec![format!(
@@ -7805,6 +7890,26 @@ where
         )])
     })();
     result.map_err(|error| VideoStagingRecoveryFailure { error, overwrite })
+}
+
+fn retain_bilibili_staging_for_manual_recovery(
+    root: &RootedFs,
+    path: &Path,
+    identity: EntryIdentity,
+    message: String,
+) -> Result<Vec<String>> {
+    let mux_recovery = recover_pending_bilibili_mux_transactions_locked(root, path)?;
+    if mux_recovery.unresolved {
+        bail!(
+            "retained staged job has unresolved Bilibili mux recovery: {}",
+            mux_recovery.messages.join("; ")
+        );
+    }
+    validate_video_staging_directory(root, path, identity)
+        .context("retained staged job changed during Bilibili mux recovery")?;
+    let mut messages = mux_recovery.messages;
+    messages.push(message);
+    Ok(messages)
 }
 
 fn validate_staged_publication_manifest(
@@ -12844,6 +12949,47 @@ mod tests {
     }
 
     #[test]
+    fn bilibili_worker_lifecycle_retains_unmarked_completed_staging_after_restart() {
+        let final_dir = temp_test_dir("bilibili-worker-lifecycle-retention");
+        let root = RootedFs::new(&final_dir).expect("output root should bind");
+        let staging =
+            create_video_staging_dir(&root).expect("production staging directory should create");
+        staging.preserve_for_recovery();
+        persist_bilibili_worker_lifecycle(&staging)
+            .expect("worker lifecycle should persist before launch");
+        let staging_dir = staging.path().to_path_buf();
+        let lifecycle_path = staging_dir.join(BILIBILI_WORKER_LIFECYCLE_FILE_NAME);
+        let staged_video = staging_dir.join("Episode.mp4");
+        fs::write(&staged_video, "completed-video").expect("completed video should write");
+        assert_eq!(
+            retained_video_staging_reason(&root, &staging_dir, staging.identity)
+                .expect("completion marker should remain absent"),
+            None
+        );
+        assert!(lifecycle_path.is_file());
+        drop(staging);
+
+        let recovery = recover_pending_video_staging_directories_locked(&root)
+            .expect("worker lifecycle should retain unmarked completed media");
+
+        assert!(!recovery.unresolved);
+        assert!(
+            recovery.messages.iter().any(|message| {
+                message.contains("Retained Bilibili staged video job")
+                    && message.contains("completion marker could not be verified")
+            }),
+            "recovery messages: {:#?}",
+            recovery.messages
+        );
+        assert_eq!(
+            fs::read_to_string(&staged_video).unwrap(),
+            "completed-video"
+        );
+        assert!(staging_dir.is_dir());
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
     fn oversized_staged_publications_survive_startup_recovery() {
         for (case, max_steps, manifest_limit, expected_reason) in [
             (
@@ -16450,6 +16596,10 @@ mod tests {
             &staging_dir,
             &staging_dir.join(BILIBILI_WORKER_REQUEST_FILE_NAME)
         ));
+        assert!(is_staging_support_file(
+            &staging_dir,
+            &staging_dir.join(BILIBILI_WORKER_LIFECYCLE_FILE_NAME)
+        ));
         assert!(!is_staging_support_file(
             &staging_dir,
             &staging_dir.join("ffmpeg-concat.txt")
@@ -16655,6 +16805,8 @@ mod tests {
         let output_lock = video_output_lock_file(&root).expect("output lock should bind");
         let staging =
             create_video_staging_dir(&root).expect("worker staging directory should create");
+        persist_bilibili_worker_lifecycle(&staging)
+            .expect("worker lifecycle should persist before marker failure");
         let request = build_bilibili_worker_request(
             &config,
             "https://www.bilibili.com/video/BV123",
