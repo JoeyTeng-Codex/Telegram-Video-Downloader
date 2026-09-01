@@ -232,6 +232,26 @@ struct BilibiliWorkerRequest {
     output_lock_inode: u64,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+enum BilibiliWorkerResponse {
+    Completed { report: JobReport },
+    CoreCompletedMarkerFailed,
+}
+
+#[derive(Debug)]
+struct BilibiliCoreCompletionMarkerFailure;
+
+impl std::fmt::Display for BilibiliCoreCompletionMarkerFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "Bilibili core download completed but its retention marker could not be persisted",
+        )
+    }
+}
+
+impl std::error::Error for BilibiliCoreCompletionMarkerFailure {}
+
 pub fn job_progress_channel() -> (JobProgressSender, JobProgressReceiver) {
     watch::channel(None)
 }
@@ -1016,8 +1036,17 @@ async fn run_staged_bilibili_worker(
             summarize_output(&stdout, &stderr)
         );
     }
-    let report = last_nonempty_line(&stdout).context("Bilibili worker returned no report")?;
-    serde_json::from_str(report).context("failed to parse Bilibili worker report")
+    let response = last_nonempty_line(&stdout).context("Bilibili worker returned no report")?;
+    parse_bilibili_worker_response(response)
+}
+
+fn parse_bilibili_worker_response(response: &str) -> Result<JobReport> {
+    match serde_json::from_str(response).context("failed to parse Bilibili worker response")? {
+        BilibiliWorkerResponse::Completed { report } => Ok(report),
+        BilibiliWorkerResponse::CoreCompletedMarkerFailed => {
+            Err(anyhow!(BilibiliCoreCompletionMarkerFailure))
+        }
+    }
 }
 
 fn create_unlinked_bilibili_worker_request(
@@ -1176,6 +1205,14 @@ fn persist_bilibili_core_download_completion(
     }
 }
 
+fn mark_bilibili_core_download_completed(
+    root: &RootedFs,
+    request: Option<&BilibiliWorkerRequest>,
+) -> Result<()> {
+    persist_bilibili_core_download_completion(root, request)
+        .context(BilibiliCoreCompletionMarkerFailure)
+}
+
 #[cfg(unix)]
 fn read_bilibili_worker_request_from_fd(request_fd: OwnedFd) -> Result<BilibiliWorkerRequest> {
     let mut reader = std::fs::File::from(request_fd)
@@ -1239,10 +1276,14 @@ pub async fn run_bilibili_worker() -> Result<()> {
             terminate_current_process_group(reason);
         }
     };
-    let report = match result {
-        Ok(report) => {
-            persist_bilibili_worker_completion(&root, &request)?;
-            report
+    let response = match result {
+        Ok(report) => BilibiliWorkerResponse::Completed { report },
+        Err(err)
+            if err
+                .downcast_ref::<BilibiliCoreCompletionMarkerFailure>()
+                .is_some() =>
+        {
+            BilibiliWorkerResponse::CoreCompletedMarkerFailed
         }
         Err(err) => {
             progress_writer
@@ -1256,7 +1297,7 @@ pub async fn run_bilibili_worker() -> Result<()> {
         .context("failed to join Bilibili worker progress writer")?;
     println!(
         "{}",
-        serde_json::to_string(&report).context("failed to encode Bilibili worker report")?
+        serde_json::to_string(&response).context("failed to encode Bilibili worker response")?
     );
     std::io::stdout()
         .flush()
@@ -1344,7 +1385,7 @@ async fn run_bilibili_job_locked(
         .download_plan_with_progress(&core_plan, options, &progress_reporter)
         .await?;
     let mut report = BilibiliDownloadReport::from(&core_report);
-    persist_bilibili_core_download_completion(root, worker_request)?;
+    mark_bilibili_core_download_completed(root, worker_request)?;
     let output_dir = bilibili_core::output_dir(config);
     if mux_locally {
         mux_bilibili_report_media(
@@ -1357,7 +1398,7 @@ async fn run_bilibili_job_locked(
         )
         .await?;
     }
-    cleanup_bilibili_mux_input_files(root, &output_dir, &report)?;
+    cleanup_bilibili_mux_input_files(root, &mut report)?;
     let primary_videos = bilibili_report_primary_media(&output_dir, &report);
     let reported_output_dir = worker_request
         .map(|request| request.logical_output_dir.as_path())
@@ -2124,6 +2165,11 @@ async fn mux_bilibili_report_media(
             bound_inputs,
             recovery: Some(recovery),
         });
+        let mux = entry
+            .mux
+            .as_mut()
+            .expect("Bilibili mux state was just installed");
+        cleanup_bilibili_mux_entry_inputs(root, mux)?;
     }
     Ok(())
 }
@@ -2385,49 +2431,60 @@ fn inherited_command_descriptor(_index: usize) -> Result<i32> {
 
 fn cleanup_bilibili_mux_input_files(
     root: &RootedFs,
-    _cwd: &Path,
-    report: &BilibiliDownloadReport,
+    report: &mut BilibiliDownloadReport,
 ) -> Result<()> {
-    let muxes = report
-        .entries
-        .iter()
-        .filter_map(|entry| entry.mux.as_ref())
-        .filter(|mux| mux.bound_output.is_some() && mux.recovery.is_some())
-        .collect::<Vec<_>>();
-    for mux in &muxes {
-        validate_bilibili_mux_recovery(root, mux)?;
-        for input in &mux.bound_inputs {
-            input.file.validate_identity()?;
-            if root.bound_entry_identity(&input.entry)? != Some(input.file.identity()) {
-                bail!(
-                    "Bilibili mux input identity changed: {}",
-                    input.path.display()
-                );
-            }
-        }
+    for entry in &mut report.entries {
+        let Some(mux) = entry.mux.as_mut() else {
+            continue;
+        };
+        cleanup_bilibili_mux_entry_inputs(root, mux)?;
+    }
+    Ok(())
+}
+
+fn cleanup_bilibili_mux_entry_inputs(root: &RootedFs, mux: &mut BilibiliMuxReport) -> Result<()> {
+    match (mux.bound_output.is_some(), mux.recovery.is_some()) {
+        (false, false) => return Ok(()),
+        (true, true) => {}
+        _ => bail!("Bilibili mux state is incomplete during raw-input cleanup"),
     }
 
-    for mux in &muxes {
-        for input in &mux.bound_inputs {
-            for current in &muxes {
-                validate_bilibili_mux_recovery(root, current)?;
-            }
-            input.file.validate_identity()?;
-            root.remove_bound_file_if_identity(&input.entry, input.file.identity())
-                .with_context(|| {
-                    format!(
-                        "failed to remove raw Bilibili input {}",
-                        input.path.display()
-                    )
-                })?;
+    // The published output and recovery transaction must be valid before any raw stream can be
+    // removed. Revalidate before each removal so an interrupted cleanup remains recoverable.
+    validate_bilibili_mux_recovery(root, mux)?;
+    for input in &mux.bound_inputs {
+        input.file.validate_identity()?;
+        if root.bound_entry_identity(&input.entry)? != Some(input.file.identity()) {
+            bail!(
+                "Bilibili mux input identity changed: {}",
+                input.path.display()
+            );
         }
     }
-    for mux in &muxes {
+    for input in &mux.bound_inputs {
         validate_bilibili_mux_recovery(root, mux)?;
+        input.file.validate_identity()?;
+        if root.bound_entry_identity(&input.entry)? != Some(input.file.identity()) {
+            bail!(
+                "Bilibili mux input identity changed: {}",
+                input.path.display()
+            );
+        }
+        root.remove_bound_file_if_identity(&input.entry, input.file.identity())
+            .with_context(|| {
+                format!(
+                    "failed to remove raw Bilibili input {}",
+                    input.path.display()
+                )
+            })?;
     }
-    for mux in &muxes {
-        finalize_bilibili_mux_recovery(root, mux)?;
-    }
+    finalize_bilibili_mux_recovery(root, mux)?;
+
+    // Recovery has been durably finalized, so retaining descriptor-bound state only consumes
+    // file descriptors across later entries in the same download plan.
+    mux.bound_output = None;
+    mux.bound_inputs.clear();
+    mux.recovery = None;
     Ok(())
 }
 
@@ -3712,6 +3769,15 @@ async fn run_staged_video_job(
                 .retain_for_manual_recovery(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)
                 .context("failed to persist completed staged download before publication")?;
             report
+        }
+        Err(err)
+            if err
+                .downcast_ref::<BilibiliCoreCompletionMarkerFailure>()
+                .is_some() =>
+        {
+            return Err(retain_completed_bilibili_staging_after_marker_failure(
+                &staging, err,
+            ));
         }
         Err(err) => {
             match retained_video_staging_reason(&staging.root, staging.path(), staging.identity) {
@@ -8468,6 +8534,25 @@ fn retain_oversized_staged_publication(staging: &BoundStagingDir, reason: String
             "{reason}; failed to persist the manual-recovery marker at {}: {retention_error:#}",
             staging.path().display()
         ),
+    }
+}
+
+fn retain_completed_bilibili_staging_after_marker_failure(
+    staging: &BoundStagingDir,
+    worker_error: anyhow::Error,
+) -> anyhow::Error {
+    // A core download already completed. Keep its staging directory even when the marker cannot
+    // be written, because treating this as an incomplete job would delete finished media.
+    staging.preserve_for_recovery();
+    match staging.retain_for_manual_recovery(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON) {
+        Ok(()) => worker_error.context(format!(
+            "Bilibili core download completed; outputs were retained at {} for manual recovery",
+            staging.path().display()
+        )),
+        Err(retention_error) => worker_error.context(format!(
+            "Bilibili core download completed; outputs remain at {} for manual recovery, but the retention marker could not be persisted: {retention_error:#}",
+            staging.path().display()
+        )),
     }
 }
 
@@ -15958,8 +16043,7 @@ mod tests {
         let rooted = RootedFs::new(&root).expect("output root should bind");
         bind_existing_bilibili_mux_state(&rooted, &root, &mut report)
             .expect("mux state should bind");
-        cleanup_bilibili_mux_input_files(&rooted, &root, &report)
-            .expect("raw inputs should clean up");
+        cleanup_bilibili_mux_input_files(&rooted, &mut report).expect("raw inputs should clean up");
 
         assert!(!video.exists());
         assert!(!audio.exists());
@@ -15969,6 +16053,13 @@ mod tests {
         );
         assert!(mux.exists());
         assert!(danmaku.exists());
+        let mux_state = report.entries[0]
+            .mux
+            .as_ref()
+            .expect("mux report should remain available after cleanup");
+        assert!(mux_state.bound_output.is_none());
+        assert!(mux_state.bound_inputs.is_empty());
+        assert!(mux_state.recovery.is_none());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -15999,7 +16090,7 @@ mod tests {
 
         fs::remove_file(&configured).expect("configured symlink should remove");
         symlink(&replacement, &configured).expect("configured symlink should retarget");
-        let error = cleanup_bilibili_mux_input_files(&root, &configured, &report)
+        let error = cleanup_bilibili_mux_input_files(&root, &mut report)
             .expect_err("retargeted root must reject raw-stream cleanup");
 
         assert!(format!("{error:#}").contains("different directory"));
@@ -16031,7 +16122,7 @@ mod tests {
 
         fs::remove_file(&output).expect("bound mux output should unlink");
         fs::write(&output, "replacement").expect("replacement output should write");
-        let error = cleanup_bilibili_mux_input_files(&rooted, &root, &report)
+        let error = cleanup_bilibili_mux_input_files(&rooted, &mut report)
             .expect_err("replacement output must stop raw-input cleanup");
 
         assert!(format!("{error:#}").contains("mux output identity changed"));
@@ -16557,6 +16648,72 @@ mod tests {
     }
 
     #[test]
+    fn bilibili_worker_marker_failure_retains_completed_staging() {
+        let config = test_config();
+        let video_dir = temp_test_dir("bilibili-worker-marker-failure");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+        let output_lock = video_output_lock_file(&root).expect("output lock should bind");
+        let staging =
+            create_video_staging_dir(&root).expect("worker staging directory should create");
+        let request = build_bilibili_worker_request(
+            &config,
+            "https://www.bilibili.com/video/BV123",
+            None,
+            None,
+            &staging,
+            &output_lock,
+        );
+        let completed_output = staging.path().join("Episode.mp4");
+        fs::write(&completed_output, "completed-media").expect("completed output should write");
+        let marker_path = staging.path().join(VIDEO_STAGING_RETENTION_FILE_NAME);
+        fs::create_dir(&marker_path).expect("marker path should become a forced write failure");
+        let worker_root =
+            RootedFs::new(staging.path()).expect("worker should bind the staging directory");
+
+        let error = mark_bilibili_core_download_completed(&worker_root, Some(&request))
+            .expect_err("a directory cannot become the private retention marker");
+        assert!(
+            error
+                .downcast_ref::<BilibiliCoreCompletionMarkerFailure>()
+                .is_some()
+        );
+        let error = retain_completed_bilibili_staging_after_marker_failure(&staging, error);
+        assert!(format!("{error:#}").contains("outputs remain at"));
+
+        let staging_path = staging.path().to_path_buf();
+        drop(worker_root);
+        drop(staging);
+        assert!(staging_path.is_dir());
+        assert!(completed_output.is_file());
+        assert!(marker_path.is_dir());
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn bilibili_worker_response_preserves_marker_failure_state() {
+        let completed = BilibiliWorkerResponse::Completed {
+            report: JobReport {
+                saved_location: "Episode.mp4".to_string(),
+                details: "complete".to_string(),
+            },
+        };
+        let encoded = serde_json::to_string(&completed).expect("response should encode");
+        let report = parse_bilibili_worker_response(&encoded)
+            .expect("completed worker response should parse");
+        assert_eq!(report.saved_location, "Episode.mp4");
+
+        let encoded = serde_json::to_string(&BilibiliWorkerResponse::CoreCompletedMarkerFailed)
+            .expect("marker failure response should encode");
+        let error = parse_bilibili_worker_response(&encoded)
+            .expect_err("marker failure response should remain distinguishable");
+        assert!(
+            error
+                .downcast_ref::<BilibiliCoreCompletionMarkerFailure>()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn startup_recovery_removes_legacy_sensitive_staging_support_files() {
         let video_dir = temp_test_dir("legacy-sensitive-staging-support");
         let root = RootedFs::new(&video_dir).expect("output root should bind");
@@ -17070,7 +17227,7 @@ mv video.original video.m4s || exit 46
             fs::read_to_string(root.join("Episode.mp4")).expect("mux output should exist"),
             "original-video"
         );
-        assert_eq!(fs::read_to_string(&video).unwrap(), "original-video");
+        assert!(!video.exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -18618,6 +18775,108 @@ mv video.original video.m4s || exit 46
             format!("{}\nrequest", canonical_staging.display())
         );
         drop(staging);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bilibili_mux_releases_descriptors_below_a_low_process_limit() {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new(
+            std::env::current_exe().expect("test binary should resolve"),
+        );
+        command
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("downloader::tests::bilibili_mux_releases_descriptors_low_limit_child")
+            .arg("--nocapture")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+                if libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut limits = limits.assume_init();
+                limits.rlim_cur = limits.rlim_cur.min(80 as libc::rlim_t);
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limits) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let output = command.output().expect("low-limit helper should run");
+
+        assert!(
+            output.status.success(),
+            "low-limit mux helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "spawned by bilibili_mux_releases_descriptors_below_a_low_process_limit"]
+    async fn bilibili_mux_releases_descriptors_low_limit_child() {
+        let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) };
+        assert_eq!(result, 0, "process file descriptor limit should read");
+        let limits = unsafe { limits.assume_init() };
+        assert!(limits.rlim_cur <= 80 as libc::rlim_t);
+
+        let root = temp_test_dir("bilibili-mux-low-fd-limit");
+        let fake_ffmpeg = root.join("fake-ffmpeg.sh");
+        fs::write(&fake_ffmpeg, "#!/bin/sh\nprintf muxed >&65\n")
+            .expect("fake ffmpeg should write");
+        fs::set_permissions(&fake_ffmpeg, fs::Permissions::from_mode(0o700))
+            .expect("fake ffmpeg should become executable");
+
+        let mut config = test_config();
+        config.tools.ffmpeg = fake_ffmpeg;
+        config.bot.command_timeout_seconds = 5;
+        config.bot.command_idle_timeout_seconds = 5;
+        let mut report = BilibiliDownloadReport {
+            title: "Low descriptor limit".to_string(),
+            output_dir: PathBuf::from("."),
+            entries: Vec::new(),
+        };
+        let mut raw_inputs = Vec::new();
+        for index in 0..32 {
+            let raw = root.join(format!("entry-{index:02}.m4s"));
+            fs::write(&raw, "raw-media").expect("raw stream should write");
+            report.entries.push(BilibiliEntryDownloadReport {
+                index,
+                title: format!("Episode {index:02}"),
+                files: vec![BilibiliDownloadedFile {
+                    kind: "video".to_string(),
+                    path: raw.clone(),
+                }],
+                mux: None,
+            });
+            raw_inputs.push(raw);
+        }
+
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+        mux_bilibili_report_media(&config, &rooted, &root, &mut report, UNIX_EPOCH, None)
+            .await
+            .expect("each mux should release descriptor-bound state before the next entry");
+
+        assert!(raw_inputs.iter().all(|path| !path.exists()));
+        for entry in &report.entries {
+            let mux = entry
+                .mux
+                .as_ref()
+                .expect("each entry should retain its published output path");
+            assert!(mux.output_path.is_file());
+            assert!(mux.bound_output.is_none());
+            assert!(mux.bound_inputs.is_empty());
+            assert!(mux.recovery.is_none());
+        }
+        drop(report);
+        drop(rooted);
         let _ = fs::remove_dir_all(root);
     }
 
