@@ -94,6 +94,7 @@ enum AtomicBoundFileReplaceCheckpoint {
 pub(crate) struct RemoveQuarantineRecoveryReport {
     pub(crate) messages: Vec<String>,
     pub(crate) unresolved: bool,
+    pub(crate) incomplete: bool,
     pub(crate) restored: bool,
 }
 
@@ -150,6 +151,7 @@ enum RemoveQuarantineScanDepth {
 struct RemoveQuarantineScanState {
     messages: Vec<String>,
     unresolved: bool,
+    incomplete: bool,
     restored: bool,
 }
 
@@ -508,6 +510,7 @@ impl RootedFs {
         Ok(RemoveQuarantineRecoveryReport {
             messages: state.messages,
             unresolved: state.unresolved,
+            incomplete: state.incomplete,
             restored: state.restored,
         })
     }
@@ -534,6 +537,7 @@ impl RootedFs {
         Ok(RemoveQuarantineRecoveryReport {
             messages: state.messages,
             unresolved: state.unresolved,
+            incomplete: state.incomplete,
             restored: state.restored,
         })
     }
@@ -1943,13 +1947,13 @@ where
         if scan_depth == RemoveQuarantineScanDepth::CurrentDirectory || !identity.is_dir() {
             continue;
         }
-        // An inaccessible ordinary subtree has not identified a managed recovery candidate.
-        // Keep the diagnostic, but reserve `unresolved` for a known quarantine/tombstone that
-        // cannot be authenticated or completed. This distinguishes unrelated library churn or
-        // permissions from a bot-owned recovery state that actually requires another pass.
+        // Protected property: a recursive scan can claim clean only after every reachable
+        // subtree has been inspected. A disappearing child has no remaining reachable subtree,
+        // but an unreadable or replaced directory can still conceal a managed transaction.
         let child = match openat_directory_cstr(directory, &name) {
             Ok(child) => child,
             Err(err) => {
+                state.incomplete = true;
                 state.messages.push(format!(
                     "Skipped unreadable directory during interrupted-removal scan {}: {err}",
                     path.display()
@@ -1958,6 +1962,7 @@ where
             }
         };
         if identity_for_fd(&child)? != identity {
+            state.incomplete = true;
             state.messages.push(format!(
                 "Skipped replaced directory during interrupted-removal scan: {}",
                 path.display()
@@ -1972,6 +1977,7 @@ where
             should_restore,
             RemoveQuarantineScanDepth::Recursive,
         ) {
+            state.incomplete = true;
             state.messages.push(format!(
                 "Skipped directory during interrupted-removal scan {}: {err:#}",
                 path.display()

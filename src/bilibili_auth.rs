@@ -1088,6 +1088,7 @@ pub fn recover_interrupted_auth_cleanup(
     state_path: &Path,
     credential_file: &Path,
 ) -> Result<Vec<String>> {
+    ensure_auth_state_path_has_no_symlink_components(state_path)?;
     with_auth_mutation_lock(credential_file, &[state_path, credential_file], |lock| {
         reconcile_interrupted_auth_cleanup_and_bump_epoch(lock, state_path, lock.credential_file())
     })
@@ -1565,6 +1566,7 @@ pub fn acquire_auth_reply_file_lock(
     state_path: &Path,
     credential_file: &Path,
 ) -> Result<AuthReplyFileLock> {
+    ensure_auth_state_path_has_no_symlink_components(state_path)?;
     let lock = acquire_auth_mutation_file_lock(credential_file, &[state_path, credential_file])?;
     reconcile_interrupted_auth_cleanup_and_bump_epoch(&lock, state_path, lock.credential_file())?;
     Ok(AuthReplyFileLock { lock })
@@ -1598,6 +1600,7 @@ fn with_auth_mutation_transaction_inner<T>(
     expected_epoch: Option<AuthEpoch>,
     operation: impl for<'a> FnOnce(&LockedAuthMutation<'a>) -> Result<T>,
 ) -> Result<(T, AuthEpoch)> {
+    ensure_auth_state_path_has_no_symlink_components(state_path)?;
     with_auth_mutation_lock(credential_file, &[state_path, credential_file], |lock| {
         reconcile_interrupted_auth_cleanup_and_bump_epoch(
             lock,
@@ -2054,6 +2057,7 @@ pub fn load_auth_state(path: &Path) -> Result<Option<AuthState>> {
     let _guard = AUTH_FILE_LOCK
         .lock()
         .expect("auth file lock should not poison");
+    ensure_auth_state_path_has_no_symlink_components(path)?;
     load_auth_state_unlocked(path)
 }
 
@@ -2072,6 +2076,7 @@ pub fn save_auth_state(path: &Path, state: &AuthState) -> Result<()> {
     let _guard = AUTH_FILE_LOCK
         .lock()
         .expect("auth file lock should not poison");
+    ensure_auth_state_path_has_no_symlink_components(path)?;
     save_auth_state_unlocked(path, state)
 }
 
@@ -2191,6 +2196,7 @@ fn sync_bbdown_rust_credentials_from_state_with_epoch_and_hook(
     credential_profile: Option<&str>,
     after_legacy_read: impl FnOnce(),
 ) -> Result<(Result<bool>, AuthEpoch)> {
+    ensure_auth_state_path_has_no_symlink_components(state_path)?;
     with_auth_mutation_lock(credential_file, &[state_path, credential_file], |lock| {
         reconcile_interrupted_auth_cleanup_and_bump_epoch(
             lock,
@@ -2361,6 +2367,7 @@ pub fn ensure_bbdown_config_file(
     let _guard = AUTH_FILE_LOCK
         .lock()
         .expect("auth file lock should not poison");
+    ensure_auth_state_path_has_no_symlink_components(path)?;
     let Some(state) = load_auth_state_unlocked(path)? else {
         return Ok(None);
     };
@@ -2387,6 +2394,7 @@ pub fn ensure_isolated_bbdown_config_file_with_lines(
     let _guard = AUTH_FILE_LOCK
         .lock()
         .expect("auth file lock should not poison");
+    ensure_auth_state_path_has_no_symlink_components(path)?;
     let state = load_auth_state_unlocked(path)?;
 
     cleanup_stale_bbdown_config_files_unlocked(path, credential_file)?;
@@ -2690,6 +2698,47 @@ fn absolute_auth_cleanup_path(path: &Path) -> Result<PathBuf> {
             .context("failed to resolve the current directory for auth cleanup")?
             .join(path))
     }
+}
+
+pub(crate) fn ensure_auth_state_path_has_no_symlink_components(path: &Path) -> Result<()> {
+    let absolute = absolute_auth_cleanup_path(path)?;
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                if is_platform_auth_path_alias(&current) {
+                    continue;
+                }
+                bail!(
+                    "Bilibili auth state path must not resolve through a symbolic link: {}",
+                    current.display()
+                );
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to inspect Bilibili auth state path component {}",
+                        current.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn is_platform_auth_path_alias(path: &Path) -> bool {
+    // Darwin exposes these root-owned aliases before application-controlled path components.
+    matches!(path, path if path == Path::new("/etc") || path == Path::new("/tmp") || path == Path::new("/var"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn is_platform_auth_path_alias(_path: &Path) -> bool {
+    false
 }
 
 fn ensure_cleanup_identity_is_not_credential(
@@ -3300,7 +3349,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn auth_lock_rejects_normalized_state_control_path_aliases() {
+    fn auth_lock_rejects_state_control_aliases_and_symlinked_state_parents() {
         use std::os::unix::fs::symlink;
 
         let state_path = temp_state_file("auth-control-path-aliases");
@@ -3318,18 +3367,23 @@ mod tests {
             .expect("owner control path should have a leaf")
             .to_os_string();
 
-        for candidate in [
-            real.join("nested").join("..").join(&owner_leaf),
-            alias.join(&owner_leaf),
-        ] {
-            let error = with_auth_mutation_transaction(&candidate, &credential_file, |_| Ok(()))
-                .expect_err("auth state must not alias a mutation control path");
-            assert!(
-                error
-                    .to_string()
-                    .contains("BBDown auth lock control path conflicts with an auth data file")
-            );
-        }
+        let normalized = real.join("nested").join("..").join(&owner_leaf);
+        let error = with_auth_mutation_transaction(&normalized, &credential_file, |_| Ok(()))
+            .expect_err("auth state must not alias a mutation control path");
+        assert!(
+            error
+                .to_string()
+                .contains("BBDown auth lock control path conflicts with an auth data file")
+        );
+
+        let error =
+            with_auth_mutation_transaction(&alias.join(&owner_leaf), &credential_file, |_| Ok(()))
+                .expect_err("auth state must not traverse a symlinked parent");
+        assert!(
+            error
+                .to_string()
+                .contains("Bilibili auth state path must not resolve through a symbolic link")
+        );
 
         for control_path in auth_mutation_control_paths(&credential_file) {
             assert!(
@@ -3343,7 +3397,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn logout_keeps_credentials_when_symlinked_legacy_state_cannot_be_removed() {
+    fn logout_rejects_a_symlinked_legacy_state_before_credential_cleanup() {
         use std::os::unix::fs::symlink;
 
         let state_path = temp_state_file("logout-symlinked-legacy-state");
@@ -3360,15 +3414,17 @@ mod tests {
             .expect("active credentials should write");
         let credential_cleanup_called = std::cell::Cell::new(false);
 
-        let (legacy_state, credential_state) =
-            clear_auth_state_and_credentials(&state_path, &credential_file, |_| {
-                credential_cleanup_called.set(true);
-                fs::remove_file(&credential_file).context("failed to clear active credentials")
-            })
-            .expect("logout transaction should complete");
+        let error = clear_auth_state_and_credentials(&state_path, &credential_file, |_| {
+            credential_cleanup_called.set(true);
+            fs::remove_file(&credential_file).context("failed to clear active credentials")
+        })
+        .expect_err("logout must reject a symlinked legacy state before cleanup");
 
-        assert!(legacy_state.is_err());
-        assert!(credential_state.is_err());
+        assert!(
+            error
+                .to_string()
+                .contains("Bilibili auth state path must not resolve through a symbolic link")
+        );
         assert!(!credential_cleanup_called.get());
         assert_eq!(
             fs::read(&credential_file).expect("active credentials should remain"),
@@ -3861,6 +3917,44 @@ mod tests {
             assert!(!called.get());
             assert!(!auth_mutation_lock_path(&credential_file).exists());
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_mutation_rejects_a_state_path_through_a_symlinked_parent_before_mutation() {
+        use std::cell::Cell;
+        use std::os::unix::fs::symlink;
+
+        let state_path = temp_state_file("auth-state-parent-symlink");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let target = root.join("state-target");
+        let state_parent = root.join("state-link");
+        let credential_file = root.join("credentials.json");
+        fs::create_dir_all(&target).expect("auth state target should create");
+        symlink(&target, &state_parent).expect("auth state parent symlink should create");
+        let state_path = state_parent.join("bilibili-auth.json");
+        let victim = target.join("bilibili-auth.json");
+        fs::write(&victim, b"unrelated-state").expect("victim should write");
+
+        let called = Cell::new(false);
+        let error = with_auth_mutation_transaction(&state_path, &credential_file, |_| {
+            called.set(true);
+            Ok(())
+        })
+        .expect_err("symlinked auth state parent must be rejected before mutation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Bilibili auth state path must not resolve through a symbolic link")
+        );
+        assert!(!called.get());
+        assert_eq!(fs::read(&victim).unwrap(), b"unrelated-state");
+        assert!(!auth_mutation_lock_path(&credential_file).exists());
         let _ = fs::remove_dir_all(root);
     }
 

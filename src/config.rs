@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use unicode_normalization::UnicodeNormalization;
 
-use crate::bilibili_auth::auth_mutation_control_paths;
+use crate::bilibili_auth::{
+    auth_mutation_control_paths, ensure_auth_state_path_has_no_symlink_components,
+};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
@@ -284,20 +286,8 @@ impl AppConfig {
 }
 
 fn ensure_auth_state_path_is_not_symlink(state_path: &Path) -> Result<()> {
-    match fs::symlink_metadata(state_path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-            "bilibili.auth.state_path must not be a symbolic link: {}",
-            state_path.display()
-        ),
-        Ok(_) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).with_context(|| {
-            format!(
-                "failed to inspect bilibili.auth.state_path: {}",
-                state_path.display()
-            )
-        }),
-    }
+    ensure_auth_state_path_has_no_symlink_components(state_path)
+        .context("invalid bilibili.auth.state_path")
 }
 
 fn ensure_distinct_auth_paths(state_path: &Path, credential_file: &Path) -> Result<()> {
@@ -1043,12 +1033,41 @@ mod tests {
         let error = AppConfig::from_toml_str(&config, root.clone())
             .expect_err("leaf symlink auth state should fail validation");
 
-        assert!(
-            error
-                .to_string()
-                .contains("bilibili.auth.state_path must not be a symbolic link")
-        );
+        assert!(format!("{error:#}").contains("must not resolve through a symbolic link"));
         assert!(target.is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_bilibili_auth_state_path_through_a_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_test_dir("auth-state-parent-symlink");
+        let target = root.join("state-target");
+        let state_parent = root.join("state-link");
+        fs::create_dir_all(&target).expect("auth state target should create");
+        symlink(&target, &state_parent).expect("auth state parent symlink should create");
+        let state = state_parent.join("bilibili-auth.json");
+        let config = format!(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [bilibili.auth]
+            state_path = "{}"
+            credential_file = "{}"
+            "#,
+            state.display(),
+            root.join("credentials.json").display()
+        );
+
+        let error = AppConfig::from_toml_str(&config, root.clone())
+            .expect_err("symlinked auth state parent should fail validation");
+
+        assert!(format!("{error:#}").contains("must not resolve through a symbolic link"));
+        assert!(target.is_dir());
         let _ = fs::remove_dir_all(root);
     }
 

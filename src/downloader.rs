@@ -75,6 +75,7 @@ const VIDEO_RECOVERY_STATE_FILE_NAME: &str = "recovery-state";
 const VIDEO_RECOVERY_STATE_TEMP_FILE_NAME: &str = "recovery-state.next";
 const VIDEO_RECOVERY_STATE_CLEAN: u8 = b'C';
 const VIDEO_RECOVERY_STATE_DIRTY: u8 = b'D';
+const VIDEO_RECOVERY_STATE_INCOMPLETE: u8 = b'I';
 const BILIBILI_FFMPEG_CONCAT_FILE_PREFIX: &str = ".telegram-video-downloader-ffmpeg-concat";
 const BILIBILI_MUX_STAGING_DIR_PREFIX: &str = ".telegram-video-downloader-mux";
 const BILIBILI_MUX_RECOVERY_MANIFEST_NAME: &str = "manifest.json";
@@ -2626,6 +2627,7 @@ fn finalize_bilibili_mux_recovery(root: &RootedFs, mux: &BilibiliMuxReport) -> R
 struct BilibiliMuxRecoveryReport {
     messages: Vec<String>,
     unresolved: bool,
+    incomplete: bool,
 }
 
 #[derive(Debug)]
@@ -2646,14 +2648,17 @@ fn recover_pending_bilibili_mux_transactions_locked(
     let mut directories = Vec::new();
     let mut report = BilibiliMuxRecoveryReport::default();
     let mut scan_diagnostics = Vec::new();
+    let mut scan_incomplete = false;
     collect_bilibili_mux_recovery_directories(
         root,
         video_dir,
         video_dir,
         &mut directories,
         &mut scan_diagnostics,
+        &mut scan_incomplete,
     )?;
     report.messages.extend(scan_diagnostics);
+    report.incomplete = scan_incomplete;
     directories.sort();
     for directory in directories {
         match recover_bilibili_mux_transaction(root, &directory) {
@@ -2676,11 +2681,13 @@ fn collect_bilibili_mux_recovery_directories(
     directory: &Path,
     recovered: &mut Vec<PathBuf>,
     diagnostics: &mut Vec<String>,
+    incomplete: &mut bool,
 ) -> Result<()> {
     root.validate_configured_root()?;
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(err) if directory != scan_root => {
+            *incomplete = true;
             diagnostics.push(format!(
                 "Skipped unreadable directory during Bilibili mux recovery scan {}: {err}",
                 directory.display()
@@ -2700,6 +2707,7 @@ fn collect_bilibili_mux_recovery_directories(
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
+                *incomplete = true;
                 diagnostics.push(format!(
                     "Skipped unreadable entry during Bilibili mux recovery scan {}: {err}",
                     directory.display()
@@ -2710,6 +2718,7 @@ fn collect_bilibili_mux_recovery_directories(
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(err) => {
+                *incomplete = true;
                 diagnostics.push(format!(
                     "Skipped uninspectable entry during Bilibili mux recovery scan {}: {err}",
                     entry.path().display()
@@ -2733,7 +2742,14 @@ fn collect_bilibili_mux_recovery_directories(
         {
             continue;
         }
-        collect_bilibili_mux_recovery_directories(root, scan_root, &path, recovered, diagnostics)?;
+        collect_bilibili_mux_recovery_directories(
+            root,
+            scan_root,
+            &path,
+            recovered,
+            diagnostics,
+            incomplete,
+        )?;
     }
     root.validate_configured_root()
 }
@@ -4688,7 +4704,9 @@ impl VideoRecoveryMarker {
     fn write_state(&mut self, state: u8) -> Result<()> {
         if !matches!(
             state,
-            VIDEO_RECOVERY_STATE_CLEAN | VIDEO_RECOVERY_STATE_DIRTY
+            VIDEO_RECOVERY_STATE_CLEAN
+                | VIDEO_RECOVERY_STATE_DIRTY
+                | VIDEO_RECOVERY_STATE_INCOMPLETE
         ) {
             bail!("invalid video recovery state");
         }
@@ -5014,7 +5032,11 @@ fn video_recovery_state_file(root: &RootedFs) -> Result<(VideoRecoveryMarker, bo
     let contents = file.read_limited(1)?;
     if !matches!(
         contents.as_slice(),
-        [VIDEO_RECOVERY_STATE_CLEAN | VIDEO_RECOVERY_STATE_DIRTY]
+        [
+            VIDEO_RECOVERY_STATE_CLEAN
+                | VIDEO_RECOVERY_STATE_DIRTY
+                | VIDEO_RECOVERY_STATE_INCOMPLETE
+        ]
     ) {
         bail!("video recovery state marker has invalid contents");
     }
@@ -5037,7 +5059,11 @@ fn remove_valid_recovery_state_temp(root: &RootedFs, path: &Path) -> Result<()> 
     file.validate_private_single_link(0o600)?;
     if !matches!(
         file.read_limited(1)?.as_slice(),
-        [VIDEO_RECOVERY_STATE_CLEAN | VIDEO_RECOVERY_STATE_DIRTY]
+        [
+            VIDEO_RECOVERY_STATE_CLEAN
+                | VIDEO_RECOVERY_STATE_DIRTY
+                | VIDEO_RECOVERY_STATE_INCOMPLETE
+        ]
     ) {
         bail!(
             "refused to remove invalid video recovery state transition: {}",
@@ -5054,9 +5080,39 @@ fn remove_valid_recovery_state_temp(root: &RootedFs, path: &Path) -> Result<()> 
         })
 }
 
-fn video_recovery_state_is_clean(marker: &VideoRecoveryMarker) -> Result<bool> {
+fn video_recovery_state(marker: &VideoRecoveryMarker) -> Result<u8> {
     marker.file.validate_private_single_link(0o600)?;
-    Ok(marker.file.read_limited(1)? == [VIDEO_RECOVERY_STATE_CLEAN])
+    match marker.file.read_limited(1)?.as_slice() {
+        [state]
+            if matches!(
+                *state,
+                VIDEO_RECOVERY_STATE_CLEAN
+                    | VIDEO_RECOVERY_STATE_DIRTY
+                    | VIDEO_RECOVERY_STATE_INCOMPLETE
+            ) =>
+        {
+            Ok(*state)
+        }
+        _ => bail!("video recovery state marker has invalid contents"),
+    }
+}
+
+fn video_recovery_state_is_clean(marker: &VideoRecoveryMarker) -> Result<bool> {
+    Ok(video_recovery_state(marker)? == VIDEO_RECOVERY_STATE_CLEAN)
+}
+
+fn video_recovery_state_is_incomplete(marker: &VideoRecoveryMarker) -> Result<bool> {
+    Ok(video_recovery_state(marker)? == VIDEO_RECOVERY_STATE_INCOMPLETE)
+}
+
+fn video_recovery_state_after_scan(unresolved: bool, incomplete: bool) -> u8 {
+    if incomplete {
+        VIDEO_RECOVERY_STATE_INCOMPLETE
+    } else if unresolved {
+        VIDEO_RECOVERY_STATE_DIRTY
+    } else {
+        VIDEO_RECOVERY_STATE_CLEAN
+    }
 }
 
 async fn video_output_lock(
@@ -5100,7 +5156,14 @@ async fn video_output_lock(
     let (mut recovery_state_file, recovery_state_existed) = video_recovery_state_file(&root)?;
     let mut recoveries = Vec::new();
     let mut unresolved_recovery = false;
-    if recovery_state_existed && !video_recovery_state_is_clean(&recovery_state_file)? {
+    let mut incomplete_recovery = false;
+    let recovery_state = video_recovery_state(&recovery_state_file)?;
+    if recovery_state_existed && recovery_state == VIDEO_RECOVERY_STATE_INCOMPLETE {
+        bail!(
+            "video output recovery scan is incomplete; restore access to the reported directories and restart the bot before starting another download"
+        );
+    }
+    if recovery_state_existed && recovery_state == VIDEO_RECOVERY_STATE_DIRTY {
         let quarantine_recovery = root.reconcile_remove_quarantines_with_status()?;
         let staging_recovery = recover_pending_video_staging_directories_locked(&root)?;
         let mux_recovery = recover_pending_bilibili_mux_transactions_locked(&root, video_dir)?;
@@ -5113,6 +5176,9 @@ async fn video_output_lock(
             || staging_recovery.unresolved
             || mux_recovery.unresolved
             || overwrite_recovery.unresolved;
+        incomplete_recovery = quarantine_recovery.incomplete
+            || mux_recovery.incomplete
+            || overwrite_recovery.incomplete;
         recoveries.extend(quarantine_recovery.messages);
         recoveries.extend(staging_recovery.messages);
         recoveries.extend(mux_recovery.messages);
@@ -5121,6 +5187,12 @@ async fn video_output_lock(
     for recovery in recoveries {
         warn_recovered_overwrite(&recovery);
         send_progress(progress, format!("{job_label}: {recovery}"));
+    }
+    if incomplete_recovery {
+        recovery_state_file.write_state(VIDEO_RECOVERY_STATE_INCOMPLETE)?;
+        bail!(
+            "video output recovery scan is incomplete; restore access to the reported directories and restart the bot before starting another download"
+        );
     }
     recovery_state_file.write_state(VIDEO_RECOVERY_STATE_DIRTY)?;
     Ok(VideoOutputGuard {
@@ -10844,11 +10916,9 @@ pub fn recover_pending_overwrite_transactions(video_dir: &Path) -> Result<Vec<St
         || staging_recovery.unresolved
         || mux_recovery.unresolved
         || overwrite_recovery.unresolved;
-    recovery_state.write_state(if unresolved {
-        VIDEO_RECOVERY_STATE_DIRTY
-    } else {
-        VIDEO_RECOVERY_STATE_CLEAN
-    })?;
+    let incomplete =
+        quarantine_recovery.incomplete || mux_recovery.incomplete || overwrite_recovery.incomplete;
+    recovery_state.write_state(video_recovery_state_after_scan(unresolved, incomplete))?;
     let mut messages = quarantine_recovery.messages;
     messages.extend(staging_recovery.messages);
     messages.extend(mux_recovery.messages);
@@ -10860,6 +10930,7 @@ pub fn recover_pending_overwrite_transactions(video_dir: &Path) -> Result<Vec<St
 struct OverwriteRecoveryReport {
     messages: Vec<String>,
     unresolved: bool,
+    incomplete: bool,
 }
 
 fn overwrite_recovery_is_blocked(
@@ -10889,14 +10960,17 @@ fn recover_pending_overwrite_transactions_locked(
     let mut directories = Vec::new();
     let mut report = OverwriteRecoveryReport::default();
     let mut scan_diagnostics = Vec::new();
+    let mut scan_incomplete = false;
     collect_overwrite_recovery_directories(
         root,
         video_dir,
         video_dir,
         &mut directories,
         &mut scan_diagnostics,
+        &mut scan_incomplete,
     )?;
     report.messages.extend(scan_diagnostics);
+    report.incomplete = scan_incomplete;
     directories.sort();
 
     for directory in directories {
@@ -10945,11 +11019,13 @@ fn collect_overwrite_recovery_directories(
     directory: &Path,
     recovered: &mut Vec<PathBuf>,
     diagnostics: &mut Vec<String>,
+    incomplete: &mut bool,
 ) -> Result<()> {
     root.validate_configured_root()?;
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(err) if directory != scan_root => {
+            *incomplete = true;
             diagnostics.push(format!(
                 "Skipped unreadable directory during overwrite recovery scan {}: {err}",
                 directory.display()
@@ -10969,6 +11045,7 @@ fn collect_overwrite_recovery_directories(
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
+                *incomplete = true;
                 diagnostics.push(format!(
                     "Skipped unreadable entry during overwrite recovery scan {}: {err}",
                     directory.display()
@@ -10979,6 +11056,7 @@ fn collect_overwrite_recovery_directories(
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(err) => {
+                *incomplete = true;
                 diagnostics.push(format!(
                     "Skipped uninspectable entry during overwrite recovery scan {}: {err}",
                     entry.path().display()
@@ -10999,7 +11077,14 @@ fn collect_overwrite_recovery_directories(
         if name == VIDEO_STAGING_DIR_NAME {
             continue;
         }
-        collect_overwrite_recovery_directories(root, scan_root, &path, recovered, diagnostics)?;
+        collect_overwrite_recovery_directories(
+            root,
+            scan_root,
+            &path,
+            recovered,
+            diagnostics,
+            incomplete,
+        )?;
     }
     root.validate_configured_root()
 }
@@ -15887,7 +15972,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn startup_recovery_skips_an_unreadable_unrelated_directory_without_dirtying_state() {
+    async fn startup_recovery_marks_an_unreadable_directory_incomplete_without_rescanning() {
         let final_dir = temp_test_dir("overwrite-startup-unreadable-child");
         let unreadable = final_dir.join("unrelated");
         fs::create_dir(&unreadable).expect("unrelated directory should create");
@@ -15913,17 +15998,34 @@ mod tests {
         }));
         let root = RootedFs::new(&final_dir).expect("output root should reopen");
         assert!(
-            video_recovery_state_is_clean(
+            video_recovery_state_is_incomplete(
                 &video_recovery_state_file(&root)
                     .expect("recovery state should reopen")
                     .0
             )
-            .expect("recovery state should remain clean")
+            .expect("recovery state should remain incomplete")
         );
         let (tx, rx) = job_progress_channel();
+        let error = match video_output_lock(&final_dir, "Bilibili download", Some(&tx)).await {
+            Ok(_) => panic!("incomplete recovery state should block a new download"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("video output recovery scan is incomplete"));
+        assert_no_progress(&rx);
+
+        recover_pending_overwrite_transactions(&final_dir)
+            .expect("a complete retry should clear the recovery marker");
+        assert!(
+            video_recovery_state_is_clean(
+                &video_recovery_state_file(&root)
+                    .expect("recovery state should reopen after retry")
+                    .0
+            )
+            .expect("recovery state should become clean after a complete retry")
+        );
         let guard = video_output_lock(&final_dir, "Bilibili download", Some(&tx))
             .await
-            .expect("clean output lock should acquire without a recursive recovery scan");
+            .expect("complete recovery should allow a new download");
         assert_no_progress(&rx);
         drop(guard);
         let _ = fs::remove_dir_all(final_dir);
