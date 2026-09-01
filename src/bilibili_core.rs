@@ -170,7 +170,7 @@ pub fn download_mode_from_config(config: &AppConfig) -> Result<DownloadMode> {
 }
 
 fn credential_profile_selection(profile: Option<&str>) -> Result<CredentialProfileSelection> {
-    match profile {
+    match profile.map(str::trim).filter(|profile| !profile.is_empty()) {
         Some(profile) => CredentialProfileSelection::named(profile)
             .map_err(anyhow::Error::from)
             .context("invalid BBDown credential profile"),
@@ -549,6 +549,46 @@ fn redact_url_for_error(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_runtime_trims_configured_profile_name() {
+        let directory = std::env::temp_dir().join(format!(
+            "telegram-video-downloader-profile-trim-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let credential_file = directory.join("credentials.json");
+        let store = CredentialStore::new(credential_file.clone());
+        let mut profiles = bbdown_core::CredentialProfiles::default();
+        profiles
+            .set_profile(
+                "default",
+                Credentials::default().with_cookie("SESSDATA=default"),
+            )
+            .unwrap();
+        profiles
+            .set_profile(
+                "selected",
+                Credentials::default().with_cookie("SESSDATA=selected"),
+            )
+            .unwrap();
+        profiles.set_default_profile("default").unwrap();
+        store.save_profiles(&profiles).unwrap();
+
+        let runtime =
+            CredentialRuntime::from_credential_file(credential_file, Some("  selected  "))
+                .expect("trimmed profile should be valid");
+
+        assert_eq!(
+            runtime.load().unwrap().cookie.as_deref(),
+            Some("SESSDATA=selected")
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn maps_router_selection_to_core_selection() {

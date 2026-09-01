@@ -1892,19 +1892,9 @@ fn list_directory_entries(
         if matches!(name.to_bytes(), b"." | b"..") {
             continue;
         }
-        let display_name = name.to_str().with_context(|| {
-            format!(
-                "bound directory contains a non-UTF-8 entry: {}",
-                display_path.display()
-            )
-        })?;
-        let identity = identity_at_cstr(directory, name)?.ok_or_else(|| {
-            anyhow!(
-                "bound directory entry disappeared: {}",
-                display_path.join(display_name).display()
-            )
-        })?;
-        entries.push((OsString::from(display_name), identity));
+        if let Some(entry) = listed_directory_entry(directory, name)? {
+            entries.push(entry);
+        }
     }
     if identity_for_fd(directory)? != expected {
         bail!(
@@ -1913,6 +1903,28 @@ fn list_directory_entries(
         );
     }
     Ok(entries)
+}
+
+fn listed_directory_entry(
+    directory: &OwnedFd,
+    name: &CStr,
+) -> Result<Option<(OsString, EntryIdentity)>> {
+    let name = os_string_from_directory_name(name);
+    let Some(identity) = identity_at(directory, &name)? else {
+        return Ok(None);
+    };
+    Ok(Some((name, identity)))
+}
+
+fn os_string_from_directory_name(name: &CStr) -> OsString {
+    #[cfg(unix)]
+    {
+        OsString::from_vec(name.to_bytes().to_vec())
+    }
+    #[cfg(not(unix))]
+    {
+        OsString::from(name.to_string_lossy().as_ref())
+    }
 }
 
 fn open_directory(path: &Path) -> Result<OwnedFd, std::io::Error> {
@@ -3211,6 +3223,8 @@ where
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -3224,6 +3238,32 @@ mod tests {
             "telegram-video-downloader-safe-fs-{label}-{}-{stamp}",
             std::process::id()
         ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_name_conversion_preserves_non_utf8_bytes() {
+        let name = c"name-\xff";
+
+        let converted = os_string_from_directory_name(name);
+
+        assert_eq!(converted.into_vec(), b"name-\xff");
+    }
+
+    #[test]
+    fn listed_directory_entry_skips_a_name_that_disappears_before_lookup() {
+        let root = temp_dir("disappearing-directory-entry");
+        fs::create_dir_all(&root).expect("root should create");
+        let name = CString::new("disappearing.txt").expect("test name should be valid");
+        fs::write(root.join("disappearing.txt"), b"ordinary data").expect("entry should write");
+        let rooted = RootedFs::new(&root).expect("root should bind");
+        fs::remove_file(root.join("disappearing.txt")).expect("entry should disappear");
+
+        let entry = listed_directory_entry(rooted.root_fd.as_ref(), &name)
+            .expect("missing entry lookup should not fail");
+
+        assert!(entry.is_none());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
