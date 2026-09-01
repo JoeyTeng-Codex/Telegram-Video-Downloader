@@ -1198,30 +1198,16 @@ fn acquire_auth_mutation_file_lock(
 ) -> Result<AuthMutationFileLock> {
     let configured_credential_file = credential_file;
     let credential_file = bind_auth_credential_file(credential_file)?;
-    let lock_path = auth_mutation_lock_path(credential_file.path());
-    let anchor_path = auth_mutation_lock_anchor_path(credential_file.path());
-    let owner_path = auth_mutation_lock_owner_path(credential_file.path());
-    let protected_paths = protected_paths
-        .iter()
-        .map(|path| {
-            if **path == *configured_credential_file {
-                credential_file.path()
-            } else {
-                *path
-            }
-        })
-        .collect::<Vec<_>>();
-    if protected_paths
-        .iter()
-        .any(|path| **path == lock_path || **path == anchor_path || **path == owner_path)
-    {
-        bail!(
-            "BBDown auth lock path conflicts with an auth data file: {}, {}, or {}",
-            lock_path.display(),
-            anchor_path.display(),
-            owner_path.display()
-        );
-    }
+    let [lock_path, anchor_path, owner_path] = auth_mutation_control_paths(credential_file.path());
+    let protected_paths = normalize_auth_protected_paths(
+        configured_credential_file,
+        credential_file.path(),
+        protected_paths,
+    )?;
+    validate_auth_control_paths_are_distinct(
+        &protected_paths,
+        &[lock_path.clone(), anchor_path.clone(), owner_path.clone()],
+    )?;
 
     let owner_exists = load_auth_mutation_lock_owner(&owner_path)?.is_some();
     if owner_exists
@@ -1251,7 +1237,11 @@ fn acquire_auth_mutation_file_lock(
             bail!("BBDown auth lock ownership record does not match the active lock object");
         }
     }
-    validate_auth_mutation_lock_is_distinct(&file, &protected_paths, &lock_path)?;
+    let protected_path_refs = protected_paths
+        .iter()
+        .map(PathBuf::as_path)
+        .collect::<Vec<_>>();
+    validate_auth_mutation_lock_is_distinct(&file, &protected_path_refs, &lock_path)?;
     validate_existing_auth_lock_format(&file, &lock_path)?;
     set_auth_mutation_lock_private(&file, &lock_path)?;
     ensure_auth_mutation_lock_aliases(&file, &lock_path, &anchor_path)?;
@@ -1306,6 +1296,138 @@ fn canonical_non_symlink_directory(path: &Path, label: &str) -> Result<PathBuf> 
     }
     fs::canonicalize(&absolute)
         .with_context(|| format!("failed to resolve {label} {}", absolute.display()))
+}
+
+fn normalize_auth_protected_paths(
+    configured_credential_file: &Path,
+    bound_credential_file: &Path,
+    protected_paths: &[&Path],
+) -> Result<Vec<PathBuf>> {
+    let normalized_configured_credential =
+        normalize_auth_path_for_control_comparison(configured_credential_file)?;
+    protected_paths
+        .iter()
+        .map(|path| {
+            let normalized = normalize_auth_path_for_control_comparison(path)?;
+            if normalized == normalized_configured_credential {
+                Ok(bound_credential_file.to_path_buf())
+            } else {
+                Ok(normalized)
+            }
+        })
+        .collect()
+}
+
+fn normalize_auth_path_for_control_comparison(path: &Path) -> Result<PathBuf> {
+    let absolute = absolute_auth_cleanup_path(path)?;
+    let mut ancestor = absolute.clone();
+    let mut missing = Vec::new();
+    loop {
+        match fs::canonicalize(&ancestor) {
+            Ok(mut canonical) => {
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(lexically_normalize_auth_path(&canonical));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let name = ancestor.file_name().with_context(|| {
+                    format!(
+                        "failed to find an existing ancestor for BBDown auth path {}",
+                        path.display()
+                    )
+                })?;
+                missing.push(name.to_os_string());
+                ancestor.pop();
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to resolve BBDown auth path for comparison: {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+}
+
+fn lexically_normalize_auth_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(name) => normalized.push(name),
+        }
+    }
+    normalized
+}
+
+fn validate_auth_control_paths_are_distinct(
+    protected_paths: &[PathBuf],
+    control_paths: &[PathBuf],
+) -> Result<()> {
+    // Protected property: auth state and credentials must never designate a lock, anchor, or
+    // owner object. Normalized paths catch lexical and symlink-parent aliases before creation;
+    // device/inode equality catches an existing hard-link alias of an established control file.
+    for protected_path in protected_paths {
+        for control_path in control_paths {
+            if protected_path == control_path
+                || existing_auth_paths_share_identity(protected_path, control_path)?
+            {
+                bail!(
+                    "BBDown auth lock control path conflicts with an auth data file: {}",
+                    protected_path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn existing_auth_paths_share_identity(first: &Path, second: &Path) -> Result<bool> {
+    let first = match fs::metadata(first) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to inspect BBDown auth data path {}",
+                    first.display()
+                )
+            });
+        }
+    };
+    let second = match fs::metadata(second) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to inspect BBDown auth control path {}",
+                    second.display()
+                )
+            });
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(first.dev() == second.dev() && first.ino() == second.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (first, second);
+        Ok(false)
+    }
 }
 
 fn open_or_create_auth_mutation_lock(path: &Path) -> Result<File> {
@@ -1895,6 +2017,15 @@ fn auth_mutation_lock_path(credential_file: &Path) -> PathBuf {
     let mut value = credential_file.as_os_str().to_os_string();
     value.push(AUTH_MUTATION_LOCK_SUFFIX);
     PathBuf::from(value)
+}
+
+pub(crate) fn auth_mutation_control_paths(credential_file: &Path) -> [PathBuf; 3] {
+    let lock_path = auth_mutation_lock_path(credential_file);
+    [
+        lock_path.clone(),
+        auth_mutation_lock_anchor_path(credential_file),
+        auth_mutation_lock_owner_path(credential_file),
+    ]
 }
 
 fn auth_mutation_lock_anchor_path(credential_file: &Path) -> PathBuf {
@@ -2952,6 +3083,49 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_lock_rejects_normalized_state_control_path_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let state_path = temp_state_file("auth-control-path-aliases");
+        let root = state_path
+            .parent()
+            .expect("state path should have a parent")
+            .to_path_buf();
+        let real = root.join("real");
+        let alias = root.join("alias");
+        fs::create_dir_all(real.join("nested")).expect("real auth directory should create");
+        symlink(&real, &alias).expect("auth directory alias should create");
+        let credential_file = real.join("credentials.json");
+        let owner_leaf = auth_mutation_control_paths(&credential_file)[2]
+            .file_name()
+            .expect("owner control path should have a leaf")
+            .to_os_string();
+
+        for candidate in [
+            real.join("nested").join("..").join(&owner_leaf),
+            alias.join(&owner_leaf),
+        ] {
+            let error = with_auth_mutation_transaction(&candidate, &credential_file, |_| Ok(()))
+                .expect_err("auth state must not alias a mutation control path");
+            assert!(
+                error
+                    .to_string()
+                    .contains("BBDown auth lock control path conflicts with an auth data file")
+            );
+        }
+
+        for control_path in auth_mutation_control_paths(&credential_file) {
+            assert!(
+                !control_path.exists(),
+                "control path should not be created after rejected config: {}",
+                control_path.display()
+            );
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

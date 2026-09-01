@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use unicode_normalization::UnicodeNormalization;
 
+use crate::bilibili_auth::auth_mutation_control_paths;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
     pub telegram: TelegramConfig,
@@ -317,6 +319,18 @@ fn ensure_distinct_auth_paths(state_path: &Path, credential_file: &Path) -> Resu
     let inside_cleanup_dir = auth_path_starts_with(&normalized_credential, &normalized_cleanup_dir);
     let aliases_cleanup_dir_entry =
         existing_file_alias_in_directory(credential_file, &cleanup_dir)?;
+    let conflicts_auth_control = auth_mutation_control_paths(credential_file)
+        .iter()
+        .try_fold(false, |conflict, control_path| {
+            let normalized_control = normalize_path_for_comparison(control_path)?;
+            Ok::<_, anyhow::Error>(
+                conflict
+                    || auth_paths_equal(&normalized_state, &normalized_control)
+                    || auth_paths_equal(&normalized_credential, &normalized_control)
+                    || existing_paths_share_identity(state_path, control_path)?
+                    || existing_paths_share_identity(credential_file, control_path)?,
+            )
+        })?;
     if auth_paths_equal(&normalized_state, &normalized_credential)
         || aliases_cleanup_file
         || inside_cleanup_dir
@@ -324,6 +338,11 @@ fn ensure_distinct_auth_paths(state_path: &Path, credential_file: &Path) -> Resu
     {
         bail!(
             "bilibili.auth.state_path and bilibili.auth.credential_file must refer to distinct files, and credential_file must be outside legacy auth cleanup paths"
+        );
+    }
+    if conflicts_auth_control {
+        bail!(
+            "bilibili.auth.state_path and bilibili.auth.credential_file must not conflict with BBDown auth lock control paths"
         );
     }
     Ok(())
@@ -1167,6 +1186,65 @@ mod tests {
             assert!(error.to_string().contains("legacy auth cleanup paths"));
         }
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_auth_state_path_at_mutation_control_paths() {
+        let root = temp_test_dir("auth-mutation-control-paths");
+        let credential = root.join("credentials.json");
+
+        for state in auth_mutation_control_paths(&credential) {
+            let error = ensure_distinct_auth_paths(&state, &credential)
+                .expect_err("auth state must not occupy a mutation control path");
+            assert!(
+                error
+                    .to_string()
+                    .contains("must not conflict with BBDown auth lock control paths")
+            );
+        }
+
+        fs::create_dir_all(root.join("nested")).expect("nested parent should create");
+        let owner_leaf = auth_mutation_control_paths(&credential)[2]
+            .file_name()
+            .expect("owner control path should have a leaf")
+            .to_os_string();
+        let state = root.join("nested").join("..").join(owner_leaf);
+        let error = ensure_distinct_auth_paths(&state, &credential)
+            .expect_err("parent components must not bypass auth control validation");
+        assert!(
+            error
+                .to_string()
+                .contains("must not conflict with BBDown auth lock control paths")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_auth_state_control_path_through_a_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_test_dir("auth-mutation-control-symlink-parent");
+        let real = root.join("real");
+        let alias = root.join("alias");
+        fs::create_dir_all(&real).expect("real auth directory should create");
+        symlink(&real, &alias).expect("auth directory alias should create");
+        let credential = real.join("credentials.json");
+        let owner_leaf = auth_mutation_control_paths(&credential)[2]
+            .file_name()
+            .expect("owner control path should have a leaf")
+            .to_os_string();
+
+        let error = ensure_distinct_auth_paths(&alias.join(owner_leaf), &credential)
+            .expect_err("symlinked parent must not bypass auth control validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("must not conflict with BBDown auth lock control paths")
+        );
         let _ = fs::remove_dir_all(root);
     }
 
