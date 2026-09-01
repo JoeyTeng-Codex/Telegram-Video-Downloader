@@ -166,17 +166,21 @@ impl AuthCredentialFilePath {
 
     fn store_path(&self) -> Result<PathBuf> {
         // Protected property: each bbdown-core pathname handoff must begin in the directory
-        // object selected before the auth lock. On macOS, F_GETPATH gives the current name of
-        // the held descriptor; reopening it with O_NOFOLLOW and comparing device/inode accepts
-        // a benign rename while rejecting a replacement before the path-only core call starts.
-        // This is an operation-boundary check, not continuous protection after that handoff.
+        // object selected before the auth lock. On macOS, F_GETPATH preserves a benign rename;
+        // other Unix platforms revalidate the configured path. Both reopen with O_NOFOLLOW and
+        // compare device/inode before the path-only core call starts. This is an operation-boundary
+        // check, not continuous protection after that handoff.
         #[cfg(target_os = "macos")]
         {
             Ok(macos_path_for_open_directory(&self._parent)?.join(&self.leaf))
         }
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            Ok(auth_descriptor_relative_path(&self._parent, &self.leaf))
+            let parent = self
+                .control_path
+                .parent()
+                .context("BBDown credential file has no parent directory")?;
+            Ok(revalidated_path_for_open_directory(&self._parent, parent)?.join(&self.leaf))
         }
         #[cfg(not(unix))]
         Ok(self.control_path.clone())
@@ -1367,26 +1371,11 @@ fn open_auth_credential_directory(path: &Path) -> Result<File> {
     Ok(directory)
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
-fn auth_descriptor_relative_path(directory: &File, leaf: &OsStr) -> PathBuf {
-    use std::os::fd::AsRawFd;
-
-    // Linux exposes descriptor-relative child paths through /dev/fd. Darwin does not support
-    // child lookup below /dev/fd descriptors, so it uses F_GETPATH below instead.
-    let fd_parent = Path::new("/dev/fd").join(directory.as_raw_fd().to_string());
-    fd_parent.join(leaf)
-}
-
-#[cfg(target_os = "macos")]
-fn macos_path_for_open_directory(directory: &File) -> Result<PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
+fn revalidated_path_for_open_directory(directory: &File, path: &Path) -> Result<PathBuf> {
     use std::os::unix::fs::MetadataExt;
 
-    let path = rustix::fs::getpath(directory)
-        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
-        .context("failed to resolve the held BBDown credential directory")?;
-    let path = PathBuf::from(OsString::from_vec(path.as_bytes().to_vec()));
-    let reopened = open_auth_credential_directory(&path)?;
+    let reopened = open_auth_credential_directory(path)?;
     let expected = directory
         .metadata()
         .context("failed to inspect held BBDown credential directory")?;
@@ -1394,11 +1383,20 @@ fn macos_path_for_open_directory(directory: &File) -> Result<PathBuf> {
         .metadata()
         .context("failed to inspect BBDown credential directory resolved from its descriptor")?;
     if expected.dev() != actual.dev() || expected.ino() != actual.ino() {
-        bail!(
-            "BBDown credential directory identity changed while resolving its descriptor-backed path"
-        );
+        bail!("BBDown credential directory identity changed while resolving its bound path");
     }
-    Ok(path)
+    Ok(path.to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_path_for_open_directory(directory: &File) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let path = rustix::fs::getpath(directory)
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+        .context("failed to resolve the held BBDown credential directory")?;
+    let path = PathBuf::from(OsString::from_vec(path.as_bytes().to_vec()));
+    revalidated_path_for_open_directory(directory, &path)
 }
 
 fn canonical_non_symlink_directory(path: &Path, label: &str) -> Result<PathBuf> {
@@ -4241,7 +4239,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn auth_mutation_keeps_credential_store_in_the_bound_parent_after_replacement() {
+    fn auth_mutation_binds_or_rejects_a_replaced_credential_parent() {
         let state_path = temp_state_file("auth-credential-parent-replacement");
         let root = state_path
             .parent()
@@ -4252,7 +4250,7 @@ mod tests {
         let credential_file = credential_parent.join("credentials.json");
         fs::create_dir_all(&credential_parent).expect("credential parent should create");
 
-        with_auth_mutation_transaction(&state_path, &credential_file, |transaction| {
+        let result = with_auth_mutation_transaction(&state_path, &credential_file, |transaction| {
             fs::rename(&credential_parent, &moved_parent)
                 .expect("bound credential parent should move");
             fs::create_dir(&credential_parent)
@@ -4267,17 +4265,30 @@ mod tests {
                 )
                 .expect("descriptor-backed credential mutation should save");
             Ok(())
-        })
-        .expect("auth transaction should keep using the original credential directory");
+        });
 
-        assert_eq!(
-            CredentialStore::new(moved_parent.join("credentials.json"))
-                .load()
-                .expect("original credential store should load")
-                .cookie
-                .as_deref(),
-            Some("SESSDATA=bound-parent")
-        );
+        #[cfg(target_os = "macos")]
+        {
+            result.expect("auth transaction should keep using the original credential directory");
+            assert_eq!(
+                CredentialStore::new(moved_parent.join("credentials.json"))
+                    .load()
+                    .expect("original credential store should load")
+                    .cookie
+                    .as_deref(),
+                Some("SESSDATA=bound-parent")
+            );
+        }
+
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            result.expect_err("generic Unix handoff must reject a replaced credential parent");
+            assert!(
+                !moved_parent.join("credentials.json").exists(),
+                "the original credential directory must remain untouched after a rejected handoff"
+            );
+        }
+
         assert!(
             !credential_file.exists(),
             "replacement credential directory must remain untouched"

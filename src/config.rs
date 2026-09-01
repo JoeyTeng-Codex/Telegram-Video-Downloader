@@ -901,6 +901,50 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_mapped_legacy_bilibili_values_before_startup() {
+        let root = temp_test_dir("invalid-mapped-legacy-bilibili-values");
+        fs::create_dir_all(&root).expect("test root should create");
+
+        for (argument, expected) in [
+            ("--api-base=not-a-url", "--api-base"),
+            ("--playurl-mode=unsupported", "--playurl-mode"),
+            ("--restricted-area=invalid", "--restricted-area"),
+            (
+                "--restricted-area-proxy=ftp://proxy.example.test",
+                "must use http or https",
+            ),
+            (
+                "--request-timeout-seconds=zero",
+                "--request-timeout-seconds",
+            ),
+        ] {
+            let config_toml = format!(
+                r#"
+                [telegram]
+                token = "token"
+                allow_all_chats = true
+
+                [downloads]
+                video_dir = "{}"
+
+                [bilibili]
+                extra_args = ["{argument}"]
+                "#,
+                root.join("videos").display(),
+            );
+            let error = AppConfig::from_toml_str(&config_toml, root.clone())
+                .expect_err("invalid mapped BBDown values must fail before the bot starts");
+
+            assert!(
+                format!("{error:#}").contains(expected),
+                "error for {argument} should mention {expected}: {error:#}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn rejects_ignored_legacy_download_args_before_startup() {
         let error = AppConfig::from_toml_str(
             r#"

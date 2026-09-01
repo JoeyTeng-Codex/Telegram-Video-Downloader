@@ -19,6 +19,35 @@ const BILIBILI_BROWSER_USER_AGENT: &str = "Mozilla/5.0";
 const DEFAULT_ACCESS_KEY_AUTH_BASE: &str = "https://www.biliplus.com";
 const DEFAULT_ACCESS_KEY_CALLBACK_ORIGIN: &str = "https://www.bilibili.com";
 const BALH_LOGIN_CREDENTIALS_PREFIX: &str = "balh-login-credentials:";
+const LEGACY_GLOBAL_VALUE_FLAGS: &[&str] = &[
+    "--api-base",
+    "--pgc-base",
+    "--intl-base",
+    "--comment-base",
+    "--passport-base",
+    "--tv-api-base",
+    "--tv-passport-base",
+    "--tv-passport-poll-base",
+    "--app-grpc-base",
+    "--app-pgc-grpc-base",
+    "--playurl-mode",
+    "--restricted-area",
+    "--restricted-area-proxy",
+    "--restricted-api-proxy",
+    "--request-timeout-seconds",
+];
+const LEGACY_ENDPOINT_BASE_FLAGS: &[&str] = &[
+    "--api-base",
+    "--pgc-base",
+    "--intl-base",
+    "--comment-base",
+    "--passport-base",
+    "--tv-api-base",
+    "--tv-passport-base",
+    "--tv-passport-poll-base",
+    "--app-grpc-base",
+    "--app-pgc-grpc-base",
+];
 
 #[derive(Clone, Debug)]
 pub struct CredentialRuntime {
@@ -194,33 +223,18 @@ fn validate_legacy_bilibili_args(
     allow_download_modes: bool,
     allow_global_options: bool,
 ) -> Result<()> {
-    const GLOBAL_VALUE_FLAGS: &[&str] = &[
-        "--api-base",
-        "--pgc-base",
-        "--intl-base",
-        "--comment-base",
-        "--passport-base",
-        "--tv-api-base",
-        "--tv-passport-base",
-        "--tv-passport-poll-base",
-        "--app-grpc-base",
-        "--app-pgc-grpc-base",
-        "--playurl-mode",
-        "--restricted-area",
-        "--restricted-area-proxy",
-        "--restricted-api-proxy",
-        "--request-timeout-seconds",
-    ];
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
         if allow_global_options
-            && let Some(flag) = GLOBAL_VALUE_FLAGS
+            && let Some(flag) = LEGACY_GLOBAL_VALUE_FLAGS
                 .iter()
                 .copied()
                 .find(|flag| legacy_arg_matches_value_flag(arg, flag))
         {
+            let value = legacy_arg_value(args, index, flag)?;
             index = consume_legacy_value_arg(args, index, flag, setting)?;
+            validate_legacy_global_value(flag, value, setting)?;
             continue;
         }
         if allow_download_modes && legacy_arg_matches_value_flag(arg, "--only") {
@@ -243,6 +257,36 @@ fn validate_legacy_bilibili_args(
             "unsupported legacy BBDown option {} in {setting}; migrate it to a direct bbdown-core setting before starting the bot",
             legacy_arg_label(arg)
         );
+    }
+    Ok(())
+}
+
+fn validate_legacy_global_value(flag: &str, value: &str, setting: &str) -> Result<()> {
+    let result = if LEGACY_ENDPOINT_BASE_FLAGS.contains(&flag) {
+        validate_endpoint_base(value, flag)
+    } else {
+        match flag {
+            "--playurl-mode" => parse_playurl_mode(value).map(|_| ()),
+            "--restricted-area" => parse_restricted_area(value).map(|_| ()),
+            "--restricted-area-proxy" => {
+                validate_legacy_restricted_proxy_values(value, RestrictedAreaProxyKind::PlayUrl)
+            }
+            "--restricted-api-proxy" => {
+                validate_legacy_restricted_proxy_values(value, RestrictedAreaProxyKind::BilibiliApi)
+            }
+            "--request-timeout-seconds" => parse_request_timeout(value).map(|_| ()),
+            _ => unreachable!("validated legacy flag must have a parser"),
+        }
+    };
+    result.with_context(|| format!("invalid legacy BBDown option {flag} in {setting}"))
+}
+
+fn validate_legacy_restricted_proxy_values(
+    value: &str,
+    kind: RestrictedAreaProxyKind,
+) -> Result<()> {
+    for spec in value.split(',').filter(|spec| !spec.trim().is_empty()) {
+        parse_restricted_proxy_spec(spec, kind)?;
     }
     Ok(())
 }
@@ -318,28 +362,47 @@ fn legacy_arg_label(arg: &str) -> &str {
 }
 
 pub fn download_mode_from_config(config: &AppConfig) -> Result<DownloadMode> {
-    let mut args = legacy_bilibili_extra_args_for_direct_api(&config.bilibili.extra_args);
-    args.extend(legacy_bilibili_extra_args_for_direct_api(
-        &config.bilibili.download_args,
-    ));
     let mut mode = DownloadMode::All;
+    apply_legacy_download_modes(&config.bilibili.extra_args, &mut mode)?;
+    apply_legacy_download_modes(&config.bilibili.download_args, &mut mode)?;
+    Ok(mode)
+}
+
+fn apply_legacy_download_modes(args: &[String], mode: &mut DownloadMode) -> Result<()> {
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
+        if let Some((directive, consumed)) = legacy_download_mode_arg_value(args, index)? {
+            match directive {
+                LegacyDownloadModeDirective::Set(next) => *mode = next,
+                LegacyDownloadModeDirective::Clear(target) if *mode == target => {
+                    *mode = DownloadMode::All;
+                }
+                LegacyDownloadModeDirective::Clear(_) => {}
+            }
+            index += consumed;
+            continue;
+        }
         if arg == "--only" {
             let value = args
                 .get(index + 1)
                 .ok_or_else(|| anyhow::anyhow!("bilibili --only requires a value"))?;
-            mode = parse_download_mode(value)?;
+            *mode = parse_download_mode(value)?;
             index += 2;
             continue;
         }
         if let Some(value) = arg.strip_prefix("--only=") {
-            mode = parse_download_mode(value)?;
+            *mode = parse_download_mode(value)?;
         }
         index += 1;
     }
-    Ok(mode)
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyDownloadModeDirective {
+    Set(DownloadMode),
+    Clear(DownloadMode),
 }
 
 fn credential_profile_selection(profile: Option<&str>) -> Result<CredentialProfileSelection> {
@@ -365,77 +428,120 @@ fn playurl_mode(config: &AppConfig) -> Result<PlayurlMode> {
         .playurl_mode
         .as_deref()
         .or_else(|| last_bilibili_arg_value(config, "--playurl-mode").map(str::trim));
-    Ok(match mode {
-        Some("web") | None => PlayurlMode::Web,
-        Some("tv") => PlayurlMode::Tv,
-        Some("app") => PlayurlMode::App,
-        Some(value) => bail!("unsupported bilibili.playurl_mode `{value}`"),
-    })
+    mode.map(parse_playurl_mode)
+        .transpose()
+        .map(|mode| mode.unwrap_or(PlayurlMode::Web))
+}
+
+fn parse_playurl_mode(value: &str) -> Result<PlayurlMode> {
+    match value.trim() {
+        "web" => Ok(PlayurlMode::Web),
+        "tv" => Ok(PlayurlMode::Tv),
+        "app" => Ok(PlayurlMode::App),
+        value => bail!("unsupported bilibili.playurl_mode `{value}`"),
+    }
 }
 
 fn endpoint_config(config: &AppConfig) -> Result<EndpointConfig> {
     let default_endpoints = EndpointConfig::default();
     let mut endpoints = EndpointConfig::default()
-        .with_api_base(
-            last_bilibili_arg_value(config, "--api-base")
-                .unwrap_or(default_endpoints.api_base.as_str())
-                .to_string(),
-        )
-        .with_pgc_base(
-            last_bilibili_arg_value(config, "--pgc-base")
-                .unwrap_or(default_endpoints.pgc_base.as_str())
-                .to_string(),
-        )
-        .with_intl_base(
-            last_bilibili_arg_value(config, "--intl-base")
-                .unwrap_or(default_endpoints.intl_base.as_str())
-                .to_string(),
-        )
-        .with_comment_base(
-            last_bilibili_arg_value(config, "--comment-base")
-                .unwrap_or(default_endpoints.comment_base.as_str())
-                .to_string(),
-        )
-        .with_passport_base(
-            last_bilibili_arg_value(config, "--passport-base")
-                .unwrap_or(default_endpoints.passport_base.as_str())
-                .to_string(),
-        )
-        .with_tv_api_base(
-            last_bilibili_arg_value(config, "--tv-api-base")
-                .unwrap_or(default_endpoints.tv_api_base.as_str())
-                .to_string(),
-        )
-        .with_app_grpc_base(
-            last_bilibili_arg_value(config, "--app-grpc-base")
-                .unwrap_or(default_endpoints.app_grpc_base.as_str())
-                .to_string(),
-        )
-        .with_app_pgc_grpc_base(
-            last_bilibili_arg_value(config, "--app-pgc-grpc-base")
-                .unwrap_or(default_endpoints.app_pgc_grpc_base.as_str())
-                .to_string(),
-        );
-    let tv_passport_base = last_bilibili_arg_value(config, "--tv-passport-base")
-        .unwrap_or(default_endpoints.tv_passport_base.as_str())
-        .to_string();
-    let tv_passport_poll_base = last_bilibili_arg_value(config, "--tv-passport-poll-base")
-        .or_else(|| last_bilibili_arg_value(config, "--tv-passport-base"))
-        .unwrap_or(default_endpoints.tv_passport_poll_base.as_str())
-        .to_string();
+        .with_api_base(legacy_endpoint_base(
+            config,
+            "--api-base",
+            default_endpoints.api_base.as_str(),
+        )?)
+        .with_pgc_base(legacy_endpoint_base(
+            config,
+            "--pgc-base",
+            default_endpoints.pgc_base.as_str(),
+        )?)
+        .with_intl_base(legacy_endpoint_base(
+            config,
+            "--intl-base",
+            default_endpoints.intl_base.as_str(),
+        )?)
+        .with_comment_base(legacy_endpoint_base(
+            config,
+            "--comment-base",
+            default_endpoints.comment_base.as_str(),
+        )?)
+        .with_passport_base(legacy_endpoint_base(
+            config,
+            "--passport-base",
+            default_endpoints.passport_base.as_str(),
+        )?)
+        .with_tv_api_base(legacy_endpoint_base(
+            config,
+            "--tv-api-base",
+            default_endpoints.tv_api_base.as_str(),
+        )?)
+        .with_app_grpc_base(legacy_endpoint_base(
+            config,
+            "--app-grpc-base",
+            default_endpoints.app_grpc_base.as_str(),
+        )?)
+        .with_app_pgc_grpc_base(legacy_endpoint_base(
+            config,
+            "--app-pgc-grpc-base",
+            default_endpoints.app_pgc_grpc_base.as_str(),
+        )?);
+    let tv_passport_base = legacy_endpoint_base(
+        config,
+        "--tv-passport-base",
+        default_endpoints.tv_passport_base.as_str(),
+    )?;
+    let tv_passport_poll_base =
+        if let Some(value) = last_bilibili_arg_value(config, "--tv-passport-poll-base") {
+            normalized_endpoint_base(value, "--tv-passport-poll-base")?
+        } else if let Some(value) = last_bilibili_arg_value(config, "--tv-passport-base") {
+            normalized_endpoint_base(value, "--tv-passport-base")?
+        } else {
+            default_endpoints.tv_passport_poll_base.to_string()
+        };
     endpoints = endpoints
         .with_tv_passport_base(tv_passport_base)
         .with_tv_passport_poll_base(tv_passport_poll_base);
     Ok(endpoints)
 }
 
+fn legacy_endpoint_base(config: &AppConfig, flag: &str, default: &str) -> Result<String> {
+    let value = last_bilibili_arg_value(config, flag).unwrap_or(default);
+    normalized_endpoint_base(value, flag)
+}
+
+fn normalized_endpoint_base(value: &str, flag: &str) -> Result<String> {
+    validate_endpoint_base(value, flag)?;
+    Ok(value.trim().to_string())
+}
+
+fn validate_endpoint_base(value: &str, flag: &str) -> Result<()> {
+    let value = value.trim();
+    ensure!(!value.is_empty(), "{flag} must not be empty");
+    let parsed = url::Url::parse(value).with_context(|| {
+        format!(
+            "failed to parse {flag} URL `{}`",
+            redact_url_for_error(value)
+        )
+    })?;
+    ensure!(
+        matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some(),
+        "{flag} must be an absolute http or https URL"
+    );
+    Ok(())
+}
+
 fn request_timeout(config: &AppConfig) -> Result<Duration> {
-    let seconds = match last_bilibili_arg_value(config, "--request-timeout-seconds") {
-        Some(value) => value
-            .parse::<u64>()
-            .with_context(|| format!("invalid --request-timeout-seconds value `{value}`"))?,
-        None => DEFAULT_REQUEST_TIMEOUT_SECONDS,
-    };
+    match last_bilibili_arg_value(config, "--request-timeout-seconds") {
+        Some(value) => parse_request_timeout(value),
+        None => Ok(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECONDS)),
+    }
+}
+
+fn parse_request_timeout(value: &str) -> Result<Duration> {
+    let seconds = value
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("invalid --request-timeout-seconds value `{value}`"))?;
     ensure!(
         seconds > 0,
         "--request-timeout-seconds must be greater than 0"
@@ -579,54 +685,35 @@ fn merge_credentials(stored: &mut Credentials, credentials: Credentials) {
     }
 }
 
-fn legacy_bilibili_extra_args_for_direct_api(args: &[String]) -> Vec<String> {
-    let mut filtered = Vec::with_capacity(args.len());
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if let Some((mode, consumed)) = legacy_download_mode_arg_value(args, index) {
-            if let Some(mode) = mode {
-                filtered.extend(["--only".to_string(), mode.to_string()]);
-            }
-            index += consumed;
-            continue;
-        }
-        match arg.as_str() {
-            "--only" => {
-                if let Some(value) = args.get(index + 1) {
-                    filtered.extend(["--only".to_string(), value.clone()]);
-                    index += 2;
-                } else {
-                    filtered.push(arg.clone());
-                    index += 1;
-                }
-            }
-            _ if arg.starts_with("--only=") => {
-                filtered.push(arg.clone());
-                index += 1;
-            }
-            _ => {
-                index += 1;
-            }
-        }
-    }
-    filtered
-}
-
 fn legacy_download_mode_arg_value(
     args: &[String],
     index: usize,
-) -> Option<(Option<&'static str>, usize)> {
-    for (flag, mode) in [("--audio-only", "audio"), ("--video-only", "video")] {
-        let arg = args.get(index)?;
+) -> Result<Option<(LegacyDownloadModeDirective, usize)>> {
+    let arg = args
+        .get(index)
+        .context("legacy Bilibili download mode index is out of range")?;
+    for (flag, mode) in [
+        ("--audio-only", DownloadMode::AudioOnly),
+        ("--video-only", DownloadMode::VideoOnly),
+    ] {
         if arg == flag {
-            if let Some(value) = args
-                .get(index + 1)
-                .and_then(|value| parse_bool_token(value))
-            {
-                return Some((value.then_some(mode), 2));
+            if let Some(value) = args.get(index + 1) {
+                if value.starts_with("--") {
+                    return Ok(Some((LegacyDownloadModeDirective::Set(mode), 1)));
+                }
+                let enabled = parse_bool_token(value).with_context(|| {
+                    format!("legacy BBDown boolean option {flag} must be true, false, 1, or 0")
+                })?;
+                return Ok(Some((
+                    if enabled {
+                        LegacyDownloadModeDirective::Set(mode)
+                    } else {
+                        LegacyDownloadModeDirective::Clear(mode)
+                    },
+                    2,
+                )));
             }
-            return Some((Some(mode), 1));
+            return Ok(Some((LegacyDownloadModeDirective::Set(mode), 1)));
         }
         let equals_prefix = format!("{flag}=");
         let colon_prefix = format!("{flag}:");
@@ -634,10 +721,20 @@ fn legacy_download_mode_arg_value(
             .strip_prefix(&equals_prefix)
             .or_else(|| arg.strip_prefix(&colon_prefix))
         {
-            return Some((parse_bool_token(value).unwrap_or(true).then_some(mode), 1));
+            let enabled = parse_bool_token(value).with_context(|| {
+                format!("legacy BBDown boolean option {flag} must be true, false, 1, or 0")
+            })?;
+            return Ok(Some((
+                if enabled {
+                    LegacyDownloadModeDirective::Set(mode)
+                } else {
+                    LegacyDownloadModeDirective::Clear(mode)
+                },
+                1,
+            )));
         }
     }
-    None
+    Ok(None)
 }
 
 fn parse_download_mode(value: &str) -> Result<DownloadMode> {
@@ -800,15 +897,20 @@ mod tests {
     }
 
     #[test]
-    fn parses_legacy_download_mode_args() {
+    fn legacy_download_mode_false_clears_only_its_matching_mode() {
+        let mut config = crate::config::AppConfig::for_test();
+        config.bilibili.extra_args = vec!["--audio-only".to_string()];
+        config.bilibili.download_args = vec!["--audio-only=false".to_string()];
+
         assert_eq!(
-            legacy_bilibili_extra_args_for_direct_api(&[
-                "--audio-only".to_string(),
-                "--video-only=false".to_string(),
-                "--cookie".to_string(),
-                "SESSDATA=legacy".to_string(),
-            ]),
-            vec!["--only".to_string(), "audio".to_string()]
+            download_mode_from_config(&config).unwrap(),
+            DownloadMode::All
+        );
+
+        config.bilibili.extra_args = vec!["--video-only".to_string()];
+        assert_eq!(
+            download_mode_from_config(&config).unwrap(),
+            DownloadMode::VideoOnly
         );
     }
 
