@@ -17,7 +17,7 @@ Environment overrides:
   BOT_CONFIG      Config file path. Defaults to ./config.toml.
   BOT_BINARY      Binary path. Defaults to ./target/release/telegram-video-downloader.
   BOT_LOG_DIR     Log directory. Defaults to ~/Library/Logs/TelegramVideoDownloader.
-  BOT_DOMAIN      launchd domain. Defaults to user/$(id -u).
+  BOT_DOMAIN      launchd domain. Defaults to gui/$(id -u).
   BOT_DOTNET_ROOT Optional .NET runtime root for BBDown global-tool apphosts.
   BOT_SKIP_BUILD  Set to 1 to skip cargo build during install.
 EOF
@@ -42,7 +42,7 @@ label="${BOT_LABEL:-${DEFAULT_LABEL}}"
 config_path="${BOT_CONFIG:-${repo_dir}/config.toml}"
 binary_path="${BOT_BINARY:-${repo_dir}/target/release/telegram-video-downloader}"
 log_dir="${BOT_LOG_DIR:-${HOME}/Library/Logs/TelegramVideoDownloader}"
-domain="${BOT_DOMAIN:-user/$(id -u)}"
+domain="${BOT_DOMAIN:-gui/$(id -u)}"
 dotnet_root="${BOT_DOTNET_ROOT:-}"
 skip_build="${BOT_SKIP_BUILD:-0}"
 
@@ -189,6 +189,7 @@ write_plist() {
     escaped_path="$(xml_escape "${path_value}")"
   fi
 
+  # A Background session restriction makes this GUI LaunchAgent fail to bootstrap.
   cat > "${output}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -220,9 +221,6 @@ ${dotnet_env_block}
 
   <key>RunAtLoad</key>
   <true/>
-
-  <key>LimitLoadToSessionType</key>
-  <string>Background</string>
 
   <key>KeepAlive</key>
   <true/>

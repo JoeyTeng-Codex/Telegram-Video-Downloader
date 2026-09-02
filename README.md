@@ -107,7 +107,7 @@ scripts/launch_agent.sh uninstall
 - config：`./config.toml`
 - binary：`./target/release/telegram-video-downloader`
 - logs：`~/Library/Logs/TelegramVideoDownloader/`
-- launchd domain：`user/$(id -u)`
+- launchd domain：`gui/$(id -u)`（当前登录的图形会话）
 
 这些都可以通过环境变量覆盖，例如：
 
