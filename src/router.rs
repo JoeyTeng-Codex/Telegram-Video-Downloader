@@ -1,3 +1,4 @@
+use bbdown_core::Input;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -287,14 +288,11 @@ fn has_positive_episode_id(url: &Url) -> bool {
     })
 }
 
-pub(crate) fn bilibili_url_has_positive_episode_id(raw_url: &str) -> bool {
+pub(crate) fn bilibili_url_ep_id_selects_episode(raw_url: &str) -> bool {
     let Ok(url) = Url::parse(raw_url) else {
         return false;
     };
-    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
-        return false;
-    };
-    domain_or_subdomain(&host, "bilibili.com") && has_positive_episode_id(&url)
+    has_positive_episode_id(&url) && matches!(Input::parse(raw_url), Ok(Input::Episode(_)))
 }
 
 fn bilibili_url_requires_selection(raw_url: &str) -> bool {
@@ -563,6 +561,18 @@ mod tests {
             ),
             Some(BilibiliSelection::Page(2))
         );
+        assert!(bilibili_url_ep_id_selects_episode(
+            "https://www.bilibili.com/video/BV12TRrBcEP8/?ep_id=456&p=2"
+        ));
+        assert!(!bilibili_url_ep_id_selects_episode(
+            "https://space.bilibili.com/123?ep_id=456"
+        ));
+        assert!(!bilibili_url_ep_id_selects_episode(
+            "https://www.bilibili.com/account/dynamic?ep_id=456"
+        ));
+        assert!(!bilibili_url_ep_id_selects_episode(
+            "https://b23.tv/abc?ep_id=456"
+        ));
         assert!(!is_b23_short_link_url("https://user:pass@b23.tv/abc"));
     }
 

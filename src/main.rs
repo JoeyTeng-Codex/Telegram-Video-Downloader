@@ -34,7 +34,7 @@ use crate::downloader::{
 use crate::redaction::redact_sensitive_text;
 use crate::router::{
     BilibiliAuthCommand, BilibiliAuthLoginMode, BilibiliSelection, JobRequest, RouteResult,
-    bilibili_selection_from_url, bilibili_url_has_positive_episode_id, is_b23_short_link_url,
+    bilibili_selection_from_url, bilibili_url_ep_id_selects_episode, is_b23_short_link_url,
     route_message,
 };
 use crate::telegram::{
@@ -1645,7 +1645,7 @@ fn apply_bilibili_short_link_resolution(
 ) -> JobRequest {
     let resolved_selection = bilibili_selection_from_url(&resolved_url);
     let selection = match selection {
-        Some(BilibiliSelection::Page(_)) if bilibili_url_has_positive_episode_id(&resolved_url) => {
+        Some(BilibiliSelection::Page(_)) if bilibili_url_ep_id_selects_episode(&resolved_url) => {
             None
         }
         Some(page @ BilibiliSelection::Page(_)) => resolved_selection.or(Some(page)),
@@ -3339,6 +3339,26 @@ mod tests {
             JobRequest::Bilibili {
                 url: "https://www.bilibili.com/video/BV12TRrBcEP8/?ep_id=456&p=2".to_string(),
                 selection: None,
+            }
+        );
+        assert_eq!(
+            apply_bilibili_short_link_resolution(
+                Some(BilibiliSelection::Page(3)),
+                "https://space.bilibili.com/123?ep_id=456".to_string(),
+            ),
+            JobRequest::Bilibili {
+                url: "https://space.bilibili.com/123?ep_id=456".to_string(),
+                selection: Some(BilibiliSelection::Page(3)),
+            }
+        );
+        assert_eq!(
+            apply_bilibili_short_link_resolution(
+                Some(BilibiliSelection::Page(3)),
+                "https://www.bilibili.com/account/dynamic?ep_id=456".to_string(),
+            ),
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/account/dynamic?ep_id=456".to_string(),
+                selection: Some(BilibiliSelection::Page(3)),
             }
         );
     }
