@@ -18,8 +18,10 @@ superseded_by:
 ## Current State
 - The installer targets the current GUI launchd domain by default: `gui/$(id -u)`.
 - Generated plists no longer set `LimitLoadToSessionType=Background`; that key prevented an otherwise valid Telegram downloader plist from bootstrapping in the active GUI session.
+- Default-domain operations migrate prior `user/$(id -u)` installations: install/uninstall clean the old service, while status/restart fall back to it until migration. Explicit `BOT_DOMAIN` values remain isolated from that compatibility behavior.
 
 ## Evidence
 - The generated plist passed `plutil -lint` and its binary, log directory, and plist permissions were readable by the current user.
 - A temporary plist with a unique label continued to fail with the session-type key, then bootstrapped successfully after only that key was removed.
 - The fixed production installer built the release binary and registered `gui/501/io.github.telegram-local-downloader.bot`; after the startup window, launchd reported `state = running` and the bot emitted a fresh startup marker.
+- A fake-`launchctl` migration integration test passed: default install cleans the legacy domain and registers GUI, status/restart fall back to legacy, uninstall cleans both domains, and explicit `BOT_DOMAIN` skips migration. The test uses only temporary files and does not create a second Telegram bot.

@@ -17,7 +17,7 @@ Environment overrides:
   BOT_CONFIG      Config file path. Defaults to ./config.toml.
   BOT_BINARY      Binary path. Defaults to ./target/release/telegram-video-downloader.
   BOT_LOG_DIR     Log directory. Defaults to ~/Library/Logs/TelegramVideoDownloader.
-  BOT_DOMAIN      launchd domain. Defaults to gui/$(id -u).
+  BOT_DOMAIN      launchd domain. Defaults to gui/$(id -u); bypasses legacy migration when set.
   BOT_DOTNET_ROOT Optional .NET runtime root for BBDown global-tool apphosts.
   BOT_SKIP_BUILD  Set to 1 to skip cargo build during install.
 EOF
@@ -42,7 +42,13 @@ label="${BOT_LABEL:-${DEFAULT_LABEL}}"
 config_path="${BOT_CONFIG:-${repo_dir}/config.toml}"
 binary_path="${BOT_BINARY:-${repo_dir}/target/release/telegram-video-downloader}"
 log_dir="${BOT_LOG_DIR:-${HOME}/Library/Logs/TelegramVideoDownloader}"
-domain="${BOT_DOMAIN:-gui/$(id -u)}"
+default_domain="gui/$(id -u)"
+legacy_domain="user/$(id -u)"
+domain="${BOT_DOMAIN:-${default_domain}}"
+use_default_domain=0
+if [[ -z "${BOT_DOMAIN:-}" ]]; then
+  use_default_domain=1
+fi
 dotnet_root="${BOT_DOTNET_ROOT:-}"
 skip_build="${BOT_SKIP_BUILD:-0}"
 
@@ -111,8 +117,36 @@ plist_path() {
   printf '%s/Library/LaunchAgents/%s.plist\n' "${HOME}" "${label}"
 }
 
+service_name_for_domain() {
+  local target_domain="$1"
+  printf '%s/%s\n' "${target_domain}" "${label}"
+}
+
 service_name() {
-  printf '%s/%s\n' "${domain}" "${label}"
+  service_name_for_domain "${domain}"
+}
+
+legacy_service_name() {
+  service_name_for_domain "${legacy_domain}"
+}
+
+cleanup_legacy_service() {
+  if [[ "${use_default_domain}" == "1" ]]; then
+    launchctl bootout "$(legacy_service_name)" >/dev/null 2>&1 || true
+  fi
+}
+
+active_or_default_service_name() {
+  if launchctl print "$(service_name)" >/dev/null 2>&1; then
+    service_name
+    return
+  fi
+  if [[ "${use_default_domain}" == "1" ]] \
+    && launchctl print "$(legacy_service_name)" >/dev/null 2>&1; then
+    legacy_service_name
+    return
+  fi
+  service_name
 }
 
 is_dotnet_root() {
@@ -266,6 +300,7 @@ install_agent() {
   install -m 644 "${temp_plist}" "${plist}"
   rm -f "${temp_plist}"
 
+  cleanup_legacy_service
   launchctl bootout "$(service_name)" >/dev/null 2>&1 || true
   launchctl bootstrap "${domain}" "${plist}"
   launchctl print "$(service_name)"
@@ -275,6 +310,7 @@ uninstall_agent() {
   local plist
   plist="$(plist_path)"
   launchctl bootout "$(service_name)" >/dev/null 2>&1 || true
+  cleanup_legacy_service
   rm -f "${plist}"
 }
 
@@ -286,10 +322,10 @@ case "${action}" in
     uninstall_agent
     ;;
   restart)
-    launchctl kickstart -k "$(service_name)"
+    launchctl kickstart -k "$(active_or_default_service_name)"
     ;;
   status)
-    launchctl print "$(service_name)"
+    launchctl print "$(active_or_default_service_name)"
     ;;
   logs)
     tail -f "${log_dir}/stdout.log" "${log_dir}/stderr.log"
