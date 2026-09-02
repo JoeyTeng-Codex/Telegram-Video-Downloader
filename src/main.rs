@@ -34,7 +34,8 @@ use crate::downloader::{
 use crate::redaction::redact_sensitive_text;
 use crate::router::{
     BilibiliAuthCommand, BilibiliAuthLoginMode, BilibiliSelection, JobRequest, RouteResult,
-    bilibili_selection_from_url, is_b23_short_link_url, route_message,
+    bilibili_selection_from_url, bilibili_url_ep_id_selects_episode, is_b23_short_link_url,
+    route_message,
 };
 use crate::telegram::{
     BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient,
@@ -1642,8 +1643,16 @@ fn apply_bilibili_short_link_resolution(
     selection: Option<BilibiliSelection>,
     resolved_url: String,
 ) -> JobRequest {
+    let resolved_selection = bilibili_selection_from_url(&resolved_url);
+    let selection = match selection {
+        Some(BilibiliSelection::Page(_)) if bilibili_url_ep_id_selects_episode(&resolved_url) => {
+            None
+        }
+        Some(page @ BilibiliSelection::Page(_)) => resolved_selection.or(Some(page)),
+        selection => selection.or(resolved_selection),
+    };
     JobRequest::Bilibili {
-        selection: selection.or_else(|| bilibili_selection_from_url(&resolved_url)),
+        selection,
         url: resolved_url,
     }
 }
@@ -3290,6 +3299,68 @@ mod tests {
             "https://www.bilibili.com/bangumi/play/ss12345?ep_id=456".to_string(),
         );
         assert!(!episode.requires_bilibili_selection());
+
+        assert_eq!(
+            apply_bilibili_short_link_resolution(
+                None,
+                "https://www.bilibili.com/video/BV12TRrBcEP8/?ep_id=456&p=2".to_string(),
+            ),
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV12TRrBcEP8/?ep_id=456&p=2".to_string(),
+                selection: None,
+            }
+        );
+
+        assert_eq!(
+            apply_bilibili_short_link_resolution(
+                Some(BilibiliSelection::Page(3)),
+                "https://www.bilibili.com/video/BV12TRrBcEP8/".to_string(),
+            ),
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV12TRrBcEP8/".to_string(),
+                selection: Some(BilibiliSelection::Page(3)),
+            }
+        );
+        assert_eq!(
+            apply_bilibili_short_link_resolution(
+                Some(BilibiliSelection::Page(3)),
+                "https://www.bilibili.com/video/BV12TRrBcEP8/?p=2".to_string(),
+            ),
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV12TRrBcEP8/?p=2".to_string(),
+                selection: Some(BilibiliSelection::Page(2)),
+            }
+        );
+        assert_eq!(
+            apply_bilibili_short_link_resolution(
+                Some(BilibiliSelection::Page(3)),
+                "https://www.bilibili.com/video/BV12TRrBcEP8/?ep_id=456&p=2".to_string(),
+            ),
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV12TRrBcEP8/?ep_id=456&p=2".to_string(),
+                selection: None,
+            }
+        );
+        assert_eq!(
+            apply_bilibili_short_link_resolution(
+                Some(BilibiliSelection::Page(3)),
+                "https://space.bilibili.com/123?ep_id=456".to_string(),
+            ),
+            JobRequest::Bilibili {
+                url: "https://space.bilibili.com/123?ep_id=456".to_string(),
+                selection: Some(BilibiliSelection::Page(3)),
+            }
+        );
+        assert_eq!(
+            apply_bilibili_short_link_resolution(
+                Some(BilibiliSelection::Page(3)),
+                "https://www.bilibili.com/account/dynamic?ep_id=456".to_string(),
+            ),
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/account/dynamic?ep_id=456".to_string(),
+                selection: Some(BilibiliSelection::Page(3)),
+            }
+        );
     }
 
     #[test]

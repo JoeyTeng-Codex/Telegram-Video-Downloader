@@ -1,3 +1,4 @@
+use bbdown_core::Input;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -253,9 +254,13 @@ fn is_bilibili_intl_video_url(url: &Url) -> bool {
 pub(crate) fn bilibili_selection_from_url(raw_url: &str) -> Option<BilibiliSelection> {
     let url = Url::parse(raw_url).ok()?;
     let host = url.host_str()?.to_ascii_lowercase();
-    if !is_b23_short_link_url(raw_url)
+    let is_b23_short_link = is_b23_short_link_url(raw_url);
+    if !is_b23_short_link
         && (!domain_or_subdomain(&host, "bilibili.com") || !is_bilibili_standard_video_url(&url))
     {
+        return None;
+    }
+    if !is_b23_short_link && has_positive_episode_id(&url) {
         return None;
     }
 
@@ -277,6 +282,19 @@ pub(crate) fn is_b23_short_link_url(raw_url: &str) -> bool {
     })
 }
 
+fn has_positive_episode_id(url: &Url) -> bool {
+    url.query_pairs().any(|(name, value)| {
+        name == "ep_id" && value.parse::<u64>().is_ok_and(|episode_id| episode_id > 0)
+    })
+}
+
+pub(crate) fn bilibili_url_ep_id_selects_episode(raw_url: &str) -> bool {
+    let Ok(url) = Url::parse(raw_url) else {
+        return false;
+    };
+    has_positive_episode_id(&url) && matches!(Input::parse(raw_url), Ok(Input::Episode(_)))
+}
+
 fn bilibili_url_requires_selection(raw_url: &str) -> bool {
     let Ok(url) = Url::parse(raw_url) else {
         return false;
@@ -287,9 +305,7 @@ fn bilibili_url_requires_selection(raw_url: &str) -> bool {
     if !domain_or_subdomain(&host, "bilibili.com") {
         return false;
     }
-    if url.query_pairs().any(|(name, value)| {
-        name == "ep_id" && value.parse::<u64>().is_ok_and(|episode_id| episode_id > 0)
-    }) {
+    if has_positive_episode_id(&url) {
         return false;
     }
     let Some(mut segments) = url.path_segments() else {
@@ -529,6 +545,34 @@ mod tests {
             bilibili_selection_from_url("https://www.bilibili.com/video/BV12TRrBcEP8/?p=invalid"),
             None
         );
+        assert_eq!(
+            bilibili_selection_from_url(
+                "https://www.bilibili.com/video/BV12TRrBcEP8/?ep_id=456&p=2"
+            ),
+            None
+        );
+        assert_eq!(
+            bilibili_selection_from_url("https://b23.tv/abc?ep_id=456&p=3"),
+            Some(BilibiliSelection::Page(3))
+        );
+        assert_eq!(
+            bilibili_selection_from_url(
+                "https://www.bilibili.com/video/BV12TRrBcEP8/?ep_id=invalid&p=2"
+            ),
+            Some(BilibiliSelection::Page(2))
+        );
+        assert!(bilibili_url_ep_id_selects_episode(
+            "https://www.bilibili.com/video/BV12TRrBcEP8/?ep_id=456&p=2"
+        ));
+        assert!(!bilibili_url_ep_id_selects_episode(
+            "https://space.bilibili.com/123?ep_id=456"
+        ));
+        assert!(!bilibili_url_ep_id_selects_episode(
+            "https://www.bilibili.com/account/dynamic?ep_id=456"
+        ));
+        assert!(!bilibili_url_ep_id_selects_episode(
+            "https://b23.tv/abc?ep_id=456"
+        ));
         assert!(!is_b23_short_link_url("https://user:pass@b23.tv/abc"));
     }
 

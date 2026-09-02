@@ -137,18 +137,9 @@ pub async fn resolve_b23_short_link(config: &AppConfig, raw_url: &str) -> Result
             .send()
             .await
             .map_err(|_| anyhow::anyhow!("Bilibili short-link request failed"))?;
-        if response.status().is_success() {
-            ensure!(
-                is_bilibili_short_link_target(&current),
-                "Bilibili short link did not resolve to a Bilibili URL"
-            );
-            return Ok(current.into());
+        if let Some(target) = terminal_b23_short_link_target(&current, response.status())? {
+            return Ok(target);
         }
-        ensure!(
-            response.status().is_redirection(),
-            "Bilibili short link returned status {}",
-            response.status()
-        );
         ensure!(
             redirect_count < B23_SHORT_LINK_MAX_REDIRECTS,
             "Bilibili short link exceeded redirect limit"
@@ -169,6 +160,19 @@ pub async fn resolve_b23_short_link(config: &AppConfig, raw_url: &str) -> Result
     }
 
     bail!("Bilibili short link exceeded redirect limit")
+}
+
+fn terminal_b23_short_link_target(
+    current: &Url,
+    status: reqwest::StatusCode,
+) -> Result<Option<String>> {
+    if status.is_redirection() {
+        return Ok(None);
+    }
+    if is_bilibili_short_link_target(current) {
+        return Ok(Some(current.to_string()));
+    }
+    bail!("Bilibili short link returned status {status}")
 }
 
 fn is_b23_short_link_url(url: &Url) -> bool {
@@ -1068,6 +1072,27 @@ mod tests {
         assert!(is_allowed_b23_redirect_hop(&bilibili));
         assert!(is_allowed_b23_redirect_hop(&bilibili_intl));
         assert!(!is_allowed_b23_redirect_hop(&unexpected));
+    }
+
+    #[test]
+    fn preserves_bilibili_short_link_target_after_terminal_page_errors() {
+        let target = Url::parse("https://www.bilibili.com/video/BV123?p=2").unwrap();
+        assert_eq!(
+            terminal_b23_short_link_target(&target, reqwest::StatusCode::FORBIDDEN).unwrap(),
+            Some(target.to_string())
+        );
+        assert_eq!(
+            terminal_b23_short_link_target(&target, reqwest::StatusCode::PRECONDITION_FAILED,)
+                .unwrap(),
+            Some(target.to_string())
+        );
+        assert_eq!(
+            terminal_b23_short_link_target(&target, reqwest::StatusCode::FOUND).unwrap(),
+            None
+        );
+
+        let b23 = Url::parse("https://b23.tv/abc").unwrap();
+        assert!(terminal_b23_short_link_target(&b23, reqwest::StatusCode::OK).is_err());
     }
 
     #[test]
