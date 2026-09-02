@@ -123,6 +123,7 @@ BOT_LABEL=com.example.telegram-downloader BOT_CONFIG=/path/to/config.toml script
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+scripts/test_launch_agent.sh
 uv run ruff format --check
 uv run ruff check
 uv run python -m unittest discover -s tests

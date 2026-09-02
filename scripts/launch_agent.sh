@@ -135,18 +135,17 @@ legacy_service_name() {
 service_exists() {
   local target="$1"
   local output
-  local status
 
   if output="$(launchctl print "${target}" 2>&1)"; then
     return 0
-  else
-    status=$?
   fi
-  if [[ "${status}" -eq 113 && "${output}" == *"Could not find service"* ]]; then
+
+  # Return 1 only for launchd's explicit absent-service/domain diagnostics.
+  if [[ "${output}" == *"Could not find service"* || "${output}" == *"Could not find domain"* ]]; then
     return 1
   fi
   printf '%s\n' "${output}" >&2
-  return "${status}"
+  return 2
 }
 
 wait_for_service_absence() {
