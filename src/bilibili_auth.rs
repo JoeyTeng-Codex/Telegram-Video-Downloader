@@ -1,21 +1,28 @@
+#![allow(dead_code)]
+
 use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::Cursor;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
+use bbdown_core::{CredentialProfileSelection, CredentialStore};
 use image::{DynamicImage, ImageFormat, Luma};
 use qrcode::QrCode;
 use reqwest::Client;
 use reqwest::header::{COOKIE, HeaderMap, SET_COOKIE, USER_AGENT};
+use rustix::fs::{CWD, FlockOperation, RenameFlags};
 use serde::{Deserialize, Serialize};
 use url::Url;
+
+use crate::safe_fs::{BoundEntry, BoundFile, EntryIdentity, RootedFs};
 
 const USER_AGENT_VALUE: &str = "Mozilla/5.0";
 const QRCODE_GENERATE_URL: &str =
@@ -25,6 +32,22 @@ const NAV_URL: &str = "https://api.bilibili.com/x/web-interface/nav";
 static AUTH_FILE_LOCK: Mutex<()> = Mutex::new(());
 static ACTIVE_BBDOWN_CONFIG_FILES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const AUTH_MUTATION_LOCK_SUFFIX: &str = ".telegram-video-downloader.auth.lock";
+const AUTH_MUTATION_LOCK_ANCHOR_SUFFIX: &str = ".anchor";
+const AUTH_MUTATION_LOCK_OWNER_SUFFIX: &str = ".telegram-video-downloader.auth-owner";
+const AUTH_MUTATION_LOCK_OWNER_VERSION: u32 = 1;
+const AUTH_MUTATION_LOCK_OWNER_LIMIT: usize = 256;
+const AUTH_LOGOUT_INTENT_SUFFIX: &str = ".telegram-video-downloader.logout-intent";
+const AUTH_LOGOUT_INTENT_VERSION: u32 = 1;
+const AUTH_LOGOUT_INTENT_LIMIT: usize = 1024;
+const AUTH_EPOCH_LOG_LIMIT: u64 = 64 * 1024;
+const AUTH_EPOCH_SLOT_SIZE: usize = 64;
+const AUTH_EPOCH_SLOT_COUNT: usize = 2;
+const AUTH_EPOCH_SLOT_MAGIC: &[u8; 8] = b"TVDAUTH1";
+const AUTH_LOCK_HEADER: &[u8] = b"telegram-video-downloader-auth-lock-v1\n";
+const AUTH_STATE_FILE_LIMIT: usize = 1024 * 1024;
+const AUTH_MUTATION_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const AUTH_MUTATION_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const LOGIN_URL_COOKIE_NAMES: &[&str] = &[
     "SESSDATA",
     "bili_jct",
@@ -64,12 +87,287 @@ pub struct LoginQr {
     pub png: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BbdownAuthTicket {
+    pub kind: String,
+    pub url: String,
+    pub qr_payload: String,
+    pub message_origin: Option<String>,
+    pub callback_origin: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct BbdownCredentialSummary {
+    pub has_cookie: bool,
+    pub has_access_key: bool,
+    #[serde(default)]
+    pub has_tv_access_key: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BbdownAuthEvent {
+    Ticket(BbdownAuthTicket),
+    Saved {
+        kind: String,
+        saved: BbdownCredentialSummary,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct BbdownCredentialHealthReport {
+    pub credentials: BbdownCredentialSummary,
+    #[serde(default)]
+    pub probes: Vec<BbdownCredentialHealthProbe>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct BbdownCredentialHealthProbe {
+    pub kind: String,
+    pub scope: String,
+    pub status: String,
+    pub endpoint: Option<String>,
+    pub api_code: Option<i64>,
+    pub message: Option<String>,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum LoginPoll {
     Waiting,
     Scanned,
     Expired,
     Success { cookie: String },
+}
+
+#[derive(Debug)]
+struct AuthMutationFileLock {
+    file: File,
+    path: PathBuf,
+    anchor_path: PathBuf,
+    owner_path: PathBuf,
+    credential_file: AuthCredentialFilePath,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AuthMutationLockOwner {
+    version: u32,
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AuthLogoutIntent {
+    version: u32,
+    lock_owner: AuthMutationLockOwner,
+    credential_profile: String,
+}
+
+#[derive(Debug)]
+struct BoundAuthLogoutIntent {
+    root: RootedFs,
+    entry: BoundEntry,
+    file: BoundFile,
+    intent: AuthLogoutIntent,
+}
+
+#[derive(Debug)]
+struct AuthCredentialFilePath {
+    control_path: PathBuf,
+    #[cfg(unix)]
+    _parent: File,
+    #[cfg(unix)]
+    leaf: OsString,
+}
+
+impl AuthCredentialFilePath {
+    fn control_path(&self) -> &Path {
+        &self.control_path
+    }
+
+    fn store_path(&self) -> Result<PathBuf> {
+        // Protected property: a path-only bbdown-core call must name the credential directory
+        // selected before the auth lock. The credential path's validated ancestry prevents a
+        // different UID from replacing that directory after this handoff; same-UID processes can
+        // already read the 0600 credential file and are outside this filesystem isolation boundary.
+        // On macOS, F_GETPATH preserves a benign rename; other Unix platforms revalidate the
+        // configured path. Both reopen with O_NOFOLLOW and compare device/inode before the call.
+        #[cfg(target_os = "macos")]
+        {
+            Ok(macos_path_for_open_directory(&self._parent)?.join(&self.leaf))
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let parent = self
+                .control_path
+                .parent()
+                .context("BBDown credential file has no parent directory")?;
+            Ok(revalidated_path_for_open_directory(&self._parent, parent)?.join(&self.leaf))
+        }
+        #[cfg(not(unix))]
+        Ok(self.control_path.clone())
+    }
+}
+
+pub fn validated_credential_store_path(credential_file: &Path) -> Result<PathBuf> {
+    let credential_file = bind_auth_credential_file(credential_file)?;
+    let store_path = credential_file.store_path()?;
+    validate_existing_credential_store_file(&store_path)?;
+    Ok(store_path)
+}
+
+fn validate_existing_credential_store_file(store_path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = store_path
+            .parent()
+            .context("BBDown credential file has no parent directory")?;
+        let root = RootedFs::new(parent).with_context(|| {
+            format!(
+                "failed to bind BBDown credential file parent directory {}",
+                parent.display()
+            )
+        })?;
+        let Some(file) = root.open_bound_file(store_path).with_context(|| {
+            format!(
+                "failed to inspect BBDown credential file {}",
+                store_path.display()
+            )
+        })?
+        else {
+            root.validate_configured_root()?;
+            return Ok(());
+        };
+
+        // Protected property: a path-only bbdown-core call must only receive an existing
+        // credential leaf whose access policy limits it to the current user. The bound
+        // descriptor proves the selected regular-file identity; its mode, UID, and link count
+        // establish that policy. The final entry-identity check detects object replacement,
+        // while the validated private parent prevents another UID from winning a missing-leaf
+        // race. Content changes by the current UID remain within the configured account scope.
+        file.validate_private_single_link(0o600).context(
+            "BBDown credential file must be a current-user-owned private single-link file",
+        )?;
+        if root.entry_identity(store_path)? != Some(file.identity()) {
+            bail!(
+                "BBDown credential file identity changed after validation: {}",
+                store_path.display()
+            );
+        }
+    }
+
+    #[cfg(not(unix))]
+    let _ = store_path;
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct BoundAuthStatePath {
+    root: RootedFs,
+    path: PathBuf,
+}
+
+impl BoundAuthStatePath {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn config_path(&self) -> PathBuf {
+        bbdown_config_path(&self.path)
+    }
+
+    fn legacy_config_path(&self) -> PathBuf {
+        legacy_bbdown_config_path(&self.path)
+    }
+
+    fn config_dir_path(&self) -> PathBuf {
+        bbdown_config_dir(&self.path)
+    }
+
+    fn validate_root(&self) -> Result<()> {
+        self.root.validate_configured_root()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthEpoch {
+    value: u64,
+    lock_owner: AuthMutationLockOwner,
+}
+
+impl AuthEpoch {
+    pub fn value(self) -> u64 {
+        self.value
+    }
+
+    #[cfg(test)]
+    pub fn for_test(value: u64) -> Self {
+        Self {
+            value,
+            lock_owner: AuthMutationLockOwner {
+                version: AUTH_MUTATION_LOCK_OWNER_VERSION,
+                device: 0,
+                inode: 0,
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct AuthReplyFileLock {
+    lock: AuthMutationFileLock,
+}
+
+impl AuthReplyFileLock {
+    pub fn current_epoch(&self) -> Result<AuthEpoch> {
+        self.lock.current_epoch()
+    }
+}
+
+pub struct LockedAuthMutation<'a> {
+    state: Option<&'a BoundAuthStatePath>,
+    credential_file: &'a AuthCredentialFilePath,
+    credential_control_path: &'a Path,
+    _lock: &'a AuthMutationFileLock,
+    epoch: AuthEpoch,
+}
+
+pub type AuthCleanupResult = (Result<bool>, Result<()>);
+
+impl LockedAuthMutation<'_> {
+    pub fn sync_legacy_cookie(&self, credential_profile: Option<&str>) -> Result<bool> {
+        let credential_file = self.credential_file.store_path()?;
+        sync_bbdown_rust_credentials_from_state_unlocked(
+            self.state,
+            &credential_file,
+            credential_profile,
+        )
+    }
+
+    pub fn delete_legacy_state(&self) -> Result<bool> {
+        delete_auth_state_unlocked(self.state, self.credential_control_path)
+    }
+
+    fn persist_logout_intent(&self, credential_profile: Option<&str>) -> Result<AuthLogoutIntent> {
+        persist_auth_logout_intent(self._lock, self.epoch, credential_profile)
+    }
+
+    fn clear_logout_intent(&self, intent: &AuthLogoutIntent) -> Result<()> {
+        clear_auth_logout_intent(self._lock, self.epoch, intent)
+    }
+
+    fn clear_selected_credential_profile(&self, credential_profile: &str) -> Result<()> {
+        clear_bbdown_rust_credential_profile_unlocked(&self.credential_file()?, credential_profile)
+    }
+
+    pub fn epoch(&self) -> AuthEpoch {
+        self.epoch
+    }
+
+    pub fn credential_file(&self) -> Result<PathBuf> {
+        self.credential_file.store_path()
+    }
 }
 
 impl fmt::Debug for LoginPoll {
@@ -115,6 +413,78 @@ struct NavData {
     is_login: bool,
     mid: Option<u64>,
     uname: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BbdownRawAuthEvent {
+    event: String,
+    kind: Option<String>,
+    url: Option<String>,
+    qr_payload: Option<String>,
+    message_origin: Option<String>,
+    callback_origin: Option<String>,
+    saved: Option<BbdownCredentialSummary>,
+}
+
+pub fn parse_bbdown_auth_event_line(line: &str) -> Result<BbdownAuthEvent> {
+    let raw: BbdownRawAuthEvent =
+        serde_json::from_str(line).context("failed to parse BBDown-rust auth JSON event")?;
+    match raw.event.as_str() {
+        "ticket" => Ok(BbdownAuthEvent::Ticket(BbdownAuthTicket {
+            kind: raw.kind.unwrap_or_else(|| "unknown".to_string()),
+            url: raw
+                .url
+                .filter(|url| !url.trim().is_empty())
+                .ok_or_else(|| anyhow!("BBDown-rust auth ticket did not include url"))?,
+            qr_payload: raw
+                .qr_payload
+                .filter(|payload| !payload.trim().is_empty())
+                .ok_or_else(|| anyhow!("BBDown-rust auth ticket did not include qr_payload"))?,
+            message_origin: raw.message_origin,
+            callback_origin: raw.callback_origin,
+        })),
+        "saved" => Ok(BbdownAuthEvent::Saved {
+            kind: raw.kind.unwrap_or_else(|| "unknown".to_string()),
+            saved: raw
+                .saved
+                .ok_or_else(|| anyhow!("BBDown-rust auth saved event did not include summary"))?,
+        }),
+        event => bail!("unsupported BBDown-rust auth event: {event}"),
+    }
+}
+
+pub fn parse_bbdown_auth_events(stdout: &str) -> Result<Vec<BbdownAuthEvent>> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(parse_bbdown_auth_event_line)
+        .collect()
+}
+
+pub fn first_bbdown_auth_ticket(stdout: &str) -> Result<BbdownAuthTicket> {
+    parse_bbdown_auth_events(stdout)?
+        .into_iter()
+        .find_map(|event| match event {
+            BbdownAuthEvent::Ticket(ticket) => Some(ticket),
+            BbdownAuthEvent::Saved { .. } => None,
+        })
+        .ok_or_else(|| anyhow!("BBDown-rust auth output did not include a ticket event"))
+}
+
+pub fn bbdown_auth_saved_summary(stdout: &str) -> Result<BbdownCredentialSummary> {
+    parse_bbdown_auth_events(stdout)?
+        .into_iter()
+        .find_map(|event| match event {
+            BbdownAuthEvent::Saved { saved, .. } => Some(saved),
+            BbdownAuthEvent::Ticket(_) => None,
+        })
+        .ok_or_else(|| anyhow!("BBDown-rust auth output did not include a saved event"))
+}
+
+pub fn parse_bbdown_credential_health_report(stdout: &str) -> Result<BbdownCredentialHealthReport> {
+    serde_json::from_str(stdout.trim())
+        .context("failed to parse BBDown-rust credential health JSON")
 }
 
 pub async fn generate_login_qr(client: &Client) -> Result<LoginQr> {
@@ -382,28 +752,1823 @@ fn encode_cookie_value_for_bbdown(value: &str) -> String {
     value.replace(',', "%2C")
 }
 
+impl AuthMutationFileLock {
+    fn current_epoch(&self) -> Result<AuthEpoch> {
+        validate_auth_mutation_lock_binding(
+            &self.file,
+            &self.path,
+            &self.anchor_path,
+            &self.owner_path,
+        )?;
+        let value = read_auth_epoch(&self.file, &self.path)?;
+        let lock_owner = auth_mutation_lock_owner_for_file(&self.file)?;
+        validate_auth_mutation_lock_binding(
+            &self.file,
+            &self.path,
+            &self.anchor_path,
+            &self.owner_path,
+        )?;
+        Ok(AuthEpoch { value, lock_owner })
+    }
+
+    fn bump_epoch(&self) -> Result<AuthEpoch> {
+        validate_auth_mutation_lock_binding(
+            &self.file,
+            &self.path,
+            &self.anchor_path,
+            &self.owner_path,
+        )?;
+        let epoch = read_auth_epoch(&self.file, &self.path)?;
+        let next = epoch
+            .checked_add(1)
+            .context("BBDown auth epoch is exhausted")?;
+        write_auth_epoch_slot(&self.file, next)?;
+        sync_auth_lock_pair_parent(&self.path, &self.anchor_path, &self.file)?;
+        validate_auth_mutation_lock_binding(
+            &self.file,
+            &self.path,
+            &self.anchor_path,
+            &self.owner_path,
+        )?;
+        let persisted = read_auth_epoch(&self.file, &self.path)?;
+        if persisted != next {
+            bail!("BBDown auth epoch changed while persisting it")
+        }
+        Ok(AuthEpoch {
+            value: next,
+            lock_owner: auth_mutation_lock_owner_for_file(&self.file)?,
+        })
+    }
+
+    fn credential_file(&self) -> &Path {
+        self.credential_file.control_path()
+    }
+
+    fn credential_store_path(&self) -> Result<PathBuf> {
+        self.credential_file.store_path()
+    }
+}
+
+fn read_auth_epoch(file: &File, path: &Path) -> Result<u64> {
+    let slots = read_auth_epoch_slots(file)?;
+    match slots.as_slice() {
+        [] => read_auth_epoch_log(file, path).map(|(epoch, _, _)| epoch),
+        [epoch] => Ok(*epoch),
+        [first, second] => {
+            if first.abs_diff(*second) > 1 {
+                bail!("BBDown auth epoch slots disagree")
+            }
+            Ok((*first).max(*second))
+        }
+        _ => unreachable!("the epoch slot count is fixed"),
+    }
+}
+
+fn read_auth_epoch_slots(file: &File) -> Result<Vec<u64>> {
+    let file_len = file
+        .metadata()
+        .context("failed to inspect BBDown auth epoch slots")?
+        .len();
+    let mut epochs = Vec::new();
+    for index in 0..AUTH_EPOCH_SLOT_COUNT {
+        let offset = auth_epoch_slot_offset(index);
+        if file_len <= offset {
+            continue;
+        }
+        let mut reader = file
+            .try_clone()
+            .context("failed to clone BBDown auth lock for slot read")?;
+        reader
+            .seek(SeekFrom::Start(offset))
+            .context("failed to seek BBDown auth epoch slot")?;
+        let mut slot = [0_u8; AUTH_EPOCH_SLOT_SIZE];
+        let mut read = 0;
+        while read < slot.len() {
+            let count = reader
+                .read(&mut slot[read..])
+                .context("failed to read BBDown auth epoch slot")?;
+            if count == 0 {
+                break;
+            }
+            read += count;
+        }
+        if read == slot.len()
+            && let Some(epoch) = decode_auth_epoch_slot(&slot)
+        {
+            epochs.push(epoch);
+        }
+    }
+    epochs.sort_unstable();
+    epochs.dedup();
+    Ok(epochs)
+}
+
+fn write_auth_epoch_slot(file: &File, epoch: u64) -> Result<()> {
+    let index = (epoch as usize) % AUTH_EPOCH_SLOT_COUNT;
+    let mut writer = file
+        .try_clone()
+        .context("failed to clone BBDown auth lock for epoch update")?;
+    writer
+        .seek(SeekFrom::Start(auth_epoch_slot_offset(index)))
+        .context("failed to seek BBDown auth epoch slot")?;
+    writer
+        .write_all(&encode_auth_epoch_slot(epoch))
+        .context("failed to write BBDown auth epoch slot")?;
+    writer
+        .sync_all()
+        .context("failed to persist BBDown auth epoch slot")
+}
+
+fn auth_epoch_slot_offset(index: usize) -> u64 {
+    AUTH_EPOCH_LOG_LIMIT + (index * AUTH_EPOCH_SLOT_SIZE) as u64
+}
+
+fn encode_auth_epoch_slot(epoch: u64) -> [u8; AUTH_EPOCH_SLOT_SIZE] {
+    let mut half = [0_u8; AUTH_EPOCH_SLOT_SIZE / 2];
+    half[..8].copy_from_slice(AUTH_EPOCH_SLOT_MAGIC);
+    half[8..16].copy_from_slice(&epoch.to_le_bytes());
+    half[16..24].copy_from_slice(&(!epoch).to_le_bytes());
+    let checksum = auth_epoch_slot_checksum(&half[..24]);
+    half[24..32].copy_from_slice(&checksum.to_le_bytes());
+    let mut slot = [0_u8; AUTH_EPOCH_SLOT_SIZE];
+    slot[..half.len()].copy_from_slice(&half);
+    slot[half.len()..].copy_from_slice(&half);
+    slot
+}
+
+fn decode_auth_epoch_slot(slot: &[u8; AUTH_EPOCH_SLOT_SIZE]) -> Option<u64> {
+    let (first, second) = slot.split_at(AUTH_EPOCH_SLOT_SIZE / 2);
+    if first != second || &first[..8] != AUTH_EPOCH_SLOT_MAGIC {
+        return None;
+    }
+    let epoch = u64::from_le_bytes(first[8..16].try_into().ok()?);
+    let inverse = u64::from_le_bytes(first[16..24].try_into().ok()?);
+    let checksum = u64::from_le_bytes(first[24..32].try_into().ok()?);
+    if inverse != !epoch || checksum != auth_epoch_slot_checksum(&first[..24]) {
+        return None;
+    }
+    Some(epoch)
+}
+
+fn auth_epoch_slot_checksum(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn read_auth_epoch_log(file: &File, path: &Path) -> Result<(u64, u64, u64)> {
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("failed to inspect BBDown auth epoch {}", path.display()))?
+        .len();
+    let legacy_len = file_len.min(AUTH_EPOCH_LOG_LIMIT);
+    let mut reader = file
+        .try_clone()
+        .context("failed to clone BBDown auth lock for epoch read")?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("failed to seek BBDown auth epoch log")?;
+    let mut contents = Vec::with_capacity(legacy_len as usize);
+    reader
+        .take(legacy_len)
+        .read_to_end(&mut contents)
+        .context("failed to read BBDown auth epoch log")?;
+    let body_offset = if contents.starts_with(AUTH_LOCK_HEADER) {
+        AUTH_LOCK_HEADER.len()
+    } else {
+        0
+    };
+    let body = &contents[body_offset..];
+    let valid_len = body
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let complete =
+        std::str::from_utf8(&body[..valid_len]).context("BBDown auth epoch log is not UTF-8")?;
+    let mut epoch = 0_u64;
+    for line in complete.lines() {
+        let value = line
+            .parse::<u64>()
+            .context("BBDown auth epoch log contains an invalid record")?;
+        let expected = epoch
+            .checked_add(1)
+            .context("BBDown auth epoch is exhausted")?;
+        if value != expected {
+            bail!("BBDown auth epoch log is not consecutive")
+        }
+        epoch = value;
+    }
+    Ok((epoch, (body_offset + valid_len) as u64, file_len))
+}
+
+fn validate_existing_auth_lock_format(file: &File, path: &Path) -> Result<()> {
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("failed to inspect BBDown auth lock {}", path.display()))?
+        .len();
+    let maximum_len = AUTH_EPOCH_LOG_LIMIT + (AUTH_EPOCH_SLOT_SIZE * AUTH_EPOCH_SLOT_COUNT) as u64;
+    if file_len > maximum_len {
+        bail!(
+            "BBDown auth lock exceeds its format limit: {}",
+            path.display()
+        );
+    }
+
+    let prefix_len = file_len.min(AUTH_EPOCH_LOG_LIMIT);
+    let mut reader = file
+        .try_clone()
+        .context("failed to clone BBDown auth lock for format validation")?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("failed to seek BBDown auth lock for format validation")?;
+    let mut prefix = Vec::with_capacity(prefix_len as usize);
+    reader
+        .take(prefix_len)
+        .read_to_end(&mut prefix)
+        .context("failed to read BBDown auth lock for format validation")?;
+
+    if let Some(body) = prefix.strip_prefix(AUTH_LOCK_HEADER) {
+        if body.iter().any(|byte| *byte != 0) {
+            bail!("BBDown auth lock has invalid current-format padding");
+        }
+        read_auth_epoch(file, path)?;
+        return Ok(());
+    }
+
+    let slots = read_auth_epoch_slots(file)?;
+    let (legacy_epoch, valid_len, _) = read_auth_epoch_log(file, path)?;
+    let tail = &prefix[usize::try_from(valid_len).context("invalid auth lock length")?..];
+    let digit_len = tail
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(tail.len());
+    if tail[..digit_len].iter().any(|byte| !byte.is_ascii_digit())
+        || tail[digit_len..].iter().any(|byte| *byte != 0)
+    {
+        bail!("BBDown auth lock is not a recognized legacy epoch log");
+    }
+    if digit_len > 0 {
+        let partial = std::str::from_utf8(&tail[..digit_len])
+            .context("BBDown auth lock legacy tail is not UTF-8")?;
+        let expected = legacy_epoch
+            .checked_add(1)
+            .context("BBDown auth epoch is exhausted")?
+            .to_string();
+        if !expected.starts_with(partial) {
+            bail!("BBDown auth lock has an invalid partial legacy record");
+        }
+    }
+    if legacy_epoch == 0 && slots.is_empty() {
+        bail!("BBDown auth lock is not an initialized downloader lock");
+    }
+    read_auth_epoch(file, path)?;
+    Ok(())
+}
+
+fn initialize_auth_lock(file: &File, path: &Path) -> Result<()> {
+    let mut writer = file
+        .try_clone()
+        .context("failed to clone new BBDown auth lock")?;
+    writer
+        .seek(SeekFrom::Start(0))
+        .context("failed to seek new BBDown auth lock")?;
+    writer
+        .write_all(AUTH_LOCK_HEADER)
+        .context("failed to initialize BBDown auth lock")?;
+    writer
+        .sync_all()
+        .context("failed to persist new BBDown auth lock")?;
+    sync_auth_lock_parent(path, file)
+}
+
+#[cfg(unix)]
+fn sync_auth_lock_parent(path: &Path, expected_file: &File) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = fs::canonicalize(parent).with_context(|| {
+        format!(
+            "failed to resolve BBDown auth lock directory {}",
+            parent.display()
+        )
+    })?;
+    let directory = rustix::fs::open(
+        &canonical_parent,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
+    .with_context(|| {
+        format!(
+            "failed to open resolved BBDown auth lock directory {}",
+            canonical_parent.display()
+        )
+    })?;
+    let leaf = path
+        .file_name()
+        .context("BBDown auth lock path has no file name")?;
+    validate_auth_lock_in_bound_parent(&directory, leaf, expected_file, path, 1)?;
+    rustix::fs::fsync(&directory)
+        .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
+        .with_context(|| {
+            format!(
+                "failed to sync BBDown auth lock directory {}",
+                canonical_parent.display()
+            )
+        })?;
+    validate_auth_lock_in_bound_parent(&directory, leaf, expected_file, path, 1)
+}
+
+#[cfg(unix)]
+fn sync_auth_lock_pair_parent(path: &Path, anchor_path: &Path, expected_file: &File) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let anchor_parent = anchor_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = fs::canonicalize(parent).with_context(|| {
+        format!(
+            "failed to resolve BBDown auth lock directory {}",
+            parent.display()
+        )
+    })?;
+    let canonical_anchor_parent = fs::canonicalize(anchor_parent).with_context(|| {
+        format!(
+            "failed to resolve BBDown auth lock anchor directory {}",
+            anchor_parent.display()
+        )
+    })?;
+    if canonical_parent != canonical_anchor_parent {
+        bail!("BBDown auth lock aliases resolve to different directories");
+    }
+    let directory = rustix::fs::open(
+        &canonical_parent,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
+    .with_context(|| {
+        format!(
+            "failed to open resolved BBDown auth lock directory {}",
+            canonical_parent.display()
+        )
+    })?;
+    let leaf = path
+        .file_name()
+        .context("BBDown auth lock path has no file name")?;
+    let anchor_leaf = anchor_path
+        .file_name()
+        .context("BBDown auth lock anchor path has no file name")?;
+    validate_auth_lock_in_bound_parent(&directory, leaf, expected_file, path, 2)?;
+    validate_auth_lock_in_bound_parent(&directory, anchor_leaf, expected_file, anchor_path, 2)?;
+    rustix::fs::fsync(&directory)
+        .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
+        .with_context(|| {
+            format!(
+                "failed to sync BBDown auth lock directory {}",
+                canonical_parent.display()
+            )
+        })?;
+    validate_auth_lock_in_bound_parent(&directory, leaf, expected_file, path, 2)?;
+    validate_auth_lock_in_bound_parent(&directory, anchor_leaf, expected_file, anchor_path, 2)
+}
+
+#[cfg(unix)]
+fn validate_auth_lock_in_bound_parent(
+    directory: &impl std::os::fd::AsFd,
+    leaf: &std::ffi::OsStr,
+    expected_file: &File,
+    path: &Path,
+    expected_link_count: u16,
+) -> Result<()> {
+    // Protected property: the directory sync must cover the exact lock object already held by the
+    // caller. Device/inode bind that object; type, owner, mode, and link count bind its access
+    // policy. Content and timestamps may change while the epoch is intentionally updated.
+    let linked = rustix::fs::openat(
+        directory,
+        leaf,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
+    .with_context(|| format!("failed to open bound BBDown auth lock {}", path.display()))?;
+    let expected = rustix::fs::fstat(expected_file)
+        .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
+        .context("failed to inspect held BBDown auth lock")?;
+    let current = rustix::fs::fstat(&linked)
+        .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))
+        .context("failed to inspect bound BBDown auth lock")?;
+    if rustix::fs::FileType::from_raw_mode(expected.st_mode) != rustix::fs::FileType::RegularFile
+        || expected.st_dev != current.st_dev
+        || expected.st_ino != current.st_ino
+        || expected.st_uid != unsafe { libc::geteuid() }
+        || current.st_uid != expected.st_uid
+        || expected.st_mode & 0o777 != 0o600
+        || current.st_mode & 0o777 != 0o600
+        || expected.st_nlink != expected_link_count
+        || current.st_nlink != expected_link_count
+    {
+        bail!(
+            "BBDown auth lock identity or access policy changed while syncing: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_auth_lock_parent(path: &Path, _expected_file: &File) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = fs::canonicalize(parent).with_context(|| {
+        format!(
+            "failed to resolve BBDown auth lock directory {}",
+            parent.display()
+        )
+    })?;
+    File::open(&canonical_parent)
+        .with_context(|| {
+            format!(
+                "failed to open BBDown auth lock directory {}",
+                canonical_parent.display()
+            )
+        })?
+        .sync_all()
+        .with_context(|| {
+            format!(
+                "failed to sync BBDown auth lock directory {}",
+                canonical_parent.display()
+            )
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_auth_lock_pair_parent(path: &Path, anchor_path: &Path, expected_file: &File) -> Result<()> {
+    sync_auth_lock_parent(path, expected_file)?;
+    sync_auth_lock_parent(anchor_path, expected_file)
+}
+
+fn with_auth_mutation_lock<T>(
+    credential_file: &Path,
+    protected_paths: &[&Path],
+    operation: impl FnOnce(&AuthMutationFileLock) -> Result<T>,
+) -> Result<T> {
+    let _guard = AUTH_FILE_LOCK
+        .lock()
+        .expect("auth file lock should not poison");
+    let file_lock = acquire_auth_mutation_file_lock(credential_file, protected_paths)?;
+    operation(&file_lock)
+}
+
+pub fn recover_interrupted_auth_cleanup(
+    state_path: &Path,
+    credential_file: &Path,
+) -> Result<Vec<String>> {
+    let state = bind_auth_state_path_before_lock(state_path)?;
+    with_auth_mutation_lock(credential_file, &[state_path, credential_file], |lock| {
+        reconcile_interrupted_auth_cleanup_and_bump_epoch(
+            lock,
+            state.as_ref(),
+            lock.credential_file(),
+        )
+    })
+}
+
+fn reconcile_interrupted_auth_cleanup_and_bump_epoch(
+    lock: &AuthMutationFileLock,
+    state: Option<&BoundAuthStatePath>,
+    credential_file: &Path,
+) -> Result<Vec<String>> {
+    let mut messages = reconcile_interrupted_auth_cleanup_unlocked(state, credential_file)?;
+    if recover_pending_auth_logout_unlocked(lock, state, credential_file)? {
+        messages.push("Recovered interrupted BBDown logout".to_string());
+    }
+    if !messages.is_empty() {
+        lock.bump_epoch()?;
+    }
+    Ok(messages)
+}
+
+fn reconcile_interrupted_auth_cleanup_unlocked(
+    state: Option<&BoundAuthStatePath>,
+    credential_file: &Path,
+) -> Result<Vec<String>> {
+    let Some(state) = state else {
+        return Ok(Vec::new());
+    };
+    state.validate_root()?;
+
+    let mut messages = Vec::new();
+    let mut unresolved = false;
+    let mut restored = false;
+    // Protected property: auth recovery considers managed quarantine entries only in the
+    // exact directories where legacy state/config cleanup can create them. Rebinding the
+    // active credential for every candidate makes object identity the sole restore signal;
+    // unrelated sibling subtrees are outside this recovery authority.
+    let report = state
+        .root
+        .reconcile_remove_quarantines_in_current_directory_with_status_and_restore_decider(
+            |candidate| {
+                let current_credential = bind_cleanup_target(credential_file)?;
+                Ok(current_credential
+                    .as_ref()
+                    .map(BoundCleanupTarget::identity)
+                    == Some(candidate))
+            },
+        )?;
+    messages.extend(report.messages);
+    unresolved |= report.unresolved;
+    restored |= report.restored;
+
+    if let Some(config_dir) = bind_private_stale_bbdown_config_directory_from_state(state)? {
+        // Object identity alone is insufficient here: a mode or ownership change leaves the
+        // same directory object in place but expands who can choose recovery entries. Check the
+        // app-owned private access policy on both sides of descriptor-bound recovery.
+        config_dir.root.validate_private_bound_directory(
+            &config_dir.entry,
+            config_dir.identity,
+            0o700,
+        )?;
+        let report = config_dir
+            .root
+            .reconcile_remove_quarantines_in_bound_directory_with_status_and_restore_decider(
+                &config_dir.entry,
+                config_dir.identity,
+                |candidate| {
+                    let current_credential = bind_cleanup_target(credential_file)?;
+                    Ok(current_credential
+                        .as_ref()
+                        .map(BoundCleanupTarget::identity)
+                        == Some(candidate))
+                },
+            )?;
+        config_dir.root.validate_private_bound_directory(
+            &config_dir.entry,
+            config_dir.identity,
+            0o700,
+        )?;
+        messages.extend(report.messages);
+        unresolved |= report.unresolved;
+        restored |= report.restored;
+    }
+    if restored {
+        bail!(
+            "interrupted Bilibili auth cleanup restored a file that now aliases the active credential; resolve the configured auth paths before retrying"
+        );
+    }
+    if unresolved {
+        bail!(
+            "interrupted Bilibili auth cleanup could not be verified: {}",
+            messages.join("; ")
+        );
+    }
+    state.validate_root()?;
+    Ok(messages)
+}
+
+fn recover_pending_auth_logout_unlocked(
+    lock: &AuthMutationFileLock,
+    state: Option<&BoundAuthStatePath>,
+    credential_file: &Path,
+) -> Result<bool> {
+    let Some(intent) = load_auth_logout_intent(lock)? else {
+        return Ok(false);
+    };
+
+    // Protected property: a pending logout may only clear the profile selected by the same
+    // authenticated lock object that durably recorded the intent. The private, single-link
+    // intent file establishes the access policy; the lock-owner identity prevents a reused
+    // credential control pathname from authorizing cleanup in another lock domain.
+    let current_owner = lock.current_epoch()?.lock_owner;
+    if intent.intent.lock_owner != current_owner {
+        bail!("pending BBDown logout intent does not match the active credential lock");
+    }
+    if let Some(state) = state {
+        state.validate_root()?;
+    }
+    delete_auth_state_unlocked(state, credential_file)
+        .context("failed to resume legacy BBDown state cleanup for a pending logout")?;
+    let credential_file = lock.credential_store_path()?;
+    clear_bbdown_rust_credential_profile_unlocked(
+        &credential_file,
+        &intent.intent.credential_profile,
+    )
+    .context("failed to resume BBDown credential profile cleanup for a pending logout")?;
+    if let Some(state) = state {
+        state.validate_root()?;
+    }
+    remove_auth_logout_intent(intent)?;
+    Ok(true)
+}
+
+fn logout_intent_for_lock(
+    lock: &AuthMutationFileLock,
+    epoch: AuthEpoch,
+    credential_profile: Option<&str>,
+) -> Result<AuthLogoutIntent> {
+    let selection = bbdown_rust_profile_selection(credential_profile)?;
+    let credential_file = lock.credential_store_path()?;
+    let profile = match selection.profile_name() {
+        Some(profile) => profile.to_string(),
+        None => CredentialStore::new(credential_file)
+            .load_profiles()
+            .context("failed to resolve the default BBDown credential profile for logout")?
+            .default_profile
+            .clone(),
+    };
+    let current_owner = lock.current_epoch()?.lock_owner;
+    if epoch.lock_owner != current_owner {
+        bail!("BBDown credential lock changed while preparing logout intent");
+    }
+    Ok(AuthLogoutIntent {
+        version: AUTH_LOGOUT_INTENT_VERSION,
+        lock_owner: current_owner,
+        credential_profile: profile,
+    })
+}
+
+fn persist_auth_logout_intent(
+    lock: &AuthMutationFileLock,
+    epoch: AuthEpoch,
+    credential_profile: Option<&str>,
+) -> Result<AuthLogoutIntent> {
+    let expected = logout_intent_for_lock(lock, epoch, credential_profile)?;
+    let path = auth_logout_intent_path(lock.credential_file());
+    let (root, bound_path) = rooted_auth_lock_path(&path)?;
+    if let Some(file) = root.open_bound_file(&bound_path)? {
+        let entry = root.bind_entry(&bound_path, false)?;
+        if root.bound_entry_identity(&entry)? != Some(file.identity()) {
+            bail!("pending BBDown logout intent identity changed while binding");
+        }
+        let actual = parse_auth_logout_intent(&file, &bound_path)?;
+        if actual != expected {
+            bail!("pending BBDown logout intent does not match the requested logout");
+        }
+        return Ok(expected);
+    }
+
+    let contents =
+        serde_json::to_vec(&expected).context("failed to encode pending BBDown logout intent")?;
+    if contents.len() > AUTH_LOGOUT_INTENT_LIMIT {
+        bail!("pending BBDown logout intent exceeds its size limit");
+    }
+    root.create_new_bound_file(&bound_path, &contents, 0o600)
+        .context("failed to persist pending BBDown logout intent")?;
+    let Some(intent) = load_auth_logout_intent(lock)? else {
+        bail!("pending BBDown logout intent disappeared after creation");
+    };
+    if intent.intent != expected {
+        bail!("pending BBDown logout intent changed after creation");
+    }
+    Ok(expected)
+}
+
+fn clear_auth_logout_intent(
+    lock: &AuthMutationFileLock,
+    epoch: AuthEpoch,
+    expected: &AuthLogoutIntent,
+) -> Result<()> {
+    let current_owner = lock.current_epoch()?.lock_owner;
+    if epoch.lock_owner != current_owner || expected.lock_owner != current_owner {
+        bail!("BBDown credential lock changed while finalizing logout intent");
+    }
+    let intent = load_auth_logout_intent(lock)?
+        .context("pending BBDown logout intent disappeared before completion")?;
+    if intent.intent != *expected {
+        bail!("pending BBDown logout intent changed before completion");
+    }
+    remove_auth_logout_intent(intent)
+}
+
+fn load_auth_logout_intent(lock: &AuthMutationFileLock) -> Result<Option<BoundAuthLogoutIntent>> {
+    let path = auth_logout_intent_path(lock.credential_file());
+    let (root, bound_path) = rooted_auth_lock_path(&path)?;
+    let Some(file) = root.open_bound_file(&bound_path)? else {
+        return Ok(None);
+    };
+    let entry = root.bind_entry(&bound_path, false)?;
+    if root.bound_entry_identity(&entry)? != Some(file.identity()) {
+        bail!("pending BBDown logout intent identity changed while binding");
+    }
+    let intent = parse_auth_logout_intent(&file, &bound_path)?;
+    Ok(Some(BoundAuthLogoutIntent {
+        root,
+        entry,
+        file,
+        intent,
+    }))
+}
+
+fn parse_auth_logout_intent(file: &BoundFile, path: &Path) -> Result<AuthLogoutIntent> {
+    file.validate_private_single_link(0o600)?;
+    let intent =
+        serde_json::from_slice::<AuthLogoutIntent>(&file.read_limited(AUTH_LOGOUT_INTENT_LIMIT)?)
+            .with_context(|| {
+            format!(
+                "failed to parse pending BBDown logout intent {}",
+                path.display()
+            )
+        })?;
+    if intent.version != AUTH_LOGOUT_INTENT_VERSION {
+        bail!(
+            "unsupported pending BBDown logout intent version: {}",
+            intent.version
+        );
+    }
+    Ok(intent)
+}
+
+fn remove_auth_logout_intent(intent: BoundAuthLogoutIntent) -> Result<()> {
+    intent.file.validate_private_single_link(0o600)?;
+    if intent.root.bound_entry_identity(&intent.entry)? != Some(intent.file.identity()) {
+        bail!("pending BBDown logout intent identity changed before removal");
+    }
+    intent
+        .root
+        .remove_bound_file_if_identity(&intent.entry, intent.file.identity())
+        .context("failed to remove completed BBDown logout intent")
+}
+
+fn acquire_auth_mutation_file_lock(
+    credential_file: &Path,
+    protected_paths: &[&Path],
+) -> Result<AuthMutationFileLock> {
+    let configured_credential_file = credential_file;
+    let credential_file = bind_auth_credential_file(credential_file)?;
+    let [lock_path, anchor_path, owner_path, logout_intent_path] =
+        auth_mutation_control_paths(credential_file.control_path());
+    let protected_paths = normalize_auth_protected_paths(
+        configured_credential_file,
+        credential_file.control_path(),
+        protected_paths,
+    )?;
+    validate_auth_control_paths_are_distinct(
+        &protected_paths,
+        &[
+            lock_path.clone(),
+            anchor_path.clone(),
+            owner_path.clone(),
+            logout_intent_path,
+        ],
+    )?;
+
+    let owner_exists = load_auth_mutation_lock_owner(&owner_path)?.is_some();
+    if owner_exists
+        && !auth_mutation_lock_alias_exists(&lock_path)?
+        && !auth_mutation_lock_alias_exists(&anchor_path)?
+    {
+        bail!(
+            "BBDown auth lock aliases disappeared after initialization; refusing to reset the credential epoch"
+        );
+    }
+    let file = match open_existing_auth_mutation_lock(&anchor_path)? {
+        Some(file) => file,
+        None if owner_exists => open_existing_auth_mutation_lock(&lock_path)?.context(
+            "BBDown auth lock aliases disappeared after initialization; refusing to reset the credential epoch",
+        )?,
+        None => open_or_create_auth_mutation_lock(&lock_path)?,
+    };
+    wait_for_auth_mutation_file_lock(&file, &lock_path, AUTH_MUTATION_LOCK_WAIT_TIMEOUT)?;
+    validate_auth_mutation_lock_candidate(&file, &lock_path, &anchor_path)?;
+    if owner_exists {
+        let expected_owner = auth_mutation_lock_owner_for_file(&file)?;
+        let actual_owner = load_auth_mutation_lock_owner(&owner_path)?
+            .context("BBDown auth lock ownership record disappeared while locking")?;
+        if actual_owner != expected_owner {
+            bail!("BBDown auth lock ownership record does not match the active lock object");
+        }
+    }
+    let protected_path_refs = protected_paths
+        .iter()
+        .map(PathBuf::as_path)
+        .collect::<Vec<_>>();
+    validate_auth_mutation_lock_is_distinct(&file, &protected_path_refs, &lock_path)?;
+    validate_existing_auth_lock_format(&file, &lock_path)?;
+    set_auth_mutation_lock_private(&file, &lock_path)?;
+    ensure_auth_mutation_lock_aliases(&file, &lock_path, &anchor_path)?;
+    ensure_auth_mutation_lock_owner(&file, &owner_path)?;
+    validate_auth_mutation_lock_binding(&file, &lock_path, &anchor_path, &owner_path)?;
+    Ok(AuthMutationFileLock {
+        file,
+        path: lock_path,
+        anchor_path,
+        owner_path,
+        credential_file,
+    })
+}
+
+fn wait_for_auth_mutation_file_lock(file: &File, path: &Path, timeout: Duration) -> Result<()> {
+    let started_at = Instant::now();
+    loop {
+        match rustix::fs::flock(file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if std::io::Error::from_raw_os_error(error.raw_os_error()).kind()
+                    == std::io::ErrorKind::WouldBlock =>
+            {
+                let elapsed = started_at.elapsed();
+                if elapsed >= timeout {
+                    bail!(
+                        "timed out after {}ms waiting to lock BBDown auth state {}",
+                        timeout.as_millis(),
+                        path.display()
+                    );
+                }
+                std::thread::sleep(
+                    AUTH_MUTATION_LOCK_RETRY_INTERVAL.min(timeout.saturating_sub(elapsed)),
+                );
+            }
+            Err(error) => {
+                return Err(std::io::Error::from_raw_os_error(error.raw_os_error())).with_context(
+                    || format!("failed to lock BBDown auth state {}", path.display()),
+                );
+            }
+        }
+    }
+}
+
+fn bind_auth_credential_file(credential_file: &Path) -> Result<AuthCredentialFilePath> {
+    ensure_auth_credential_path_has_no_symlink_components(credential_file)?;
+    let parent = credential_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    create_private_dir_if_missing(parent).with_context(|| {
+        format!(
+            "failed to create BBDown credential directory {}",
+            parent.display()
+        )
+    })?;
+    let parent_path = canonical_non_symlink_directory(parent, "BBDown credential directory")?;
+    validate_auth_credential_directory_ancestry(&parent_path)?;
+    let leaf = credential_file
+        .file_name()
+        .context("BBDown credential file has no file name")?;
+    #[cfg(unix)]
+    {
+        let parent = open_auth_credential_directory(&parent_path)?;
+        let control_path = parent_path.join(leaf);
+        Ok(AuthCredentialFilePath {
+            control_path,
+            _parent: parent,
+            leaf: leaf.to_os_string(),
+        })
+    }
+    #[cfg(not(unix))]
+    Ok(AuthCredentialFilePath {
+        control_path: parent_path.join(leaf),
+    })
+}
+
+#[cfg(unix)]
+fn validate_auth_credential_directory_ancestry(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    // A path-only core store cannot preserve a directory descriptor. The required access policy
+    // therefore prevents another UID from renaming any reachable directory component. A sticky
+    // shared ancestor is safe below a private credential parent because another UID cannot remove
+    // or rename that current-user child. The direct parent must not be shared writable: before the
+    // credential leaf exists, another UID could otherwise create it first.
+    let current_uid = unsafe { libc::geteuid() };
+    let mut ancestor = Some(path);
+    while let Some(directory) = ancestor {
+        let metadata = fs::symlink_metadata(directory).with_context(|| {
+            format!(
+                "failed to inspect BBDown credential directory ancestor {}",
+                directory.display()
+            )
+        })?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            bail!(
+                "BBDown credential directory ancestor is not a real directory: {}",
+                directory.display()
+            );
+        }
+        let owner = metadata.uid();
+        if owner != current_uid && owner != 0 {
+            bail!(
+                "BBDown credential directory ancestor is not owned by the current user or root: {}",
+                directory.display()
+            );
+        }
+        let mode = metadata.mode();
+        let shared_write = mode & 0o022 != 0;
+        let sticky_protected =
+            directory != path && mode & 0o1000 != 0 && (owner == current_uid || owner == 0);
+        if shared_write && !sticky_protected {
+            bail!(
+                "BBDown credential directory ancestor permits another user to replace credentials: {}",
+                directory.display()
+            );
+        }
+        ancestor = directory.parent();
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_auth_credential_directory_ancestry(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_auth_credential_directory(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    let directory = options.open(path).with_context(|| {
+        format!(
+            "failed to open BBDown credential directory {}",
+            path.display()
+        )
+    })?;
+    if !directory
+        .metadata()
+        .context("failed to inspect opened BBDown credential directory")?
+        .is_dir()
+    {
+        bail!(
+            "BBDown credential directory is not a directory: {}",
+            path.display()
+        );
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn revalidated_path_for_open_directory(directory: &File, path: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let reopened = open_auth_credential_directory(path)?;
+    let expected = directory
+        .metadata()
+        .context("failed to inspect held BBDown credential directory")?;
+    let actual = reopened
+        .metadata()
+        .context("failed to inspect BBDown credential directory resolved from its descriptor")?;
+    if expected.dev() != actual.dev() || expected.ino() != actual.ino() {
+        bail!("BBDown credential directory identity changed while resolving its bound path");
+    }
+    Ok(path.to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_path_for_open_directory(directory: &File) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let path = rustix::fs::getpath(directory)
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+        .context("failed to resolve the held BBDown credential directory")?;
+    let path = PathBuf::from(OsString::from_vec(path.as_bytes().to_vec()));
+    revalidated_path_for_open_directory(directory, &path)
+}
+
+fn canonical_non_symlink_directory(path: &Path, label: &str) -> Result<PathBuf> {
+    let absolute = absolute_auth_cleanup_path(path)?;
+    // Protected property: auth mutations must stay in the directory selected when the lock is
+    // acquired. Resolve ancestors once to a canonical path, but reject a configurable final
+    // parent symlink because it is the direct, retargetable credential-store selector.
+    let metadata = fs::symlink_metadata(&absolute)
+        .with_context(|| format!("failed to inspect {label} {}", absolute.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "{label} must not resolve through a symbolic link: {}",
+            absolute.display()
+        );
+    }
+    let metadata = fs::metadata(&absolute)
+        .with_context(|| format!("failed to inspect {label} {}", absolute.display()))?;
+    if !metadata.is_dir() {
+        bail!("{label} is not a directory: {}", absolute.display());
+    }
+    fs::canonicalize(&absolute)
+        .with_context(|| format!("failed to resolve {label} {}", absolute.display()))
+}
+
+fn normalize_auth_protected_paths(
+    configured_credential_file: &Path,
+    bound_credential_file: &Path,
+    protected_paths: &[&Path],
+) -> Result<Vec<PathBuf>> {
+    let normalized_configured_credential =
+        normalize_auth_path_for_control_comparison(configured_credential_file)?;
+    protected_paths
+        .iter()
+        .map(|path| {
+            let normalized = normalize_auth_path_for_control_comparison(path)?;
+            if normalized == normalized_configured_credential {
+                Ok(bound_credential_file.to_path_buf())
+            } else {
+                Ok(normalized)
+            }
+        })
+        .collect()
+}
+
+fn normalize_auth_path_for_control_comparison(path: &Path) -> Result<PathBuf> {
+    let absolute = absolute_auth_cleanup_path(path)?;
+    let mut ancestor = absolute.clone();
+    let mut missing = Vec::new();
+    loop {
+        match fs::canonicalize(&ancestor) {
+            Ok(mut canonical) => {
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(lexically_normalize_auth_path(&canonical));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let name = ancestor.file_name().with_context(|| {
+                    format!(
+                        "failed to find an existing ancestor for BBDown auth path {}",
+                        path.display()
+                    )
+                })?;
+                missing.push(name.to_os_string());
+                ancestor.pop();
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to resolve BBDown auth path for comparison: {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+}
+
+fn lexically_normalize_auth_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(name) => normalized.push(name),
+        }
+    }
+    normalized
+}
+
+fn validate_auth_control_paths_are_distinct(
+    protected_paths: &[PathBuf],
+    control_paths: &[PathBuf],
+) -> Result<()> {
+    // Protected property: auth state and credentials must never designate a lock, anchor, or
+    // owner object. Normalized paths catch lexical and symlink-parent aliases before creation;
+    // device/inode equality catches an existing hard-link alias of an established control file.
+    for protected_path in protected_paths {
+        for control_path in control_paths {
+            if protected_path == control_path
+                || existing_auth_paths_share_identity(protected_path, control_path)?
+            {
+                bail!(
+                    "BBDown auth lock control path conflicts with an auth data file: {}",
+                    protected_path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn existing_auth_paths_share_identity(first: &Path, second: &Path) -> Result<bool> {
+    let first = match fs::metadata(first) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to inspect BBDown auth data path {}",
+                    first.display()
+                )
+            });
+        }
+    };
+    let second = match fs::metadata(second) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to inspect BBDown auth control path {}",
+                    second.display()
+                )
+            });
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(first.dev() == second.dev() && first.ino() == second.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (first, second);
+        Ok(false)
+    }
+}
+
+fn open_or_create_auth_mutation_lock(path: &Path) -> Result<File> {
+    for _ in 0..3 {
+        if let Some(file) = create_initialized_auth_lock(path)? {
+            return Ok(file);
+        }
+
+        if let Some(file) = open_existing_auth_mutation_lock(path)? {
+            return Ok(file);
+        }
+    }
+    bail!(
+        "BBDown auth lock kept changing while opening: {}",
+        path.display()
+    )
+}
+
+fn open_existing_auth_mutation_lock(path: &Path) -> Result<Option<File>> {
+    let mut existing = OpenOptions::new();
+    existing.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        existing.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    match existing.open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to open BBDown auth lock {}", path.display()))
+        }
+    }
+}
+
+fn auth_mutation_lock_alias_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed to inspect BBDown auth lock alias {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+fn create_initialized_auth_lock(path: &Path) -> Result<Option<File>> {
+    let temp_path = temp_state_path(path);
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let file = options.open(&temp_path).with_context(|| {
+        format!(
+            "failed to create temporary BBDown auth lock {}",
+            temp_path.display()
+        )
+    })?;
+    if let Err(err) = initialize_auth_lock(&file, &temp_path) {
+        let cleanup = fs::remove_file(&temp_path);
+        return match cleanup {
+            Ok(()) => Err(err),
+            Err(cleanup) => Err(err.context(format!(
+                "failed to remove temporary BBDown auth lock: {cleanup}"
+            ))),
+        };
+    }
+
+    match install_auth_lock_noreplace(&temp_path, path) {
+        Ok(true) => {
+            sync_auth_lock_parent(path, &file)?;
+            Ok(Some(file))
+        }
+        Ok(false) => {
+            fs::remove_file(&temp_path).with_context(|| {
+                format!(
+                    "failed to remove unused temporary BBDown auth lock {}",
+                    temp_path.display()
+                )
+            })?;
+            Ok(None)
+        }
+        Err(err) => {
+            let cleanup = fs::remove_file(&temp_path);
+            match cleanup {
+                Ok(()) => Err(err),
+                Err(cleanup) => Err(err.context(format!(
+                    "failed to remove temporary BBDown auth lock: {cleanup}"
+                ))),
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "linux"))]
+fn install_auth_lock_noreplace(source: &Path, destination: &Path) -> Result<bool> {
+    match rustix::fs::renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(true),
+        Err(err) if err == rustix::io::Errno::EXIST => Ok(false),
+        Err(err) => Err(std::io::Error::from_raw_os_error(err.raw_os_error()))
+            .context("failed to atomically install BBDown auth lock"),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+fn install_auth_lock_noreplace(source: &Path, destination: &Path) -> Result<bool> {
+    match fs::hard_link(source, destination) {
+        Ok(()) => {
+            fs::remove_file(source).context("failed to unlink temporary BBDown auth lock")?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(err).context("failed to install BBDown auth lock without replacement"),
+    }
+}
+
+pub fn acquire_auth_reply_file_lock(
+    state_path: &Path,
+    credential_file: &Path,
+) -> Result<AuthReplyFileLock> {
+    let state = bind_auth_state_path_before_lock(state_path)?;
+    let lock = acquire_auth_mutation_file_lock(credential_file, &[state_path, credential_file])?;
+    reconcile_interrupted_auth_cleanup_and_bump_epoch(
+        &lock,
+        state.as_ref(),
+        lock.credential_file(),
+    )?;
+    Ok(AuthReplyFileLock { lock })
+}
+
+pub fn with_auth_mutation_transaction<T>(
+    state_path: &Path,
+    credential_file: &Path,
+    operation: impl for<'a> FnOnce(&LockedAuthMutation<'a>) -> Result<T>,
+) -> Result<(T, AuthEpoch)> {
+    with_auth_mutation_transaction_inner(state_path, credential_file, None, operation)
+}
+
+pub fn with_auth_mutation_transaction_at_epoch<T>(
+    state_path: &Path,
+    credential_file: &Path,
+    expected_epoch: AuthEpoch,
+    operation: impl for<'a> FnOnce(&LockedAuthMutation<'a>) -> Result<T>,
+) -> Result<(T, AuthEpoch)> {
+    with_auth_mutation_transaction_inner(
+        state_path,
+        credential_file,
+        Some(expected_epoch),
+        operation,
+    )
+}
+
+fn with_auth_mutation_transaction_inner<T>(
+    state_path: &Path,
+    credential_file: &Path,
+    expected_epoch: Option<AuthEpoch>,
+    operation: impl for<'a> FnOnce(&LockedAuthMutation<'a>) -> Result<T>,
+) -> Result<(T, AuthEpoch)> {
+    let state = bind_auth_state_path_before_lock(state_path)?;
+    with_auth_mutation_lock(credential_file, &[state_path, credential_file], |lock| {
+        reconcile_interrupted_auth_cleanup_and_bump_epoch(
+            lock,
+            state.as_ref(),
+            lock.credential_file(),
+        )?;
+        if let Some(expected_epoch) = expected_epoch {
+            let current_epoch = lock.current_epoch()?;
+            if current_epoch != expected_epoch {
+                bail!(
+                    "BBDown credential state changed while login was pending (expected epoch {}, current epoch {})",
+                    expected_epoch.value(),
+                    current_epoch.value()
+                );
+            }
+        }
+        let epoch = lock.bump_epoch()?;
+        let transaction = LockedAuthMutation {
+            state: state.as_ref(),
+            credential_file: &lock.credential_file,
+            credential_control_path: lock.credential_file(),
+            _lock: lock,
+            epoch,
+        };
+        operation(&transaction).map(|result| (result, epoch))
+    })
+}
+
+#[cfg(unix)]
+fn validate_auth_mutation_lock_is_distinct(
+    file: &File,
+    protected_paths: &[&Path],
+    lock_path: &Path,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let lock = file
+        .metadata()
+        .with_context(|| format!("failed to inspect BBDown auth lock {}", lock_path.display()))?;
+    for path in protected_paths {
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to inspect auth data file {}", path.display())
+                });
+            }
+        };
+        if lock.dev() == metadata.dev() && lock.ino() == metadata.ino() {
+            bail!(
+                "BBDown auth lock aliases an auth data file: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_auth_mutation_lock_is_distinct(
+    _file: &File,
+    _protected_paths: &[&Path],
+    _lock_path: &Path,
+) -> Result<()> {
+    Ok(())
+}
+
+fn rooted_auth_lock_path(path: &Path) -> Result<(RootedFs, PathBuf)> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = fs::canonicalize(parent).with_context(|| {
+        format!(
+            "failed to resolve BBDown auth lock directory {}",
+            parent.display()
+        )
+    })?;
+    let leaf = path
+        .file_name()
+        .context("BBDown auth lock control path has no file name")?;
+    let root = RootedFs::new(&canonical_parent)?;
+    Ok((root, canonical_parent.join(leaf)))
+}
+
+fn load_auth_mutation_lock_owner(path: &Path) -> Result<Option<AuthMutationLockOwner>> {
+    let (root, bound_path) = rooted_auth_lock_path(path)?;
+    let Some(file) = root.open_bound_file(&bound_path)? else {
+        return Ok(None);
+    };
+    file.validate_private_single_link(0o600)?;
+    let owner = serde_json::from_slice::<AuthMutationLockOwner>(
+        &file.read_limited(AUTH_MUTATION_LOCK_OWNER_LIMIT)?,
+    )
+    .with_context(|| {
+        format!(
+            "failed to parse BBDown auth lock ownership record {}",
+            path.display()
+        )
+    })?;
+    if owner.version != AUTH_MUTATION_LOCK_OWNER_VERSION {
+        bail!(
+            "unsupported BBDown auth lock ownership record version: {}",
+            owner.version
+        );
+    }
+    if root.entry_identity(&bound_path)? != Some(file.identity()) {
+        bail!("BBDown auth lock ownership record identity changed");
+    }
+    Ok(Some(owner))
+}
+
+fn ensure_auth_mutation_lock_owner(file: &File, owner_path: &Path) -> Result<()> {
+    let expected = auth_mutation_lock_owner_for_file(file)?;
+    if let Some(actual) = load_auth_mutation_lock_owner(owner_path)? {
+        if actual != expected {
+            bail!("BBDown auth lock ownership record does not match the active lock object");
+        }
+        return Ok(());
+    }
+
+    let contents = serde_json::to_vec(&expected)
+        .context("failed to encode BBDown auth lock ownership record")?;
+    let (root, bound_path) = rooted_auth_lock_path(owner_path)?;
+    root.create_new_bound_file(&bound_path, &contents, 0o600)
+        .context("failed to create BBDown auth lock ownership record")?;
+    let actual = load_auth_mutation_lock_owner(owner_path)?
+        .context("BBDown auth lock ownership record disappeared after creation")?;
+    if actual != expected {
+        bail!("BBDown auth lock ownership record changed after creation");
+    }
+    Ok(())
+}
+
+fn validate_auth_mutation_lock_binding(
+    file: &File,
+    path: &Path,
+    anchor_path: &Path,
+    owner_path: &Path,
+) -> Result<()> {
+    validate_auth_mutation_lock_identity(file, path, anchor_path)?;
+    let expected = auth_mutation_lock_owner_for_file(file)?;
+    let actual = load_auth_mutation_lock_owner(owner_path)?
+        .context("BBDown auth lock ownership record disappeared")?;
+    if actual != expected {
+        bail!("BBDown auth lock ownership record does not match the active lock object");
+    }
+    validate_auth_mutation_lock_identity(file, path, anchor_path)
+}
+
+#[cfg(unix)]
+fn auth_mutation_lock_owner_for_file(file: &File) -> Result<AuthMutationLockOwner> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .context("failed to inspect held BBDown auth lock")?;
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+        bail!("BBDown auth lock object or ownership changed");
+    }
+    Ok(AuthMutationLockOwner {
+        version: AUTH_MUTATION_LOCK_OWNER_VERSION,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn auth_mutation_lock_owner_for_file(file: &File) -> Result<AuthMutationLockOwner> {
+    if !file
+        .metadata()
+        .context("failed to inspect held BBDown auth lock")?
+        .is_file()
+    {
+        bail!("BBDown auth lock is not a regular file");
+    }
+    Ok(AuthMutationLockOwner {
+        version: AUTH_MUTATION_LOCK_OWNER_VERSION,
+        device: 0,
+        inode: 0,
+    })
+}
+
+#[cfg(unix)]
+fn validate_auth_mutation_lock_candidate(
+    file: &File,
+    path: &Path,
+    anchor_path: &Path,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let opened = file
+        .metadata()
+        .with_context(|| format!("failed to inspect BBDown auth lock {}", path.display()))?;
+    if !opened.is_file() || opened.uid() != unsafe { libc::geteuid() } {
+        bail!(
+            "BBDown auth lock path or ownership changed while locking: {}",
+            path.display()
+        );
+    }
+    let linked_count = [path, anchor_path]
+        .into_iter()
+        .map(|candidate| auth_mutation_lock_path_matches(&opened, candidate))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|matches| *matches)
+        .count() as u64;
+    if linked_count == 0 {
+        bail!("BBDown auth lock aliases disappeared while locking");
+    }
+    if opened.nlink() != linked_count {
+        bail!("BBDown auth lock has hard-link aliases: {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn auth_mutation_lock_path_matches(opened: &std::fs::Metadata, candidate: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let linked = match fs::symlink_metadata(candidate) {
+        Ok(linked) => linked,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to revalidate BBDown auth lock alias {}",
+                    candidate.display()
+                )
+            });
+        }
+    };
+    if !linked.file_type().is_file()
+        || opened.dev() != linked.dev()
+        || opened.ino() != linked.ino()
+        || linked.uid() != unsafe { libc::geteuid() }
+    {
+        bail!(
+            "BBDown auth lock path or ownership changed while locking: {}",
+            candidate.display()
+        );
+    }
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn ensure_auth_mutation_lock_aliases(file: &File, path: &Path, anchor_path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    validate_auth_mutation_lock_candidate(file, path, anchor_path)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let anchor_parent = anchor_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = fs::canonicalize(parent).with_context(|| {
+        format!(
+            "failed to resolve BBDown auth lock directory {}",
+            parent.display()
+        )
+    })?;
+    if fs::canonicalize(anchor_parent).with_context(|| {
+        format!(
+            "failed to resolve BBDown auth lock anchor directory {}",
+            anchor_parent.display()
+        )
+    })? != canonical_parent
+    {
+        bail!("BBDown auth lock aliases resolve to different directories");
+    }
+
+    let root = RootedFs::new(&canonical_parent)?;
+    let primary_bound_path = canonical_parent.join(
+        path.file_name()
+            .context("BBDown auth lock path has no file name")?,
+    );
+    let anchor_bound_path = canonical_parent.join(
+        anchor_path
+            .file_name()
+            .context("BBDown auth lock anchor path has no file name")?,
+    );
+    let primary_entry = root.bind_entry(&primary_bound_path, false)?;
+    let anchor_entry = root.bind_entry(&anchor_bound_path, false)?;
+    let primary_identity = root.bound_entry_identity(&primary_entry)?;
+    let anchor_identity = root.bound_entry_identity(&anchor_entry)?;
+    let metadata = file
+        .metadata()
+        .context("failed to inspect held BBDown auth lock")?;
+    let matches_file = |identity: EntryIdentity| {
+        identity.is_file()
+            && identity.device() == metadata.dev()
+            && identity.inode() == metadata.ino()
+    };
+    let expected = primary_identity
+        .or(anchor_identity)
+        .filter(|identity| matches_file(*identity))
+        .context("BBDown auth lock aliases disappeared during anchor validation")?;
+    if primary_identity.is_some_and(|identity| identity != expected)
+        || anchor_identity.is_some_and(|identity| identity != expected)
+    {
+        bail!("BBDown auth lock alias identity changed during anchor validation");
+    }
+
+    match (primary_identity, anchor_identity) {
+        (Some(_), Some(_)) => {}
+        (Some(_), None) => root.ensure_hard_link_via_bound_parents_if_identity(
+            &primary_entry,
+            &anchor_entry,
+            expected,
+        )?,
+        (None, Some(_)) => root.ensure_hard_link_via_bound_parents_if_identity(
+            &anchor_entry,
+            &primary_entry,
+            expected,
+        )?,
+        (None, None) => bail!("BBDown auth lock aliases disappeared during anchor installation"),
+    }
+    validate_auth_mutation_lock_identity(file, path, anchor_path)?;
+    sync_auth_lock_pair_parent(path, anchor_path, file)?;
+    validate_auth_mutation_lock_identity(file, path, anchor_path)
+}
+
+#[cfg(unix)]
+fn validate_auth_mutation_lock_identity(
+    file: &File,
+    path: &Path,
+    anchor_path: &Path,
+) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    validate_auth_mutation_lock_candidate(file, path, anchor_path)?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("failed to inspect BBDown auth lock {}", path.display()))?;
+    if opened.nlink() != 2 || opened.permissions().mode() & 0o777 != 0o600 {
+        bail!("BBDown auth lock anchor or access policy changed");
+    }
+    if !auth_mutation_lock_path_matches(&opened, path)?
+        || !auth_mutation_lock_path_matches(&opened, anchor_path)?
+    {
+        bail!("BBDown auth lock anchor disappeared");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_auth_mutation_lock_candidate(
+    file: &File,
+    path: &Path,
+    anchor_path: &Path,
+) -> Result<()> {
+    if !file
+        .metadata()
+        .with_context(|| format!("failed to inspect BBDown auth lock {}", path.display()))?
+        .is_file()
+        || (!path.is_file() && !anchor_path.is_file())
+    {
+        bail!("BBDown auth lock is not a regular file: {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_auth_mutation_lock_aliases(file: &File, path: &Path, anchor_path: &Path) -> Result<()> {
+    validate_auth_mutation_lock_candidate(file, path, anchor_path)?;
+    match (path.exists(), anchor_path.exists()) {
+        (true, false) => {
+            fs::hard_link(path, anchor_path).context("failed to create BBDown auth lock anchor")?
+        }
+        (false, true) => {
+            fs::hard_link(anchor_path, path).context("failed to restore BBDown auth lock path")?
+        }
+        (true, true) => {}
+        (false, false) => bail!("BBDown auth lock aliases disappeared"),
+    }
+    sync_auth_lock_pair_parent(path, anchor_path, file)
+}
+
+#[cfg(not(unix))]
+fn validate_auth_mutation_lock_identity(
+    file: &File,
+    path: &Path,
+    anchor_path: &Path,
+) -> Result<()> {
+    validate_auth_mutation_lock_candidate(file, path, anchor_path)?;
+    if !path.is_file() || !anchor_path.is_file() {
+        bail!("BBDown auth lock anchor disappeared");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_auth_mutation_lock_private(file: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect BBDown auth lock {}", path.display()))?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o600);
+    file.set_permissions(permissions)
+        .with_context(|| format!("failed to protect BBDown auth lock {}", path.display()))?;
+    let mode = file
+        .metadata()
+        .with_context(|| format!("failed to recheck BBDown auth lock {}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode != 0o600 {
+        bail!(
+            "BBDown auth lock permissions are not private: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_auth_mutation_lock_private(_file: &File, _path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn auth_mutation_lock_path(credential_file: &Path) -> PathBuf {
+    let mut value = credential_file.as_os_str().to_os_string();
+    value.push(AUTH_MUTATION_LOCK_SUFFIX);
+    PathBuf::from(value)
+}
+
+pub(crate) fn auth_mutation_control_paths(credential_file: &Path) -> [PathBuf; 4] {
+    let lock_path = auth_mutation_lock_path(credential_file);
+    [
+        lock_path.clone(),
+        auth_mutation_lock_anchor_path(credential_file),
+        auth_mutation_lock_owner_path(credential_file),
+        auth_logout_intent_path(credential_file),
+    ]
+}
+
+fn auth_mutation_lock_anchor_path(credential_file: &Path) -> PathBuf {
+    let mut value = auth_mutation_lock_path(credential_file).into_os_string();
+    value.push(AUTH_MUTATION_LOCK_ANCHOR_SUFFIX);
+    PathBuf::from(value)
+}
+
+fn auth_mutation_lock_owner_path(credential_file: &Path) -> PathBuf {
+    let mut value = credential_file.as_os_str().to_os_string();
+    value.push(AUTH_MUTATION_LOCK_OWNER_SUFFIX);
+    PathBuf::from(value)
+}
+
+fn auth_logout_intent_path(credential_file: &Path) -> PathBuf {
+    let mut value = credential_file.as_os_str().to_os_string();
+    value.push(AUTH_LOGOUT_INTENT_SUFFIX);
+    PathBuf::from(value)
+}
+
 pub fn load_auth_state(path: &Path) -> Result<Option<AuthState>> {
     let _guard = AUTH_FILE_LOCK
         .lock()
         .expect("auth file lock should not poison");
+    ensure_auth_state_path_has_no_symlink_components(path)?;
     load_auth_state_unlocked(path)
 }
 
 fn load_auth_state_unlocked(path: &Path) -> Result<Option<AuthState>> {
-    match fs::read(path) {
-        Ok(content) => serde_json::from_slice(&content)
-            .with_context(|| format!("failed to parse Bilibili auth state {}", path.display()))
-            .map(Some),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err)
-            .with_context(|| format!("failed to read Bilibili auth state {}", path.display())),
-    }
+    let Some(state) = bind_auth_state_path_before_lock(path)? else {
+        return Ok(None);
+    };
+    load_bound_auth_state_unlocked(&state)
+}
+
+fn load_bound_auth_state_unlocked(state: &BoundAuthStatePath) -> Result<Option<AuthState>> {
+    state.validate_root()?;
+    let Some(file) = state.root.open_bound_file(state.path()).with_context(|| {
+        format!(
+            "failed to read Bilibili auth state {}",
+            state.path().display()
+        )
+    })?
+    else {
+        state.validate_root()?;
+        return Ok(None);
+    };
+    // Protected property: only an app-owned legacy state object may populate the durable
+    // credential store. The bound descriptor holds object identity through the read; its mode,
+    // owner, and single link establish the access policy. Binding only the parent directory would
+    // not prove that the selected state leaf was created by the current user.
+    file.validate_private_single_link(0o600)
+        .context("Bilibili auth state must be a current-user-owned private single-link file")?;
+    let contents = file.read_limited(AUTH_STATE_FILE_LIMIT)?;
+    state.validate_root()?;
+    serde_json::from_slice(&contents)
+        .with_context(|| {
+            format!(
+                "failed to parse Bilibili auth state {}",
+                state.path().display()
+            )
+        })
+        .map(Some)
 }
 
 pub fn save_auth_state(path: &Path, state: &AuthState) -> Result<()> {
     let _guard = AUTH_FILE_LOCK
         .lock()
         .expect("auth file lock should not poison");
+    ensure_auth_state_path_has_no_symlink_components(path)?;
     save_auth_state_unlocked(path, state)
 }
 
@@ -444,48 +2609,369 @@ fn save_auth_state_unlocked(path: &Path, state: &AuthState) -> Result<()> {
     Ok(())
 }
 
-pub fn delete_auth_state(path: &Path) -> Result<bool> {
-    let _guard = AUTH_FILE_LOCK
-        .lock()
-        .expect("auth file lock should not poison");
-    let config_path = bbdown_config_path(path);
-    let legacy_config_path = legacy_bbdown_config_path(path);
-    let mut removed = false;
-    match fs::remove_file(path) {
-        Ok(()) => removed = true,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!("failed to delete Bilibili auth state {}", path.display())
-            });
-        }
-    }
+pub fn delete_auth_state(path: &Path, credential_file: &Path) -> Result<bool> {
+    with_auth_mutation_transaction(path, credential_file, |transaction| {
+        transaction.delete_legacy_state()
+    })
+    .map(|(removed, _)| removed)
+}
 
-    for path in [config_path, legacy_config_path] {
-        match fs::remove_file(&path) {
-            Ok(()) => removed = true,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("failed to delete BBDown auth config {}", path.display())
-                });
-            }
-        }
-    }
-    if cleanup_stale_bbdown_config_files_unlocked(path)? {
+fn delete_auth_state_unlocked(
+    state: Option<&BoundAuthStatePath>,
+    credential_file: &Path,
+) -> Result<bool> {
+    let Some(state) = state else {
+        return Ok(false);
+    };
+    state.validate_root()?;
+    let mut removed = false;
+    if remove_bound_state_file_if_exists(state, state.path(), credential_file).with_context(
+        || {
+            format!(
+                "failed to delete Bilibili auth state {}",
+                state.path().display()
+            )
+        },
+    )? {
         removed = true;
     }
 
+    for path in [state.config_path(), state.legacy_config_path()] {
+        if remove_bound_state_file_if_exists(state, &path, credential_file)
+            .with_context(|| format!("failed to delete BBDown auth config {}", path.display()))?
+        {
+            removed = true;
+        }
+    }
+    if cleanup_stale_bbdown_config_files_from_bound_state_unlocked(state, credential_file)? {
+        removed = true;
+    }
+
+    state.validate_root()?;
     Ok(removed)
 }
 
+pub fn sync_bbdown_rust_credentials_from_state(
+    state_path: &Path,
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+) -> Result<bool> {
+    let (result, _) = sync_bbdown_rust_credentials_from_state_with_epoch_and_hook(
+        state_path,
+        credential_file,
+        credential_profile,
+        || {},
+    )?;
+    result
+}
+
+pub fn sync_bbdown_rust_credentials_from_state_with_epoch(
+    state_path: &Path,
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+) -> Result<(Result<bool>, AuthEpoch)> {
+    sync_bbdown_rust_credentials_from_state_with_epoch_and_hook(
+        state_path,
+        credential_file,
+        credential_profile,
+        || {},
+    )
+}
+
+fn sync_bbdown_rust_credentials_from_state_with_hook(
+    state_path: &Path,
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+    after_legacy_read: impl FnOnce(),
+) -> Result<bool> {
+    let (result, _) = sync_bbdown_rust_credentials_from_state_with_epoch_and_hook(
+        state_path,
+        credential_file,
+        credential_profile,
+        after_legacy_read,
+    )?;
+    result
+}
+
+fn sync_bbdown_rust_credentials_from_state_with_epoch_and_hook(
+    state_path: &Path,
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+    after_legacy_read: impl FnOnce(),
+) -> Result<(Result<bool>, AuthEpoch)> {
+    sync_bbdown_rust_credentials_from_state_with_epoch_and_hooks(
+        state_path,
+        credential_file,
+        credential_profile,
+        || {},
+        after_legacy_read,
+    )
+}
+
+fn sync_bbdown_rust_credentials_from_state_with_epoch_and_hooks(
+    state_path: &Path,
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+    before_lock: impl FnOnce(),
+    after_legacy_read: impl FnOnce(),
+) -> Result<(Result<bool>, AuthEpoch)> {
+    let state = bind_auth_state_path_before_lock(state_path)?;
+    before_lock();
+    with_auth_mutation_lock(credential_file, &[state_path, credential_file], |lock| {
+        reconcile_interrupted_auth_cleanup_and_bump_epoch(
+            lock,
+            state.as_ref(),
+            lock.credential_file(),
+        )?;
+        let credential_file = lock.credential_store_path()?;
+        let current_epoch = lock.current_epoch()?;
+        let cookie = match legacy_cookie_from_state_unlocked(state.as_ref()) {
+            Ok(Some(cookie)) => cookie,
+            Ok(None) => return Ok((Ok(false), current_epoch)),
+            Err(err) => return Ok((Err(err), current_epoch)),
+        };
+        let update_needed = match bbdown_rust_cookie_update_needed_unlocked(
+            &credential_file,
+            credential_profile,
+            Some(&cookie),
+            false,
+        ) {
+            Ok(update_needed) => update_needed,
+            Err(err) => return Ok((Err(err), current_epoch)),
+        };
+        if !update_needed {
+            return Ok((Ok(false), current_epoch));
+        }
+        if let Some(state) = state.as_ref() {
+            state.validate_root()?;
+        }
+        after_legacy_read();
+        let epoch = lock.bump_epoch()?;
+        let result = update_bbdown_rust_cookie_unlocked(
+            &credential_file,
+            credential_profile,
+            Some(&cookie),
+            false,
+        );
+        if let Some(state) = state.as_ref() {
+            state.validate_root()?;
+        }
+        Ok((result, epoch))
+    })
+}
+
+fn bbdown_rust_cookie_update_needed_unlocked(
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+    cookie: Option<&str>,
+    overwrite_existing: bool,
+) -> Result<bool> {
+    let selection = bbdown_rust_profile_selection(credential_profile)?;
+    let credentials =
+        CredentialStore::new(credential_file.to_path_buf()).load_selected_profile(&selection)?;
+    let current_cookie = credentials.cookie.as_deref().unwrap_or_default().trim();
+    if cookie.is_some() && !current_cookie.is_empty() && !overwrite_existing {
+        return Ok(false);
+    }
+    Ok(credentials.cookie.as_deref() != cookie)
+}
+
+fn sync_bbdown_rust_credentials_from_state_unlocked(
+    state: Option<&BoundAuthStatePath>,
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+) -> Result<bool> {
+    let Some(cookie) = legacy_cookie_from_state_unlocked(state)? else {
+        return Ok(false);
+    };
+    if let Some(state) = state {
+        state.validate_root()?;
+    }
+    let result = update_bbdown_rust_cookie_unlocked(
+        credential_file,
+        credential_profile,
+        Some(&cookie),
+        false,
+    );
+    if let Some(state) = state {
+        state.validate_root()?;
+    }
+    result
+}
+
+fn legacy_cookie_from_state_unlocked(state: Option<&BoundAuthStatePath>) -> Result<Option<String>> {
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    let Some(state) = load_bound_auth_state_unlocked(state)? else {
+        return Ok(None);
+    };
+    let cookie = state.cookie.trim();
+    if cookie.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(cookie.to_string()))
+    }
+}
+
+pub fn clear_bbdown_rust_cookie(
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+) -> Result<bool> {
+    with_auth_mutation_lock(credential_file, &[credential_file], |lock| {
+        lock.bump_epoch()?;
+        let credential_file = lock.credential_store_path()?;
+        if !credential_file.exists() {
+            return Ok(false);
+        }
+        update_bbdown_rust_cookie_unlocked(&credential_file, credential_profile, None, true)
+    })
+}
+
+pub fn logout_bbdown_auth_with_epoch(
+    state_path: &Path,
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+) -> Result<(AuthCleanupResult, AuthEpoch)> {
+    logout_bbdown_auth_with_epoch_and_hook(state_path, credential_file, credential_profile, || {
+        Ok(())
+    })
+}
+
+fn logout_bbdown_auth_with_epoch_and_hook(
+    state_path: &Path,
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+    after_legacy_state_cleanup: impl FnOnce() -> Result<()>,
+) -> Result<(AuthCleanupResult, AuthEpoch)> {
+    with_auth_mutation_transaction(state_path, credential_file, |transaction| {
+        let intent = transaction.persist_logout_intent(credential_profile)?;
+        let legacy_state = transaction.delete_legacy_state();
+        let credential_state = if legacy_state.is_ok() {
+            after_legacy_state_cleanup().and_then(|()| {
+                transaction.clear_selected_credential_profile(&intent.credential_profile)
+            })
+        } else {
+            Err(anyhow!(
+                "BBDown credential cleanup skipped because legacy login state cleanup failed"
+            ))
+        };
+        let credential_state = if credential_state.is_ok() && legacy_state.is_ok() {
+            transaction
+                .clear_logout_intent(&intent)
+                .context("failed to finalize BBDown logout")
+        } else {
+            credential_state
+        };
+        Ok((legacy_state, credential_state))
+    })
+}
+
+#[cfg(test)]
+pub fn clear_auth_state_and_credentials(
+    state_path: &Path,
+    credential_file: &Path,
+    clear_credentials: impl for<'a> FnOnce(&LockedAuthMutation<'a>) -> Result<()>,
+) -> Result<AuthCleanupResult> {
+    clear_auth_state_and_credentials_with_epoch(state_path, credential_file, clear_credentials)
+        .map(|(result, _)| result)
+}
+
+#[cfg(test)]
+pub fn clear_auth_state_and_credentials_with_epoch(
+    state_path: &Path,
+    credential_file: &Path,
+    clear_credentials: impl for<'a> FnOnce(&LockedAuthMutation<'a>) -> Result<()>,
+) -> Result<(AuthCleanupResult, AuthEpoch)> {
+    with_auth_mutation_transaction(state_path, credential_file, |transaction| {
+        let legacy_state = transaction.delete_legacy_state();
+        let credential_state = if legacy_state.is_ok() {
+            clear_credentials(transaction)
+        } else {
+            Err(anyhow!(
+                "BBDown credential cleanup skipped because legacy login state cleanup failed"
+            ))
+        };
+        Ok((legacy_state, credential_state))
+    })
+}
+
+fn update_bbdown_rust_cookie_unlocked(
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+    cookie: Option<&str>,
+    overwrite_existing: bool,
+) -> Result<bool> {
+    let selection = bbdown_rust_profile_selection(credential_profile)?;
+    let store = CredentialStore::new(credential_file.to_path_buf());
+    let changed = std::cell::Cell::new(false);
+    store
+        .update_selected_profile(&selection, |mut credentials| {
+            let current_cookie = credentials.cookie.as_deref().unwrap_or_default().trim();
+            if cookie.is_some() && !current_cookie.is_empty() && !overwrite_existing {
+                return Ok(credentials);
+            }
+            let next_cookie = cookie.map(str::to_string);
+            if credentials.cookie != next_cookie {
+                credentials.cookie = next_cookie;
+                changed.set(true);
+            }
+            Ok(credentials)
+        })
+        .with_context(|| {
+            format!(
+                "failed to update BBDown-rust credentials {}",
+                credential_file.display()
+            )
+        })?;
+    Ok(changed.get())
+}
+
+fn clear_bbdown_rust_credential_profile_unlocked(
+    credential_file: &Path,
+    credential_profile: &str,
+) -> Result<()> {
+    let profile = CredentialProfileSelection::named(credential_profile)
+        .context("invalid BBDown-rust credential profile in pending logout intent")?
+        .profile_name()
+        .expect("named credential profile should retain its name")
+        .to_string();
+    CredentialStore::new(credential_file.to_path_buf())
+        .update_profiles(|profiles| {
+            profiles.remove_profile(&profile)?;
+            Ok(())
+        })
+        .with_context(|| {
+            format!(
+                "failed to clear BBDown-rust credential profile in {}",
+                credential_file.display()
+            )
+        })
+}
+
+fn bbdown_rust_profile_selection(
+    credential_profile: Option<&str>,
+) -> Result<CredentialProfileSelection> {
+    match credential_profile
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty())
+    {
+        Some(profile) => CredentialProfileSelection::named(profile)
+            .context("invalid BBDown-rust credential profile"),
+        None => Ok(CredentialProfileSelection::default_profile()),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn ensure_bbdown_config_file(
     path: &Path,
+    credential_file: &Path,
     base_config_path: Option<&Path>,
 ) -> Result<Option<PathBuf>> {
     let _guard = AUTH_FILE_LOCK
         .lock()
         .expect("auth file lock should not poison");
+    ensure_auth_state_path_has_no_symlink_components(path)?;
     let Some(state) = load_auth_state_unlocked(path)? else {
         return Ok(None);
     };
@@ -493,7 +2979,7 @@ pub fn ensure_bbdown_config_file(
         return Ok(None);
     }
 
-    cleanup_stale_bbdown_config_files_unlocked(path)?;
+    cleanup_stale_bbdown_config_files_unlocked(path, credential_file)?;
     let config_path = temp_state_path(&bbdown_config_dir(path).join("cookie.config"));
     write_bbdown_config(&config_path, &state.cookie, base_config_path)?;
     active_bbdown_config_files()
@@ -503,16 +2989,19 @@ pub fn ensure_bbdown_config_file(
     Ok(Some(config_path))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn ensure_isolated_bbdown_config_file_with_lines(
     path: &Path,
+    credential_file: &Path,
     base_lines: &[String],
 ) -> Result<PathBuf> {
     let _guard = AUTH_FILE_LOCK
         .lock()
         .expect("auth file lock should not poison");
+    ensure_auth_state_path_has_no_symlink_components(path)?;
     let state = load_auth_state_unlocked(path)?;
 
-    cleanup_stale_bbdown_config_files_unlocked(path)?;
+    cleanup_stale_bbdown_config_files_unlocked(path, credential_file)?;
     let config_path = temp_state_path(&bbdown_config_dir(path).join("probe.config"));
     let mut content = Vec::new();
     for line in base_lines {
@@ -566,6 +3055,7 @@ pub fn release_bbdown_config_file(path: &Path) {
         .remove(path);
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_bbdown_config(path: &Path, cookie: &str, base_config_path: Option<&Path>) -> Result<()> {
     let mut content = match base_config_path {
         Some(base_config_path) => fs::read(base_config_path).with_context(|| {
@@ -583,17 +3073,18 @@ fn write_bbdown_config(path: &Path, cookie: &str, base_config_path: Option<&Path
     write_bbdown_config_content(path, &content)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_bbdown_config_content(path: &Path, content: &[u8]) -> Result<()> {
+    write_private_bytes(path, content, "BBDown auth config")
+}
+
+fn write_private_bytes(path: &Path, content: &[u8], label: &str) -> Result<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        create_private_dir_if_missing(parent).with_context(|| {
-            format!(
-                "failed to create BBDown auth config directory {}",
-                parent.display()
-            )
-        })?;
+        create_private_dir_if_missing(parent)
+            .with_context(|| format!("failed to create {label} directory {}", parent.display()))?;
     }
 
     let temp_path = temp_state_path(path);
@@ -605,73 +3096,476 @@ fn write_bbdown_config_content(path: &Path, content: &[u8]) -> Result<()> {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(&temp_path).with_context(|| {
-            format!(
-                "failed to create temp BBDown auth config {}",
-                temp_path.display()
-            )
-        })?;
-        std::io::Write::write_all(&mut file, content).with_context(|| {
-            format!(
-                "failed to write temp BBDown auth config {}",
-                temp_path.display()
-            )
-        })?;
-        std::io::Write::flush(&mut file).with_context(|| {
-            format!(
-                "failed to flush temp BBDown auth config {}",
-                temp_path.display()
-            )
-        })?;
+        let mut file = options
+            .open(&temp_path)
+            .with_context(|| format!("failed to create temp {label} {}", temp_path.display()))?;
+        std::io::Write::write_all(&mut file, content)
+            .with_context(|| format!("failed to write temp {label} {}", temp_path.display()))?;
+        std::io::Write::flush(&mut file)
+            .with_context(|| format!("failed to flush temp {label} {}", temp_path.display()))?;
     }
     set_file_private(&temp_path);
     fs::rename(&temp_path, path)
-        .with_context(|| format!("failed to replace BBDown auth config {}", path.display()))?;
+        .with_context(|| format!("failed to replace {label} {}", path.display()))?;
     set_file_private(path);
     Ok(())
 }
 
-fn cleanup_stale_bbdown_config_files_unlocked(path: &Path) -> Result<bool> {
-    let config_dir = bbdown_config_dir(path);
-    let entries = match fs::read_dir(&config_dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to read {}", config_dir.display()));
-        }
+struct BoundCleanupTarget {
+    root: RootedFs,
+    entry: BoundEntry,
+    file: BoundFile,
+}
+
+impl BoundCleanupTarget {
+    fn identity(&self) -> EntryIdentity {
+        self.file.identity()
+    }
+}
+
+struct BoundStaleBbdownConfigDirectory {
+    root: RootedFs,
+    entry: BoundEntry,
+    identity: EntryIdentity,
+    path: PathBuf,
+}
+
+fn remove_cleanup_file_if_exists(path: &Path, credential_file: &Path) -> Result<bool> {
+    remove_cleanup_file_if_exists_with_hook(path, credential_file, || Ok(()))
+}
+
+fn remove_cleanup_file_if_exists_with_hook<F>(
+    path: &Path,
+    credential_file: &Path,
+    after_quarantine_move: F,
+) -> Result<bool>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let Some(target) = bind_cleanup_target(path)? else {
+        return Ok(false);
     };
-    let active_files = active_bbdown_config_files()
-        .lock()
-        .expect("active BBDown config lock should not poison")
-        .clone();
-    let mut removed = false;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if active_files.contains(&path) {
-            continue;
+    remove_bound_cleanup_target_with_hook(path, target, credential_file, after_quarantine_move)
+}
+
+fn remove_bound_cleanup_target_with_hook<F>(
+    path: &Path,
+    target: BoundCleanupTarget,
+    credential_file: &Path,
+    after_quarantine_move: F,
+) -> Result<bool>
+where
+    F: FnOnce() -> Result<()>,
+{
+    // Protected property: never unlink the object selected by the active credential path. Hold
+    // the initial object identity, then rebind the credential after the target is quarantined so
+    // a namespace replacement either rejects and restores the target or fails closed.
+    let initial_credential = bind_cleanup_target(credential_file)?;
+    ensure_cleanup_identity_is_not_credential(
+        path,
+        target.identity(),
+        initial_credential
+            .as_ref()
+            .map(BoundCleanupTarget::identity),
+    )?;
+
+    let expected = target.identity();
+    target
+        .root
+        .remove_bound_file_if_identity_with_validation(&target.entry, expected, || {
+            after_quarantine_move()?;
+            let current_credential = bind_cleanup_target(credential_file)?;
+            ensure_cleanup_identity_is_not_credential(
+                path,
+                expected,
+                current_credential
+                    .as_ref()
+                    .map(BoundCleanupTarget::identity),
+            )
+        })
+        .with_context(|| format!("failed to delete legacy auth file {}", path.display()))?;
+    Ok(true)
+}
+
+fn bind_cleanup_target(path: &Path) -> Result<Option<BoundCleanupTarget>> {
+    let path = absolute_auth_cleanup_path(path)?;
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to inspect Bilibili auth cleanup path {}",
+                    path.display()
+                )
+            });
         }
-        match entry.file_type() {
-            Ok(file_type) if file_type.is_file() => {}
-            Ok(_) => continue,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err.into()),
+    }
+
+    let parent = path
+        .parent()
+        .context("Bilibili auth cleanup path has no parent")?;
+    let root = RootedFs::new(parent).with_context(|| {
+        format!(
+            "failed to bind Bilibili auth cleanup directory {}",
+            parent.display()
+        )
+    })?;
+    let Some(file) = root.open_bound_file(&path)? else {
+        return Ok(None);
+    };
+    let entry = root.bind_entry(&path, false)?;
+    Ok(Some(BoundCleanupTarget { root, entry, file }))
+}
+
+fn bind_cleanup_target_in_root(root: &RootedFs, path: &Path) -> Result<Option<BoundCleanupTarget>> {
+    let Some(file) = root.open_bound_file(path)? else {
+        return Ok(None);
+    };
+    let entry = root.bind_entry(path, false)?;
+    if root.bound_entry_identity(&entry)? != Some(file.identity()) {
+        bail!(
+            "Bilibili auth cleanup target identity changed while binding: {}",
+            path.display()
+        );
+    }
+    Ok(Some(BoundCleanupTarget {
+        root: root.clone(),
+        entry,
+        file,
+    }))
+}
+
+fn remove_bound_state_file_if_exists(
+    state: &BoundAuthStatePath,
+    path: &Path,
+    credential_file: &Path,
+) -> Result<bool> {
+    state.validate_root()?;
+    let Some(target) = bind_cleanup_target_in_root(&state.root, path)? else {
+        state.validate_root()?;
+        return Ok(false);
+    };
+    let result = remove_bound_cleanup_target_with_hook(path, target, credential_file, || Ok(()));
+    state.validate_root()?;
+    result
+}
+
+fn bind_private_stale_bbdown_config_directory(
+    state_path: &Path,
+) -> Result<Option<BoundStaleBbdownConfigDirectory>> {
+    let path = absolute_auth_cleanup_path(&bbdown_config_dir(state_path))?;
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to inspect stale BBDown auth config directory {}",
+                    path.display()
+                )
+            });
         }
-        match fs::remove_file(&path) {
-            Ok(()) => removed = true,
+    }
+    let parent = path
+        .parent()
+        .context("stale BBDown auth config directory has no parent")?;
+    let root = RootedFs::new(parent).with_context(|| {
+        format!(
+            "failed to bind stale BBDown auth config parent directory {}",
+            parent.display()
+        )
+    })?;
+    let entry = root.bind_entry(&path, false)?;
+    let Some(identity) = root.bound_entry_identity(&entry)? else {
+        return Ok(None);
+    };
+    root.validate_private_bound_directory(&entry, identity, 0o700)
+        .with_context(|| {
+            format!(
+                "stale BBDown auth config directory must be an app-owned private directory: {}",
+                path.display()
+            )
+        })?;
+    Ok(Some(BoundStaleBbdownConfigDirectory {
+        root,
+        entry,
+        identity,
+        path,
+    }))
+}
+
+fn bind_private_stale_bbdown_config_directory_from_state(
+    state: &BoundAuthStatePath,
+) -> Result<Option<BoundStaleBbdownConfigDirectory>> {
+    state.validate_root()?;
+    let path = state.config_dir_path();
+    let Some(identity) = state.root.entry_identity(&path)? else {
+        state.validate_root()?;
+        return Ok(None);
+    };
+    let entry = state.root.bind_entry(&path, false)?;
+    if state.root.bound_entry_identity(&entry)? != Some(identity) {
+        bail!(
+            "stale BBDown auth config directory identity changed while binding: {}",
+            path.display()
+        );
+    }
+    state
+        .root
+        .validate_private_bound_directory(&entry, identity, 0o700)
+        .with_context(|| {
+            format!(
+                "stale BBDown auth config directory must be an app-owned private directory: {}",
+                path.display()
+            )
+        })?;
+    state.validate_root()?;
+    Ok(Some(BoundStaleBbdownConfigDirectory {
+        root: state.root.clone(),
+        entry,
+        identity,
+        path,
+    }))
+}
+
+fn is_managed_bbdown_config_file_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let mut parts = name.split('.');
+    let Some(kind) = parts.next() else {
+        return false;
+    };
+    let Some(config) = parts.next() else {
+        return false;
+    };
+    let Some(process_id) = parts.next() else {
+        return false;
+    };
+    let Some(counter) = parts.next() else {
+        return false;
+    };
+    let Some(nanos) = parts.next() else {
+        return false;
+    };
+    let Some(extension) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && matches!(kind, "cookie" | "probe")
+        && config == "config"
+        && extension == "tmp"
+        && [process_id, counter, nanos]
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn absolute_auth_cleanup_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .context("failed to resolve the current directory for auth cleanup")?
+            .join(path))
+    }
+}
+
+fn bind_auth_state_path_before_lock(path: &Path) -> Result<Option<BoundAuthStatePath>> {
+    ensure_auth_state_path_has_no_symlink_components(path)?;
+    let path = absolute_auth_cleanup_path(path)?;
+    let parent = path
+        .parent()
+        .context("Bilibili auth state path has no parent")?;
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            bail!(
+                "Bilibili auth state parent is not a directory: {}",
+                parent.display()
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to inspect Bilibili auth state parent {}",
+                    parent.display()
+                )
+            });
+        }
+    }
+
+    // Protected property: lock-protected legacy state work stays attached to the parent
+    // directory selected before waiting for the cross-process credential lock. Every later
+    // operation validates this root, so replacing the lexical parent fails closed.
+    let root = RootedFs::new(parent).with_context(|| {
+        format!(
+            "failed to bind Bilibili auth state parent before acquiring the auth lock: {}",
+            parent.display()
+        )
+    })?;
+    root.bind_entry(&path, false)?;
+    root.validate_configured_root()?;
+    Ok(Some(BoundAuthStatePath { root, path }))
+}
+
+pub(crate) fn ensure_auth_state_path_has_no_symlink_components(path: &Path) -> Result<()> {
+    ensure_auth_path_has_no_symlink_components(path, "Bilibili auth state path")
+}
+
+fn ensure_auth_credential_path_has_no_symlink_components(path: &Path) -> Result<()> {
+    ensure_auth_path_has_no_symlink_components(path, "BBDown credential path")
+}
+
+fn ensure_auth_path_has_no_symlink_components(path: &Path, label: &str) -> Result<()> {
+    let absolute = absolute_auth_cleanup_path(path)?;
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                if is_platform_auth_path_alias(&current) {
+                    continue;
+                }
+                bail!(
+                    "{label} must not resolve through a symbolic link: {}",
+                    current.display()
+                );
+            }
+            Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
                 return Err(err).with_context(|| {
-                    format!(
-                        "failed to delete stale BBDown auth config {}",
-                        path.display()
-                    )
+                    format!("failed to inspect {label} component {}", current.display())
                 });
             }
         }
     }
-    let _ = fs::remove_dir(&config_dir);
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn is_platform_auth_path_alias(path: &Path) -> bool {
+    // Darwin exposes these root-owned aliases before application-controlled path components.
+    matches!(path, path if path == Path::new("/etc") || path == Path::new("/tmp") || path == Path::new("/var"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn is_platform_auth_path_alias(_path: &Path) -> bool {
+    false
+}
+
+fn ensure_cleanup_identity_is_not_credential(
+    path: &Path,
+    target: EntryIdentity,
+    credential: Option<EntryIdentity>,
+) -> Result<()> {
+    if credential == Some(target) {
+        bail!(
+            "legacy Bilibili auth cleanup target aliases the active credential file: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn cleanup_stale_bbdown_config_files_unlocked(path: &Path, credential_file: &Path) -> Result<bool> {
+    let Some(config_dir) = bind_private_stale_bbdown_config_directory(path)? else {
+        return Ok(false);
+    };
+    cleanup_stale_bbdown_config_files_in_directory(config_dir, credential_file)
+}
+
+fn cleanup_stale_bbdown_config_files_from_bound_state_unlocked(
+    state: &BoundAuthStatePath,
+    credential_file: &Path,
+) -> Result<bool> {
+    state.validate_root()?;
+    let Some(config_dir) = bind_private_stale_bbdown_config_directory_from_state(state)? else {
+        state.validate_root()?;
+        return Ok(false);
+    };
+    let result = cleanup_stale_bbdown_config_files_in_directory(config_dir, credential_file);
+    state.validate_root()?;
+    result
+}
+
+fn cleanup_stale_bbdown_config_files_in_directory(
+    config_dir: BoundStaleBbdownConfigDirectory,
+    credential_file: &Path,
+) -> Result<bool> {
+    let active_files = active_bbdown_config_files()
+        .lock()
+        .expect("active BBDown config lock should not poison")
+        .iter()
+        .map(|active| absolute_auth_cleanup_path(active))
+        .collect::<Result<HashSet<_>>>()?;
+    let entries = config_dir
+        .root
+        .list_bound_directory(&config_dir.entry, config_dir.identity)?;
+    let mut removed = false;
+    for (name, expected) in entries {
+        if !expected.is_file() || !is_managed_bbdown_config_file_name(&name) {
+            continue;
+        }
+        let child_path = config_dir.path.join(&name);
+        if active_files.contains(&child_path) {
+            continue;
+        }
+        // Keep both checks around child binding: the first proves the directory is private before
+        // we select a child, while the second proves that child is attached to the same directory
+        // object. Later removal uses that bound parent descriptor rather than this pathname.
+        config_dir.root.validate_private_bound_directory(
+            &config_dir.entry,
+            config_dir.identity,
+            0o700,
+        )?;
+        let entry = config_dir.root.bind_entry(&child_path, false)?;
+        config_dir.root.validate_private_bound_directory(
+            &config_dir.entry,
+            config_dir.identity,
+            0o700,
+        )?;
+        let current = config_dir
+            .root
+            .bound_entry_identity(&entry)?
+            .with_context(|| {
+                format!(
+                    "stale BBDown auth config disappeared during cleanup: {}",
+                    child_path.display()
+                )
+            })?;
+        if current != expected || !current.is_file() {
+            bail!(
+                "stale BBDown auth config identity changed during cleanup: {}",
+                child_path.display()
+            );
+        }
+        let file = config_dir
+            .root
+            .open_bound_file_if_identity(&entry, current)?;
+        let target = BoundCleanupTarget {
+            root: config_dir.root.clone(),
+            entry,
+            file,
+        };
+        if remove_bound_cleanup_target_with_hook(&child_path, target, credential_file, || Ok(()))
+            .with_context(|| {
+                format!(
+                    "failed to delete stale BBDown auth config {}",
+                    child_path.display()
+                )
+            })?
+        {
+            removed = true;
+        }
+    }
     Ok(removed)
+}
+
+fn remove_legacy_file_if_exists(path: &Path, credential_file: &Path) -> Result<bool> {
+    remove_cleanup_file_if_exists(path, credential_file)
 }
 
 fn active_bbdown_config_files() -> &'static Mutex<HashSet<PathBuf>> {
@@ -748,6 +3642,14 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn make_test_directory_private(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("test directory should become private");
+    }
+
     #[test]
     fn extracts_cookie_pairs_from_set_cookie_headers() {
         assert_eq!(
@@ -802,6 +3704,46 @@ mod tests {
         let png = render_qr_png("https://example.com/login").expect("QR should render");
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert!(png.len() > 100);
+    }
+
+    #[test]
+    fn parses_bbdown_rust_auth_events() {
+        let stdout = r#"
+{"event":"ticket","kind":"access_key","url":"https://www.biliplus.com/login","qr_payload":"https://www.biliplus.com/login","message_origin":"https://www.biliplus.com","callback_origin":"https://www.bilibili.com"}
+{"event":"saved","kind":"access_key","saved":{"has_cookie":false,"has_access_key":true,"has_tv_access_key":false}}
+"#;
+
+        assert_eq!(
+            first_bbdown_auth_ticket(stdout).expect("ticket should parse"),
+            BbdownAuthTicket {
+                kind: "access_key".to_string(),
+                url: "https://www.biliplus.com/login".to_string(),
+                qr_payload: "https://www.biliplus.com/login".to_string(),
+                message_origin: Some("https://www.biliplus.com".to_string()),
+                callback_origin: Some("https://www.bilibili.com".to_string()),
+            }
+        );
+        assert_eq!(
+            bbdown_auth_saved_summary(stdout).expect("saved summary should parse"),
+            BbdownCredentialSummary {
+                has_cookie: false,
+                has_access_key: true,
+                has_tv_access_key: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_bbdown_rust_credential_health_report() {
+        let report = parse_bbdown_credential_health_report(
+            r#"{"credentials":{"has_cookie":true,"has_access_key":true,"has_tv_access_key":false},"probes":[{"kind":"cookie","scope":"web_cookie","status":"valid","endpoint":"https://api.example/nav","api_code":0,"message":null}]}"#,
+        )
+        .expect("health report should parse");
+
+        assert!(report.credentials.has_cookie);
+        assert_eq!(report.probes.len(), 1);
+        assert_eq!(report.probes[0].kind, "cookie");
+        assert_eq!(report.probes[0].status, "valid");
     }
 
     #[test]
@@ -886,6 +3828,217 @@ mod tests {
         assert_eq!(state.uname, "Joey");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn logout_refuses_to_unlink_a_hard_link_to_the_active_credential_file() {
+        let state_path = temp_state_file("logout-credential-hard-link");
+        let credential_file = state_path.with_file_name("credentials.json");
+        fs::create_dir_all(state_path.parent().expect("state should have a parent"))
+            .expect("auth directory should create");
+        fs::write(&credential_file, b"active-credentials").expect("credential file should write");
+        fs::hard_link(&credential_file, &state_path).expect("state hard link should create");
+
+        let error = delete_auth_state(&state_path, &credential_file)
+            .expect_err("logout must preserve the active credential object");
+
+        assert!(format!("{error:#}").contains("aliases the active credential file"));
+        assert_eq!(fs::read(&credential_file).unwrap(), b"active-credentials");
+        assert_eq!(fs::read(&state_path).unwrap(), b"active-credentials");
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logout_refuses_to_unlink_a_stale_config_hard_link_to_credentials() {
+        let state_path = temp_state_file("logout-stale-config-hard-link");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let stale_config = bbdown_config_dir(&state_path).join("cookie.config.1.2.3.tmp");
+        save_auth_state(&state_path, &test_state()).expect("state should save");
+        fs::write(&credential_file, b"active-credentials").expect("credential file should write");
+        let config_dir = stale_config.parent().expect("config should have a parent");
+        fs::create_dir_all(config_dir).expect("config directory should create");
+        make_test_directory_private(config_dir);
+        fs::hard_link(&credential_file, &stale_config)
+            .expect("stale config hard link should create");
+
+        let error = delete_auth_state(&state_path, &credential_file)
+            .expect_err("stale cleanup must preserve the active credential object");
+
+        assert!(format!("{error:#}").contains("aliases the active credential file"));
+        assert_eq!(fs::read(&credential_file).unwrap(), b"active-credentials");
+        assert_eq!(fs::read(&stale_config).unwrap(), b"active-credentials");
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_config_cleanup_refuses_a_stale_hard_link_to_credentials() {
+        let state_path = temp_state_file("isolated-config-stale-hard-link");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let stale_config = bbdown_config_dir(&state_path).join("cookie.config.1.2.3.tmp");
+        let config_dir = stale_config.parent().expect("config should have a parent");
+        fs::create_dir_all(config_dir).expect("config directory should create");
+        make_test_directory_private(config_dir);
+        fs::write(&credential_file, b"active-credentials").expect("credential file should write");
+        fs::hard_link(&credential_file, &stale_config)
+            .expect("stale config hard link should create");
+
+        let error =
+            ensure_isolated_bbdown_config_file_with_lines(&state_path, &credential_file, &[])
+                .expect_err("config cleanup must preserve the active credential object");
+
+        assert!(format!("{error:#}").contains("aliases the active credential file"));
+        assert_eq!(fs::read(&credential_file).unwrap(), b"active-credentials");
+        assert_eq!(fs::read(&stale_config).unwrap(), b"active-credentials");
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_config_cleanup_rejects_a_symlinked_directory_without_deleting_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let state_path = temp_state_file("stale-config-symlink");
+        let root = state_path
+            .parent()
+            .expect("state path should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        let stale_config_dir = bbdown_config_dir(&state_path);
+        let unrelated = root.join("unrelated-private-data");
+        let sentinel = unrelated.join("sentinel");
+        save_auth_state(&state_path, &test_state()).expect("state should save");
+        fs::write(&credential_file, b"active-credentials").expect("credential file should write");
+        fs::create_dir_all(&unrelated).expect("unrelated directory should create");
+        make_test_directory_private(&unrelated);
+        fs::write(&sentinel, b"do-not-delete").expect("sentinel should write");
+        symlink(&unrelated, &stale_config_dir).expect("stale config symlink should create");
+
+        let error = delete_auth_state(&state_path, &credential_file)
+            .expect_err("cleanup must reject a symlinked stale config directory");
+
+        assert!(
+            format!("{error:#}").contains("must be an app-owned private directory"),
+            "unexpected cleanup error: {error:#}"
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"do-not-delete");
+        assert!(
+            fs::symlink_metadata(&stale_config_dir)
+                .expect("stale config symlink should remain")
+                .file_type()
+                .is_symlink()
+        );
+        let _ = fs::remove_file(&stale_config_dir);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_config_cleanup_removes_only_managed_file_names() {
+        let state_path = temp_state_file("stale-config-recognized-files");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let stale_config_dir = bbdown_config_dir(&state_path);
+        let managed = stale_config_dir.join("cookie.config.1.2.3.tmp");
+        let unrelated = stale_config_dir.join("unrelated.txt");
+        save_auth_state(&state_path, &test_state()).expect("state should save");
+        fs::write(&credential_file, b"active-credentials").expect("credential file should write");
+        create_private_dir_if_missing(&stale_config_dir)
+            .expect("stale config directory should become private");
+        fs::write(&managed, b"legacy-cookie").expect("managed config should write");
+        fs::write(&unrelated, b"do-not-delete").expect("unrelated file should write");
+
+        assert!(
+            delete_auth_state(&state_path, &credential_file)
+                .expect("managed stale config cleanup should complete")
+        );
+        assert!(!managed.exists());
+        assert_eq!(fs::read(&unrelated).unwrap(), b"do-not-delete");
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_restores_a_target_that_becomes_the_active_credential() {
+        use std::os::unix::fs::MetadataExt;
+
+        let state_path = temp_state_file("cleanup-credential-namespace-swap");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        fs::create_dir_all(&root).expect("auth directory should create");
+        let cleanup_target = root.join("legacy-state.json");
+        let credential_file = root.join("credentials.json");
+        let credential_candidate = root.join("new-credentials.json");
+        fs::write(&cleanup_target, b"newly-saved-credentials")
+            .expect("cleanup target should write");
+        fs::hard_link(&cleanup_target, &credential_candidate)
+            .expect("credential candidate hard link should create");
+        fs::write(&credential_file, b"old-credentials").expect("old credential should write");
+
+        let error =
+            remove_cleanup_file_if_exists_with_hook(&cleanup_target, &credential_file, || {
+                fs::remove_file(&credential_file).context("failed to remove old credential")?;
+                fs::rename(&credential_candidate, &credential_file)
+                    .context("failed to install raced credential")?;
+                Ok(())
+            })
+            .expect_err("cleanup must restore an object selected as the active credential");
+
+        assert!(format!("{error:#}").contains("aliases the active credential file"));
+        assert_eq!(
+            fs::read(&credential_file).unwrap(),
+            b"newly-saved-credentials"
+        );
+        assert_eq!(
+            fs::read(&cleanup_target).unwrap(),
+            b"newly-saved-credentials"
+        );
+        let credential_metadata = fs::metadata(&credential_file).unwrap();
+        let cleanup_metadata = fs::metadata(&cleanup_target).unwrap();
+        assert_eq!(credential_metadata.dev(), cleanup_metadata.dev());
+        assert_eq!(credential_metadata.ino(), cleanup_metadata.ino());
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".telegram-video-downloader-remove")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn logout_refuses_unicode_normalization_alias_of_credentials() {
+        let root = temp_state_file("logout-unicode-normalization")
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        fs::create_dir_all(&root).expect("auth directory should create");
+        let state_path = root.join("caf\u{e9}.json");
+        let credential_file = root.join("cafe\u{301}.json");
+        fs::write(&credential_file, b"active-credentials").expect("credential file should write");
+        assert!(
+            state_path.exists(),
+            "test filesystem must normalize Unicode names"
+        );
+
+        let error = delete_auth_state(&state_path, &credential_file)
+            .expect_err("logout must preserve a normalization-aliased credential object");
+
+        assert!(format!("{error:#}").contains("aliases the active credential file"));
+        assert_eq!(fs::read(&credential_file).unwrap(), b"active-credentials");
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn rejects_logged_out_nav_account() {
         assert!(
@@ -917,16 +4070,1188 @@ mod tests {
             load_auth_state(&path).expect("state should load"),
             Some(state)
         );
-        assert!(delete_auth_state(&path).expect("state should delete"));
+        let credential_file = path.with_file_name("credentials.json");
+        assert!(delete_auth_state(&path, &credential_file).expect("state should delete"));
         assert_eq!(
             load_auth_state(&path).expect("state should be missing"),
             None
         );
-        assert!(!delete_auth_state(&path).expect("missing delete should be ok"));
+        assert!(!delete_auth_state(&path, &credential_file).expect("missing delete should be ok"));
 
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_nonprivate_legacy_state_before_loading_or_credential_sync() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_path = temp_state_file("nonprivate-legacy-state");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        fs::create_dir_all(&root).expect("state directory should create");
+        fs::write(
+            &state_path,
+            serde_json::to_vec(&test_state()).expect("state should encode"),
+        )
+        .expect("state should write");
+        fs::set_permissions(&state_path, fs::Permissions::from_mode(0o644))
+            .expect("state permissions should update");
+
+        let load_error = load_auth_state(&state_path)
+            .expect_err("nonprivate state must not be returned to status callers");
+        assert!(format!("{load_error:#}").contains("current-user-owned private single-link file"));
+
+        let sync_error =
+            sync_bbdown_rust_credentials_from_state(&state_path, &credential_file, None)
+                .expect_err("nonprivate state must not populate credentials");
+        assert!(format!("{sync_error:#}").contains("current-user-owned private single-link file"));
+        assert!(!credential_file.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_lock_rejects_state_control_aliases_and_symlinked_state_parents() {
+        use std::os::unix::fs::symlink;
+
+        let state_path = temp_state_file("auth-control-path-aliases");
+        let root = state_path
+            .parent()
+            .expect("state path should have a parent")
+            .to_path_buf();
+        let real = root.join("real");
+        let alias = root.join("alias");
+        fs::create_dir_all(real.join("nested")).expect("real auth directory should create");
+        symlink(&real, &alias).expect("auth directory alias should create");
+        let credential_file = real.join("credentials.json");
+        let owner_leaf = auth_mutation_control_paths(&credential_file)[2]
+            .file_name()
+            .expect("owner control path should have a leaf")
+            .to_os_string();
+
+        let normalized = real.join("nested").join("..").join(&owner_leaf);
+        let error = with_auth_mutation_transaction(&normalized, &credential_file, |_| Ok(()))
+            .expect_err("auth state must not alias a mutation control path");
+        assert!(
+            error
+                .to_string()
+                .contains("BBDown auth lock control path conflicts with an auth data file")
+        );
+
+        let error =
+            with_auth_mutation_transaction(&alias.join(&owner_leaf), &credential_file, |_| Ok(()))
+                .expect_err("auth state must not traverse a symlinked parent");
+        assert!(
+            error
+                .to_string()
+                .contains("Bilibili auth state path must not resolve through a symbolic link")
+        );
+
+        for control_path in auth_mutation_control_paths(&credential_file) {
+            assert!(
+                !control_path.exists(),
+                "control path should not be created after rejected config: {}",
+                control_path.display()
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logout_rejects_a_symlinked_legacy_state_before_credential_cleanup() {
+        use std::os::unix::fs::symlink;
+
+        let state_path = temp_state_file("logout-symlinked-legacy-state");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        fs::create_dir_all(&root).expect("auth root should create");
+        let legacy_target = root.join("legacy-auth-target.json");
+        let credential_file = root.join("credentials.json");
+        save_auth_state(&legacy_target, &test_state()).expect("legacy state should save");
+        symlink(&legacy_target, &state_path).expect("legacy state symlink should create");
+        fs::write(&credential_file, b"active-credentials")
+            .expect("active credentials should write");
+        let credential_cleanup_called = std::cell::Cell::new(false);
+
+        let error = clear_auth_state_and_credentials(&state_path, &credential_file, |_| {
+            credential_cleanup_called.set(true);
+            fs::remove_file(&credential_file).context("failed to clear active credentials")
+        })
+        .expect_err("logout must reject a symlinked legacy state before cleanup");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Bilibili auth state path must not resolve through a symbolic link")
+        );
+        assert!(!credential_cleanup_called.get());
+        assert_eq!(
+            fs::read(&credential_file).expect("active credentials should remain"),
+            b"active-credentials"
+        );
+        assert_eq!(
+            load_auth_state(&legacy_target).expect("legacy target should load"),
+            Some(test_state())
+        );
+        assert!(
+            fs::symlink_metadata(&state_path)
+                .expect("legacy symlink should remain")
+                .file_type()
+                .is_symlink()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_recovery_deletes_an_interrupted_noncredential_auth_cleanup() {
+        let state_path = temp_state_file("interrupted-auth-cleanup-delete");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        fs::create_dir_all(&root).expect("auth root should create");
+        fs::write(&state_path, b"legacy-state").expect("legacy state should write");
+        fs::write(&credential_file, b"active-credentials")
+            .expect("active credentials should write");
+        let target = bind_cleanup_target(&state_path)
+            .expect("legacy state should bind")
+            .expect("legacy state should exist");
+        target
+            .root
+            .leave_validated_file_removal_quarantined_for_test(&target.entry, target.identity())
+            .expect("interrupted cleanup should persist");
+        drop(target);
+
+        let messages = recover_interrupted_auth_cleanup(&state_path, &credential_file)
+            .expect("noncredential cleanup should recover");
+
+        assert!(!state_path.exists());
+        assert_eq!(
+            fs::read(&credential_file).expect("active credentials should remain"),
+            b"active-credentials"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("Recovered interrupted bound-path removal"))
+        );
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".telegram-video-downloader-remove")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_auth_recovery_ignores_unrelated_unreadable_subdirectories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_path = temp_state_file("auth-recovery-unrelated-directory");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        let unrelated = root.join("unrelated-private-data");
+        fs::create_dir_all(&unrelated).expect("unrelated directory should create");
+        fs::write(unrelated.join("sentinel"), b"unrelated")
+            .expect("unrelated sentinel should write");
+        fs::write(&credential_file, b"active-credentials")
+            .expect("active credentials should write");
+        fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o000))
+            .expect("unrelated directory should become unreadable");
+
+        let result = recover_interrupted_auth_cleanup(&state_path, &credential_file);
+
+        fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o700))
+            .expect("unrelated directory permissions should restore");
+        let messages = result.expect("unrelated subtree must not block auth recovery");
+        assert!(messages.is_empty());
+        assert_eq!(fs::read(unrelated.join("sentinel")).unwrap(), b"unrelated");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_auth_recovery_scans_the_known_stale_config_directory() {
+        let state_path = temp_state_file("auth-recovery-stale-config-directory");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        let stale_config_dir = bbdown_config_dir(&state_path);
+        let stale_config = stale_config_dir.join("stale.config");
+        fs::create_dir_all(&stale_config_dir).expect("stale config directory should create");
+        make_test_directory_private(&stale_config_dir);
+        fs::write(&stale_config, b"legacy-cookie").expect("stale config should write");
+        fs::write(&credential_file, b"active-credentials")
+            .expect("active credentials should write");
+        let target = bind_cleanup_target(&stale_config)
+            .expect("stale config should bind")
+            .expect("stale config should exist");
+        target
+            .root
+            .leave_validated_file_removal_quarantined_for_test(&target.entry, target.identity())
+            .expect("interrupted stale config cleanup should persist");
+        drop(target);
+
+        let messages = recover_interrupted_auth_cleanup(&state_path, &credential_file)
+            .expect("known stale config cleanup should recover");
+
+        assert!(!stale_config.exists());
+        assert!(messages.iter().any(|message| {
+            message.contains("Recovered interrupted bound-path removal")
+                && message.contains(".bbdown.config.d")
+        }));
+        assert!(fs::read_dir(&stale_config_dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".telegram-video-downloader-remove")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_auth_recovery_rejects_a_symlinked_stale_config_directory_without_scanning_it() {
+        use std::os::unix::fs::symlink;
+
+        let state_path = temp_state_file("auth-recovery-stale-config-symlink");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        let stale_config_dir = bbdown_config_dir(&state_path);
+        let unrelated = root.join("unrelated-private-data");
+        let sentinel = unrelated.join("sentinel");
+        fs::create_dir_all(&unrelated).expect("unrelated directory should create");
+        make_test_directory_private(&unrelated);
+        fs::write(&sentinel, b"do-not-remove").expect("sentinel should write");
+        fs::write(&credential_file, b"active-credentials")
+            .expect("active credentials should write");
+        let target = bind_cleanup_target(&sentinel)
+            .expect("sentinel should bind")
+            .expect("sentinel should exist");
+        target
+            .root
+            .leave_validated_file_removal_quarantined_for_test(&target.entry, target.identity())
+            .expect("interrupted unrelated cleanup should persist");
+        drop(target);
+        symlink(&unrelated, &stale_config_dir).expect("stale config symlink should create");
+
+        let error = recover_interrupted_auth_cleanup(&state_path, &credential_file)
+            .expect_err("symlinked stale config directory must block recovery");
+
+        assert!(format!("{error:#}").contains("app-owned private directory"));
+        assert!(fs::read_dir(&unrelated).unwrap().any(|entry| {
+            entry
+                .expect("unrelated directory entry should read")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".telegram-video-downloader-remove")
+        }));
+        fs::remove_file(&stale_config_dir).expect("stale config symlink should remove");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_recovery_restores_an_interrupted_cleanup_that_now_aliases_credentials() {
+        use std::os::unix::fs::MetadataExt;
+
+        let state_path = temp_state_file("interrupted-auth-cleanup-restore");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        fs::create_dir_all(&root).expect("auth root should create");
+        fs::write(&state_path, b"legacy-state").expect("legacy state should write");
+        let target = bind_cleanup_target(&state_path)
+            .expect("legacy state should bind")
+            .expect("legacy state should exist");
+        target
+            .root
+            .leave_validated_file_removal_quarantined_for_test(&target.entry, target.identity())
+            .expect("interrupted cleanup should persist");
+        let quarantine = fs::read_dir(&root)
+            .expect("auth root should read")
+            .map(|entry| entry.expect("auth entry should read").path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with(".telegram-video-downloader-remove")
+                }) && path.is_dir()
+            })
+            .expect("interrupted cleanup quarantine should exist");
+        fs::hard_link(quarantine.join("entry"), &credential_file)
+            .expect("credential alias should create after quarantine");
+        drop(target);
+
+        let error = recover_interrupted_auth_cleanup(&state_path, &credential_file)
+            .expect_err("credential alias must block auth recovery");
+
+        assert!(format!("{error:#}").contains("now aliases the active credential"));
+        assert_eq!(fs::read(&state_path).unwrap(), b"legacy-state");
+        assert_eq!(fs::read(&credential_file).unwrap(), b"legacy-state");
+        let state_metadata = fs::metadata(&state_path).unwrap();
+        let credential_metadata = fs::metadata(&credential_file).unwrap();
+        assert_eq!(state_metadata.dev(), credential_metadata.dev());
+        assert_eq!(state_metadata.ino(), credential_metadata.ino());
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".telegram-video-downloader-remove")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn syncs_bbdown_rust_flat_credentials_and_preserves_access_keys() {
+        let path = temp_state_file("bbdown-rust-flat-sync");
+        let credential_file = path.with_file_name("credentials.json");
+        save_auth_state(&path, &test_state()).expect("state should save");
+        fs::write(
+            &credential_file,
+            r#"{"access_key":"access","tv_access_key":"tv"}"#,
+        )
+        .expect("credential file should write");
+
+        assert!(
+            sync_bbdown_rust_credentials_from_state(&path, &credential_file, None)
+                .expect("credential sync should succeed")
+        );
+        let value: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&credential_file).expect("credential file should read"),
+        )
+        .expect("credential file should parse");
+        assert_eq!(value["cookie"], "SESSDATA=secret; bili_jct=csrf");
+        assert_eq!(value["access_key"], "access");
+        assert_eq!(value["tv_access_key"], "tv");
+
+        assert!(
+            clear_bbdown_rust_cookie(&credential_file, None)
+                .expect("credential clear should succeed")
+        );
+        let value: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&credential_file).expect("credential file should read"),
+        )
+        .expect("credential file should parse");
+        assert!(value["cookie"].is_null());
+        assert_eq!(value["access_key"], "access");
+        assert_eq!(value["tv_access_key"], "tv");
+
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn sync_does_not_overwrite_existing_bbdown_rust_flat_cookie() {
+        let path = temp_state_file("bbdown-rust-flat-existing-cookie");
+        let credential_file = path.with_file_name("credentials.json");
+        save_auth_state(&path, &test_state()).expect("state should save");
+        fs::write(
+            &credential_file,
+            r#"{"cookie":"fresh-cookie","access_key":"access"}"#,
+        )
+        .expect("credential file should write");
+
+        assert!(
+            !sync_bbdown_rust_credentials_from_state(&path, &credential_file, None)
+                .expect("credential sync should succeed")
+        );
+        let value: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&credential_file).expect("credential file should read"),
+        )
+        .expect("credential file should parse");
+        assert_eq!(value["cookie"], "fresh-cookie");
+        assert_eq!(value["access_key"], "access");
+
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn sync_rejects_malformed_legacy_auth_state() {
+        let path = temp_state_file("bbdown-rust-malformed-legacy-sync");
+        let credential_file = path.with_file_name("credentials.json");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("state parent should create");
+        }
+        fs::write(&path, "{not-json").expect("malformed state should write");
+        set_file_private(&path);
+        fs::write(&credential_file, r#"{"access_key":"access"}"#)
+            .expect("credential file should write");
+
+        let error = sync_bbdown_rust_credentials_from_state(&path, &credential_file, None)
+            .expect_err("malformed legacy state must block credential migration");
+        assert!(format!("{error:#}").contains("failed to parse Bilibili auth state"));
+        let value: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&credential_file).expect("credential file should read"),
+        )
+        .expect("credential file should parse");
+        assert!(value.get("cookie").is_none());
+        assert_eq!(value["access_key"], "access");
+
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn syncs_bbdown_rust_selected_profile_cookie_only() {
+        let path = temp_state_file("bbdown-rust-profile-sync");
+        let credential_file = path.with_file_name("credentials.json");
+        save_auth_state(&path, &test_state()).expect("state should save");
+        fs::write(
+            &credential_file,
+            r#"{"version":1,"default_profile":"default","profiles":{"default":{"cookie":"old-cookie"},"intl":{"access_key":"intl-access"}}}"#,
+        )
+        .expect("credential file should write");
+
+        assert!(
+            sync_bbdown_rust_credentials_from_state(&path, &credential_file, Some("intl"))
+                .expect("credential sync should succeed")
+        );
+        let value: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&credential_file).expect("credential file should read"),
+        )
+        .expect("credential file should parse");
+        assert_eq!(value["profiles"]["default"]["cookie"], "old-cookie");
+        assert_eq!(
+            value["profiles"]["intl"]["cookie"],
+            "SESSDATA=secret; bili_jct=csrf"
+        );
+        assert_eq!(value["profiles"]["intl"]["access_key"], "intl-access");
+
+        assert!(
+            clear_bbdown_rust_cookie(&credential_file, Some("intl"))
+                .expect("credential clear should succeed")
+        );
+        let value: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&credential_file).expect("credential file should read"),
+        )
+        .expect("credential file should parse");
+        assert_eq!(value["profiles"]["default"]["cookie"], "old-cookie");
+        assert!(value["profiles"]["intl"]["cookie"].is_null());
+        assert_eq!(value["profiles"]["intl"]["access_key"], "intl-access");
+
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn sync_does_not_overwrite_existing_bbdown_rust_profile_cookie() {
+        let path = temp_state_file("bbdown-rust-profile-existing-cookie");
+        let credential_file = path.with_file_name("credentials.json");
+        save_auth_state(&path, &test_state()).expect("state should save");
+        fs::write(
+            &credential_file,
+            r#"{"version":1,"default_profile":"default","profiles":{"default":{"cookie":"default-cookie"},"intl":{"cookie":"fresh-cookie","access_key":"intl-access"}}}"#,
+        )
+        .expect("credential file should write");
+
+        assert!(
+            !sync_bbdown_rust_credentials_from_state(&path, &credential_file, Some("intl"))
+                .expect("credential sync should succeed")
+        );
+        let value: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&credential_file).expect("credential file should read"),
+        )
+        .expect("credential file should parse");
+        assert_eq!(value["profiles"]["default"]["cookie"], "default-cookie");
+        assert_eq!(value["profiles"]["intl"]["cookie"], "fresh-cookie");
+        assert_eq!(value["profiles"]["intl"]["access_key"], "intl-access");
+
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn credential_migration_does_not_overwrite_a_concurrent_core_update() {
+        use std::sync::mpsc::sync_channel;
+        use std::thread;
+
+        use bbdown_core::Credentials;
+
+        let path = temp_state_file("bbdown-rust-concurrent-migration");
+        let credential_file = path.with_file_name("credentials.json");
+        save_auth_state(&path, &test_state()).expect("state should save");
+        let store = CredentialStore::new(credential_file.clone());
+        store
+            .save(&Credentials::default().with_access_key("old-access"))
+            .expect("initial credentials should save");
+
+        let (locked_tx, locked_rx) = sync_channel(0);
+        let (release_tx, release_rx) = sync_channel(0);
+        let writer_path = credential_file.clone();
+        let writer = thread::spawn(move || {
+            CredentialStore::new(writer_path)
+                .update_selected_profile(
+                    &CredentialProfileSelection::default_profile(),
+                    |mut credentials| {
+                        locked_tx.send(()).expect("lock signal should send");
+                        release_rx.recv().expect("release signal should arrive");
+                        credentials.access_key = Some("fresh-access".to_string());
+                        Ok(credentials)
+                    },
+                )
+                .expect("concurrent credential update should save");
+        });
+        locked_rx.recv().expect("writer should acquire the lock");
+
+        let blocked = sync_bbdown_rust_credentials_from_state(&path, &credential_file, None);
+        release_tx.send(()).expect("writer should release");
+        writer.join().expect("writer thread should finish");
+
+        let error = blocked.expect_err("migration must not race a core credential update");
+        assert!(format!("{error:#}").contains("locked by another update"));
+        assert!(
+            sync_bbdown_rust_credentials_from_state(&path, &credential_file, None)
+                .expect("migration retry should succeed")
+        );
+        let stored = CredentialStore::new(credential_file)
+            .load()
+            .expect("stored credentials should load");
+        assert_eq!(
+            stored.cookie.as_deref(),
+            Some("SESSDATA=secret; bili_jct=csrf")
+        );
+        assert_eq!(stored.access_key.as_deref(), Some("fresh-access"));
+
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_mutation_rejects_retargeted_symlinked_credential_parents_before_epoch_mutation() {
+        use std::cell::Cell;
+        use std::os::unix::fs::symlink;
+
+        let state_path = temp_state_file("auth-epoch-symlink-retarget");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let first_parent = root.join("credential-store-first");
+        let second_parent = root.join("credential-store-second");
+        let parent_link = root.join("credential-store-link");
+        fs::create_dir_all(&first_parent).expect("first credential parent should create");
+        fs::create_dir_all(&second_parent).expect("second credential parent should create");
+        let credential_file = parent_link.join("credentials.json");
+        for credential_parent in [&first_parent, &second_parent] {
+            if parent_link.exists() {
+                fs::remove_file(&parent_link).expect("previous credential symlink should unlink");
+            }
+            symlink(credential_parent, &parent_link)
+                .expect("credential symlink should point at the selected parent");
+            let called = Cell::new(false);
+            let error = with_auth_mutation_transaction(&state_path, &credential_file, |_| {
+                called.set(true);
+                Ok(())
+            })
+            .expect_err("retargetable credential parents must be rejected before mutation");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("must not resolve through a symbolic link")
+            );
+            assert!(!called.get());
+            assert!(!auth_mutation_lock_path(&credential_file).exists());
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_mutation_rejects_replaceable_credential_ancestry_before_epoch_mutation() {
+        use std::cell::Cell;
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_path = temp_state_file("auth-replaceable-credential-ancestor");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let shared_parent = root.join("shared");
+        let credential_parent = shared_parent.join("credentials");
+        let credential_file = credential_parent.join("credentials.json");
+        fs::create_dir_all(&credential_parent).expect("credential parent should create");
+        fs::set_permissions(&shared_parent, fs::Permissions::from_mode(0o777))
+            .expect("shared parent permissions should update");
+
+        let called = Cell::new(false);
+        let error = with_auth_mutation_transaction(&state_path, &credential_file, |_| {
+            called.set(true);
+            Ok(())
+        })
+        .expect_err("replaceable credential ancestry must be rejected before mutation");
+
+        assert!(format!("{error:#}").contains("permits another user to replace credentials"));
+        assert!(!called.get());
+        assert!(!auth_mutation_lock_path(&credential_file).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_mutation_accepts_sticky_shared_credential_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_path = temp_state_file("auth-sticky-credential-ancestor");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let shared_parent = root.join("shared");
+        let credential_parent = shared_parent.join("credentials");
+        let credential_file = credential_parent.join("credentials.json");
+        fs::create_dir_all(&credential_parent).expect("credential parent should create");
+        fs::set_permissions(&shared_parent, fs::Permissions::from_mode(0o1777))
+            .expect("sticky parent permissions should update");
+
+        with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+            .expect("sticky shared parents must protect current-user credential children");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_mutation_rejects_sticky_shared_credential_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_path = temp_state_file("auth-sticky-credential-parent");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let shared_parent = root.join("shared");
+        let credential_file = shared_parent.join("credentials.json");
+        fs::create_dir_all(&shared_parent).expect("credential parent should create");
+        fs::set_permissions(&shared_parent, fs::Permissions::from_mode(0o1777))
+            .expect("sticky parent permissions should update");
+
+        let error = with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+            .expect_err("a missing credential leaf must not use a shared writable parent");
+
+        assert!(
+            error
+                .to_string()
+                .contains("permits another user to replace credentials")
+        );
+        assert!(!auth_mutation_lock_path(&credential_file).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auth_mutation_lock_wait_times_out_when_another_descriptor_holds_it() {
+        let path = temp_state_file("auth-lock-wait-timeout");
+        let parent = path
+            .parent()
+            .expect("lock file should have a parent")
+            .to_path_buf();
+        fs::create_dir_all(&parent).expect("lock directory should create");
+        fs::write(&path, "lock").expect("lock file should write");
+        let holder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("lock holder should open");
+        rustix::fs::flock(&holder, FlockOperation::LockExclusive)
+            .expect("lock holder should acquire");
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("lock contender should open");
+
+        let error = wait_for_auth_mutation_file_lock(&contender, &path, Duration::from_millis(5))
+            .expect_err("a held auth lock must time out");
+
+        assert!(error.to_string().contains("timed out after 5ms"));
+        rustix::fs::flock(&holder, FlockOperation::Unlock).expect("lock holder should unlock");
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_mutation_binds_or_rejects_a_replaced_credential_parent() {
+        let state_path = temp_state_file("auth-credential-parent-replacement");
+        let root = state_path
+            .parent()
+            .expect("state path should have a parent")
+            .to_path_buf();
+        let credential_parent = root.join("credentials");
+        let moved_parent = root.join("credentials-original");
+        let credential_file = credential_parent.join("credentials.json");
+        fs::create_dir_all(&credential_parent).expect("credential parent should create");
+
+        let result = with_auth_mutation_transaction(&state_path, &credential_file, |transaction| {
+            fs::rename(&credential_parent, &moved_parent)
+                .expect("bound credential parent should move");
+            fs::create_dir(&credential_parent)
+                .expect("replacement credential parent should create");
+            CredentialStore::new(transaction.credential_file()?)
+                .update_selected_profile(
+                    &CredentialProfileSelection::default_profile(),
+                    |mut credentials| {
+                        credentials.cookie = Some("SESSDATA=bound-parent".to_string());
+                        Ok(credentials)
+                    },
+                )
+                .expect("descriptor-backed credential mutation should save");
+            Ok(())
+        });
+
+        #[cfg(target_os = "macos")]
+        {
+            result.expect("auth transaction should keep using the original credential directory");
+            assert_eq!(
+                CredentialStore::new(moved_parent.join("credentials.json"))
+                    .load()
+                    .expect("original credential store should load")
+                    .cookie
+                    .as_deref(),
+                Some("SESSDATA=bound-parent")
+            );
+        }
+
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            result.expect_err("generic Unix handoff must reject a replaced credential parent");
+            assert!(
+                !moved_parent.join("credentials.json").exists(),
+                "the original credential directory must remain untouched after a rejected handoff"
+            );
+        }
+
+        assert!(
+            !credential_file.exists(),
+            "replacement credential directory must remain untouched"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_mutation_rejects_a_state_path_through_a_symlinked_parent_before_mutation() {
+        use std::cell::Cell;
+        use std::os::unix::fs::symlink;
+
+        let state_path = temp_state_file("auth-state-parent-symlink");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let target = root.join("state-target");
+        let state_parent = root.join("state-link");
+        let credential_file = root.join("credentials.json");
+        fs::create_dir_all(&target).expect("auth state target should create");
+        symlink(&target, &state_parent).expect("auth state parent symlink should create");
+        let state_path = state_parent.join("bilibili-auth.json");
+        let victim = target.join("bilibili-auth.json");
+        fs::write(&victim, b"unrelated-state").expect("victim should write");
+
+        let called = Cell::new(false);
+        let error = with_auth_mutation_transaction(&state_path, &credential_file, |_| {
+            called.set(true);
+            Ok(())
+        })
+        .expect_err("symlinked auth state parent must be rejected before mutation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Bilibili auth state path must not resolve through a symbolic link")
+        );
+        assert!(!called.get());
+        assert_eq!(fs::read(&victim).unwrap(), b"unrelated-state");
+        assert!(!auth_mutation_lock_path(&credential_file).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_state_parent_replacement_while_waiting_for_lock_fails_closed() {
+        use std::sync::mpsc::sync_channel;
+        use std::thread;
+
+        let root = temp_state_file("auth-state-parent-replacement")
+            .parent()
+            .expect("test state should have a root")
+            .to_path_buf();
+        let state_parent = root.join("state");
+        let state_path = state_parent.join("state.json");
+        let credential_file = root.join("credentials.json");
+        fs::create_dir_all(&state_parent).expect("state parent should create");
+        save_auth_state(&state_path, &test_state()).expect("legacy state should save");
+
+        let held_lock = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect("test should hold the credential lock");
+        let (bound_tx, bound_rx) = sync_channel(0);
+        let migration_state = state_path.clone();
+        let migration_credentials = credential_file.clone();
+        let migration = thread::spawn(move || {
+            sync_bbdown_rust_credentials_from_state_with_epoch_and_hooks(
+                &migration_state,
+                &migration_credentials,
+                None,
+                || bound_tx.send(()).expect("state binding signal should send"),
+                || {},
+            )
+        });
+        bound_rx
+            .recv()
+            .expect("migration should bind the original state parent before waiting");
+
+        let original_parent = root.join("state-original");
+        fs::rename(&state_parent, &original_parent)
+            .expect("original state parent should move out of the configured path");
+        fs::create_dir(&state_parent).expect("replacement state parent should create");
+        let replacement_state = AuthState {
+            cookie: "SESSDATA=attacker".to_string(),
+            mid: 999,
+            uname: "replacement".to_string(),
+            stored_at_unix: 1,
+        };
+        fs::write(
+            state_parent.join("state.json"),
+            serde_json::to_vec(&replacement_state).expect("replacement state should encode"),
+        )
+        .expect("replacement state should write");
+        set_file_private(&state_parent.join("state.json"));
+        drop(held_lock);
+
+        let error = migration
+            .join()
+            .expect("migration thread should finish")
+            .expect_err("replaced state parent must reject the delayed migration");
+        assert!(
+            format!("{error:#}").contains("configured output root identity changed"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            load_auth_state(&original_parent.join("state.json"))
+                .expect("original state should remain readable"),
+            Some(test_state())
+        );
+        assert_eq!(
+            load_auth_state(&state_parent.join("state.json"))
+                .expect("replacement state should remain readable"),
+            Some(replacement_state)
+        );
+        assert!(
+            !credential_file.exists(),
+            "migration must not write credentials from replacement state"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_epoch_rejects_a_retargetable_credential_ancestor_before_epoch_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let state_path = temp_state_file("auth-epoch-ancestor-symlink-retarget");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let first_root = root.join("credential-store-first");
+        let second_root = root.join("credential-store-second");
+        let parent_link = root.join("credential-store-link");
+        let first_parent = first_root.join("profiles");
+        let second_parent = second_root.join("profiles");
+        fs::create_dir_all(&first_parent).expect("first credential parent should create");
+        fs::create_dir_all(&second_parent).expect("second credential parent should create");
+        symlink(&first_root, &parent_link).expect("initial credential symlink should create");
+        let credential_file = parent_link.join("profiles").join("credentials.json");
+
+        let error = with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+            .expect_err("retargetable credential ancestors must be rejected before epoch capture");
+
+        assert!(
+            error
+                .to_string()
+                .contains("BBDown credential path must not resolve through a symbolic link")
+        );
+        assert!(
+            !auth_mutation_lock_path(&first_parent.join("credentials.json")).exists(),
+            "rejected credential paths must not create the first target's lock"
+        );
+        assert!(
+            !auth_mutation_lock_path(&second_parent.join("credentials.json")).exists(),
+            "rejected credential paths must not create another target's lock"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cross_process_logout_cannot_be_undone_by_legacy_cookie_migration() {
+        use std::process::Command;
+        use std::sync::mpsc::sync_channel;
+        use std::thread;
+        use std::time::Duration;
+
+        let state_path = temp_state_file("bbdown-rust-cross-process-logout");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        let child_started = root.join("logout-child-started");
+        save_auth_state(&state_path, &test_state()).expect("state should save");
+        let (read_tx, read_rx) = sync_channel(0);
+        let (release_tx, release_rx) = sync_channel(0);
+        let migration_state = state_path.clone();
+        let migration_credentials = credential_file.clone();
+        let migration = thread::spawn(move || {
+            sync_bbdown_rust_credentials_from_state_with_hook(
+                &migration_state,
+                &migration_credentials,
+                None,
+                || {
+                    read_tx.send(()).expect("legacy read signal should send");
+                    release_rx
+                        .recv()
+                        .expect("migration release signal should arrive");
+                },
+            )
+        });
+        read_rx
+            .recv()
+            .expect("migration should read legacy state while holding the shared lock");
+
+        let mut child = Command::new(std::env::current_exe().expect("test binary should resolve"))
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("bilibili_auth::tests::cross_process_logout_child")
+            .arg("--nocapture")
+            .env("TVD_AUTH_RACE_CHILD_ROOT", &root)
+            .spawn()
+            .expect("logout child should start");
+        for _ in 0..100 {
+            if child_started.is_file() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            child_started.is_file(),
+            "logout child did not reach the lock"
+        );
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            child
+                .try_wait()
+                .expect("child status should read")
+                .is_none(),
+            "logout must wait while migration owns the cross-process lock"
+        );
+
+        release_tx
+            .send(())
+            .expect("migration should be released before logout");
+        assert!(
+            migration
+                .join()
+                .expect("migration thread should finish")
+                .expect("migration should succeed")
+        );
+        let output = child
+            .wait_with_output()
+            .expect("logout child output should collect");
+        assert!(
+            output.status.success(),
+            "logout child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!state_path.exists());
+        assert!(!credential_file.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_recovery_finishes_a_logout_interrupted_after_legacy_state_cleanup() {
+        let state_path = temp_state_file("interrupted-profile-logout");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        fs::create_dir_all(&root).expect("auth root should create");
+        save_auth_state(&state_path, &test_state()).expect("legacy state should save");
+        fs::write(
+            &credential_file,
+            r#"{"version":1,"default_profile":"default","profiles":{"default":{"cookie":"SESSDATA=default"},"intl":{"cookie":"SESSDATA=intl"}}}"#,
+        )
+        .expect("credential profiles should write");
+        set_file_private(&credential_file);
+
+        let ((legacy_state, credential_state), _) = logout_bbdown_auth_with_epoch_and_hook(
+            &state_path,
+            &credential_file,
+            Some("  intl  "),
+            || Err(anyhow!("simulated crash after legacy state cleanup")),
+        )
+        .expect("logout transaction should persist its recovery intent");
+
+        assert!(legacy_state.expect("legacy state should be removed"));
+        assert!(credential_state.is_err());
+        assert!(!state_path.exists());
+        assert!(
+            auth_logout_intent_path(&credential_file).is_file(),
+            "interrupted logout must retain its durable intent"
+        );
+        let store = CredentialStore::new(credential_file.clone());
+        assert_eq!(
+            store
+                .load_selected_profile(
+                    &CredentialProfileSelection::named("intl").expect("profile should parse"),
+                )
+                .expect("interrupted profile should load")
+                .cookie
+                .as_deref(),
+            Some("SESSDATA=intl")
+        );
+
+        let messages = recover_interrupted_auth_cleanup(&state_path, &credential_file)
+            .expect("startup should finish the interrupted logout");
+
+        assert!(
+            messages
+                .iter()
+                .any(|message| message == "Recovered interrupted BBDown logout")
+        );
+        assert!(!auth_logout_intent_path(&credential_file).exists());
+        let store = CredentialStore::new(credential_file.clone());
+        assert!(
+            store
+                .load_selected_profile(
+                    &CredentialProfileSelection::named("intl").expect("profile should parse"),
+                )
+                .expect("recovered profile should load")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .load_selected_profile(&CredentialProfileSelection::default_profile())
+                .expect("default profile should remain")
+                .cookie
+                .as_deref(),
+            Some("SESSDATA=default")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_recovery_clears_the_default_profile_selected_when_logout_started() {
+        let state_path = temp_state_file("interrupted-default-profile-logout");
+        let root = state_path
+            .parent()
+            .expect("state should have a parent")
+            .to_path_buf();
+        let credential_file = root.join("credentials.json");
+        fs::create_dir_all(&root).expect("auth root should create");
+        save_auth_state(&state_path, &test_state()).expect("legacy state should save");
+        fs::write(
+            &credential_file,
+            r#"{"version":1,"default_profile":"current","profiles":{"current":{"cookie":"SESSDATA=current"},"replacement":{"cookie":"SESSDATA=replacement"}}}"#,
+        )
+        .expect("credential profiles should write");
+        set_file_private(&credential_file);
+
+        let ((legacy_state, credential_state), _) =
+            logout_bbdown_auth_with_epoch_and_hook(&state_path, &credential_file, None, || {
+                Err(anyhow!("simulated crash after legacy state cleanup"))
+            })
+            .expect("logout transaction should persist its recovery intent");
+
+        assert!(legacy_state.expect("legacy state should be removed"));
+        assert!(credential_state.is_err());
+        let store = CredentialStore::new(credential_file.clone());
+        store
+            .update_profiles(|profiles| {
+                profiles.set_default_profile("replacement")?;
+                Ok(())
+            })
+            .expect("test should change the default profile after interruption");
+        set_file_private(&credential_file);
+
+        recover_interrupted_auth_cleanup(&state_path, &credential_file)
+            .expect("startup should finish the interrupted logout");
+
+        let store = CredentialStore::new(credential_file.clone());
+        assert!(
+            store
+                .load_selected_profile(
+                    &CredentialProfileSelection::named("current").expect("profile should parse"),
+                )
+                .expect("recorded profile should load")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .load_selected_profile(&CredentialProfileSelection::default_profile())
+                .expect("replacement default profile should load")
+                .cookie
+                .as_deref(),
+            Some("SESSDATA=replacement")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "spawned by cross_process_logout_cannot_be_undone_by_legacy_cookie_migration"]
+    fn cross_process_logout_child() {
+        let root = PathBuf::from(
+            std::env::var_os("TVD_AUTH_RACE_CHILD_ROOT")
+                .expect("child root must be provided by the parent test"),
+        );
+        let state_path = root.join("state.json");
+        let credential_file = root.join("credentials.json");
+        fs::write(root.join("logout-child-started"), b"started")
+            .expect("child start marker should write");
+
+        let (legacy, credentials) =
+            clear_auth_state_and_credentials(&state_path, &credential_file, |_| {
+                match fs::remove_file(&credential_file) {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(err) => Err(err).context("failed to clear child credentials"),
+                }
+            })
+            .expect("child should acquire the shared auth lock");
+        legacy.expect("child should clear legacy state");
+        credentials.expect("child should clear credentials");
     }
 
     fn test_poll(code: i64, cookie: Option<String>) -> LoginPoll {
@@ -962,7 +5287,8 @@ mod tests {
         let path = temp_state_file("bbdown-config");
         save_auth_state(&path, &test_state()).expect("state should save");
 
-        let config_path = ensure_bbdown_config_file(&path, None)
+        let credential_file = path.with_file_name("credentials.json");
+        let config_path = ensure_bbdown_config_file(&path, &credential_file, None)
             .expect("BBDown config should save")
             .expect("BBDown config should be present");
         assert!(
@@ -975,14 +5301,14 @@ mod tests {
         fs::write(&legacy_config_path, "--cookie legacy\n").expect("legacy config should write");
         let content = fs::read_to_string(&config_path).expect("BBDown config should be readable");
         assert_eq!(content, "--cookie\nSESSDATA=secret; bili_jct=csrf\n");
-        assert!(delete_auth_state(&path).expect("auth delete should succeed"));
+        assert!(delete_auth_state(&path, &credential_file).expect("auth delete should succeed"));
         assert!(!path.exists());
         assert!(config_path.exists());
         release_bbdown_config_file(&config_path);
         assert!(!config_path.exists());
-        let stale_config_path = bbdown_config_dir(&path).join("stale.config.tmp");
+        let stale_config_path = bbdown_config_dir(&path).join("cookie.config.1.2.3.tmp");
         fs::write(&stale_config_path, "--cookie\nstale\n").expect("stale config should write");
-        assert!(delete_auth_state(&path).expect("stale config should delete"));
+        assert!(delete_auth_state(&path, &credential_file).expect("stale config should delete"));
         assert!(!stale_config_path.exists());
         assert!(!legacy_config_path.exists());
 
@@ -1004,9 +5330,11 @@ mod tests {
         .expect("base config parent should be created");
         fs::write(&base_config_path, "--dfn-priority\n1080P\n").expect("base config should write");
 
-        let config_path = ensure_bbdown_config_file(&path, Some(&base_config_path))
-            .expect("BBDown config should save")
-            .expect("BBDown config should be present");
+        let credential_file = path.with_file_name("credentials.json");
+        let config_path =
+            ensure_bbdown_config_file(&path, &credential_file, Some(&base_config_path))
+                .expect("BBDown config should save")
+                .expect("BBDown config should be present");
         let content = fs::read_to_string(&config_path).expect("BBDown config should be readable");
 
         assert_eq!(
@@ -1031,6 +5359,364 @@ mod tests {
         assert_ne!(temp_state_path(&path), temp_state_path(&path));
     }
 
+    #[test]
+    fn auth_epoch_persists_across_independent_file_locks() {
+        let state_path = temp_state_file("auth-epoch-persistence");
+        let credential_file = state_path.with_file_name("credentials.json");
+
+        let initial = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect("initial auth lock should open");
+        assert_eq!(
+            initial.current_epoch().expect("epoch should read").value(),
+            0
+        );
+        drop(initial);
+        let lock_path = auth_mutation_lock_path(&credential_file);
+        assert!(
+            fs::read(&lock_path)
+                .expect("initialized auth lock should read")
+                .starts_with(AUTH_LOCK_HEADER)
+        );
+
+        let (_, first_epoch) =
+            with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+                .expect("first auth mutation should commit its epoch");
+        assert_eq!(first_epoch.value(), 1);
+
+        let reopened = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect("auth lock should reopen");
+        assert_eq!(
+            reopened
+                .current_epoch()
+                .expect("epoch should persist")
+                .value(),
+            1
+        );
+        drop(reopened);
+
+        let (_, second_epoch) = with_auth_mutation_transaction_at_epoch(
+            &state_path,
+            &credential_file,
+            first_epoch,
+            |_| Ok(()),
+        )
+        .expect("second auth mutation should commit its epoch");
+        assert_eq!(second_epoch.value(), 2);
+
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn auth_epoch_rejects_a_stale_mutation_before_running_it() {
+        use std::cell::Cell;
+
+        let state_path = temp_state_file("auth-epoch-stale-mutation");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let (_, pending_epoch) =
+            with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+                .expect("initial auth mutation should commit");
+        let (_, current_epoch) =
+            with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+                .expect("second auth mutation should commit");
+        let called = Cell::new(false);
+
+        let error = with_auth_mutation_transaction_at_epoch(
+            &state_path,
+            &credential_file,
+            pending_epoch,
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("stale auth mutation must fail");
+
+        assert!(error.to_string().contains("credential state changed"));
+        assert!(!called.get());
+        let current = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect("auth lock should reopen");
+        assert_eq!(
+            current.current_epoch().expect("epoch should remain stable"),
+            current_epoch
+        );
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_epoch_survives_primary_lock_unlink_before_a_stale_login_reply() {
+        use std::cell::Cell;
+        use std::os::unix::fs::MetadataExt;
+
+        let state_path = temp_state_file("auth-epoch-primary-unlink");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let pending_login = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect("pending login should capture the initial epoch");
+        let pending_epoch = pending_login.current_epoch().expect("epoch should read");
+        drop(pending_login);
+        let (_, logout_epoch) =
+            with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+                .expect("logout mutation should advance the epoch");
+        assert_eq!(pending_epoch.value(), 0);
+        assert_eq!(logout_epoch.value(), 1);
+
+        let lock_path = auth_mutation_lock_path(&credential_file);
+        let anchor_path = auth_mutation_lock_anchor_path(&credential_file);
+        fs::remove_file(&lock_path).expect("primary auth lock alias should unlink");
+        let called = Cell::new(false);
+        let error = with_auth_mutation_transaction_at_epoch(
+            &state_path,
+            &credential_file,
+            pending_epoch,
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("a stale pending login must remain rejected after primary unlink");
+
+        assert!(error.to_string().contains("credential state changed"));
+        assert!(!called.get());
+        let primary = fs::symlink_metadata(&lock_path).expect("primary alias should be restored");
+        let anchor = fs::symlink_metadata(&anchor_path).expect("anchor should remain linked");
+        assert_eq!((primary.dev(), primary.ino()), (anchor.dev(), anchor.ino()));
+        assert_eq!(primary.nlink(), 2);
+        let current = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect("auth lock should reopen from the anchored epoch");
+        assert_eq!(current.current_epoch().unwrap(), logout_epoch);
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_epoch_pair_loss_fails_closed_across_processes() {
+        use std::cell::Cell;
+        use std::process::Command;
+
+        let state_path = temp_state_file("auth-epoch-pair-loss");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let (_, pending_epoch) =
+            with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+                .expect("pending login epoch should initialize");
+        assert_eq!(pending_epoch.value(), 1);
+        let lock_path = auth_mutation_lock_path(&credential_file);
+        let anchor_path = auth_mutation_lock_anchor_path(&credential_file);
+        let owner_path = auth_mutation_lock_owner_path(&credential_file);
+        fs::remove_file(&lock_path).expect("primary auth lock alias should unlink");
+        fs::remove_file(&anchor_path).expect("auth lock anchor should unlink");
+
+        let output = Command::new(std::env::current_exe().expect("test binary should resolve"))
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("bilibili_auth::tests::auth_epoch_pair_loss_child")
+            .arg("--nocapture")
+            .env("TVD_AUTH_STATE_PATH", &state_path)
+            .env("TVD_AUTH_CREDENTIAL_PATH", &credential_file)
+            .output()
+            .expect("cross-process auth mutation probe should run");
+        assert!(
+            output.status.success(),
+            "cross-process auth mutation probe failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let called = Cell::new(false);
+        let error = with_auth_mutation_transaction_at_epoch(
+            &state_path,
+            &credential_file,
+            pending_epoch,
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("pair loss must reject a stale login instead of resetting its epoch");
+        assert!(format!("{error:#}").contains("aliases disappeared after initialization"));
+        assert!(!called.get());
+        assert!(owner_path.is_file());
+        assert!(!lock_path.exists());
+        assert!(!anchor_path.exists());
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "spawned by auth_epoch_pair_loss_fails_closed_across_processes"]
+    fn auth_epoch_pair_loss_child() {
+        let state_path = PathBuf::from(
+            std::env::var_os("TVD_AUTH_STATE_PATH").expect("state path should be provided"),
+        );
+        let credential_file = PathBuf::from(
+            std::env::var_os("TVD_AUTH_CREDENTIAL_PATH")
+                .expect("credential path should be provided"),
+        );
+        let error = with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+            .expect_err("another process must not recreate a lost auth lock pair");
+        assert!(format!("{error:#}").contains("aliases disappeared after initialization"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_lock_rejects_a_replaced_primary_alias_unchanged() {
+        let state_path = temp_state_file("auth-lock-replaced-primary");
+        let credential_file = state_path.with_file_name("credentials.json");
+        drop(
+            acquire_auth_reply_file_lock(&state_path, &credential_file)
+                .expect("auth lock should initialize"),
+        );
+        let lock_path = auth_mutation_lock_path(&credential_file);
+        let anchor_path = auth_mutation_lock_anchor_path(&credential_file);
+        fs::remove_file(&lock_path).expect("primary auth lock alias should unlink");
+        fs::write(&lock_path, b"user-owned replacement").expect("replacement should be written");
+
+        let error = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect_err("a replaced primary auth lock alias must fail closed");
+
+        assert!(format!("{error:#}").contains("path or ownership changed"));
+        assert_eq!(fs::read(&lock_path).unwrap(), b"user-owned replacement");
+        assert!(anchor_path.is_file());
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn auth_epoch_migrates_an_incomplete_legacy_log_to_fixed_slots() {
+        let state_path = temp_state_file("auth-epoch-incomplete-record");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let lock_path = auth_mutation_lock_path(&credential_file);
+        fs::create_dir_all(lock_path.parent().expect("lock path should have a parent"))
+            .expect("lock parent should create");
+        fs::write(&lock_path, b"1\n2").expect("legacy epoch log should write");
+
+        let (_, repaired_epoch) =
+            with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+                .expect("next auth mutation should migrate the epoch log");
+
+        assert_eq!(repaired_epoch.value(), 2);
+        let reopened = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect("auth lock should reopen");
+        assert_eq!(
+            reopened
+                .current_epoch()
+                .expect("epoch should persist")
+                .value(),
+            2
+        );
+        assert!(
+            fs::metadata(&lock_path)
+                .expect("auth epoch file should exist")
+                .len()
+                <= AUTH_EPOCH_LOG_LIMIT + (AUTH_EPOCH_SLOT_SIZE * AUTH_EPOCH_SLOT_COUNT) as u64
+        );
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn auth_epoch_near_legacy_limit_migrates_without_growing_again() {
+        let state_path = temp_state_file("auth-epoch-near-limit");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let lock_path = auth_mutation_lock_path(&credential_file);
+        fs::create_dir_all(lock_path.parent().expect("lock path should have a parent"))
+            .expect("lock parent should create");
+        let mut legacy = String::new();
+        let mut epoch = 0_u64;
+        loop {
+            let next = epoch + 1;
+            let record = format!("{next}\n");
+            if legacy.len() + record.len() > AUTH_EPOCH_LOG_LIMIT as usize {
+                break;
+            }
+            legacy.push_str(&record);
+            epoch = next;
+        }
+        fs::write(&lock_path, legacy).expect("near-limit legacy epoch log should write");
+
+        let (_, migrated_epoch) =
+            with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+                .expect("near-limit legacy epoch should migrate");
+        assert_eq!(migrated_epoch.value(), epoch + 1);
+        for expected in (migrated_epoch.value() + 1)..=(migrated_epoch.value() + 4) {
+            let (_, observed) =
+                with_auth_mutation_transaction(&state_path, &credential_file, |_| Ok(()))
+                    .expect("fixed epoch slot should continue advancing");
+            assert_eq!(observed.value(), expected);
+        }
+        assert_eq!(
+            fs::metadata(&lock_path)
+                .expect("auth epoch file should exist")
+                .len(),
+            AUTH_EPOCH_LOG_LIMIT + (AUTH_EPOCH_SLOT_SIZE * AUTH_EPOCH_SLOT_COUNT) as u64
+        );
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn no_op_legacy_sync_keeps_the_auth_epoch_stable() {
+        let state_path = temp_state_file("auth-epoch-no-op-sync");
+        let credential_file = state_path.with_file_name("credentials.json");
+        save_auth_state(&state_path, &test_state()).expect("state should save");
+        fs::write(&credential_file, r#"{"cookie":"fresh-cookie"}"#)
+            .expect("credential file should write");
+
+        let (sync_result, observed_epoch) =
+            sync_bbdown_rust_credentials_from_state_with_epoch(&state_path, &credential_file, None)
+                .expect("no-op credential sync should succeed");
+
+        assert!(!sync_result.expect("sync result should be available"));
+        assert_eq!(observed_epoch.value(), 0);
+        let reopened = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect("auth lock should open");
+        assert_eq!(
+            reopened.current_epoch().expect("epoch should read").value(),
+            0
+        );
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_mutation_lock_rejects_unknown_regular_file_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_path = temp_state_file("auth-lock-unknown-regular");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let lock_path = auth_mutation_lock_path(&credential_file);
+        fs::create_dir_all(lock_path.parent().expect("lock path should have a parent"))
+            .expect("lock parent should create");
+        fs::write(&lock_path, b"unrelated user data").expect("unrelated file should write");
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644))
+            .expect("unrelated permissions should set");
+
+        let error = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect_err("unknown regular file must not be adopted as an auth lock");
+
+        assert!(format!("{error:#}").contains("not a recognized legacy epoch log"));
+        assert_eq!(fs::read(&lock_path).unwrap(), b"unrelated user data");
+        assert_eq!(
+            fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn saves_auth_state_with_private_permissions() {
@@ -1047,6 +5733,64 @@ mod tests {
         assert_eq!(mode, 0o600);
 
         if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_mutation_lock_never_follows_a_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let state_path = temp_state_file("auth-lock-symlink");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let victim = state_path.with_file_name("victim.txt");
+        save_auth_state(&state_path, &test_state()).expect("state should save");
+        fs::write(&victim, b"victim").expect("victim should write");
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644))
+            .expect("victim permissions should set");
+        symlink(&victim, auth_mutation_lock_path(&credential_file))
+            .expect("lock symlink should create");
+
+        let error = sync_bbdown_rust_credentials_from_state(&state_path, &credential_file, None)
+            .expect_err("symlinked auth lock must be rejected");
+
+        assert!(format!("{error:#}").contains("failed to open BBDown auth lock"));
+        assert_eq!(fs::read(&victim).unwrap(), b"victim");
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_mutation_lock_rejects_hard_link_aliases() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_path = temp_state_file("auth-lock-hard-link");
+        let credential_file = state_path.with_file_name("credentials.json");
+        let victim = state_path.with_file_name("victim.txt");
+        save_auth_state(&state_path, &test_state()).expect("state should save");
+        fs::write(&victim, b"victim").expect("victim should write");
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644))
+            .expect("victim permissions should set");
+        fs::hard_link(&victim, auth_mutation_lock_path(&credential_file))
+            .expect("lock hard link should create");
+
+        let error = sync_bbdown_rust_credentials_from_state(&state_path, &credential_file, None)
+            .expect_err("aliased auth lock must be rejected");
+
+        assert!(format!("{error:#}").contains("hard-link aliases"));
+        assert_eq!(fs::read(&victim).unwrap(), b"victim");
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        if let Some(parent) = state_path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
     }

@@ -6,10 +6,18 @@ use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use crate::redaction::redact_sensitive_text;
+
 #[derive(Debug, Clone)]
 pub struct TelegramClient {
     client: Client,
     token: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundTextPolicy {
+    RedactCredentials,
+    AllowAuthSecret,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,7 +153,13 @@ impl TelegramClient {
     }
 
     pub async fn send_message(&self, chat_id: i64, text: String) -> Result<i64> {
-        self.send_message_payload(chat_id, text, None).await
+        self.send_message_payload(chat_id, text, None, OutboundTextPolicy::RedactCredentials)
+            .await
+    }
+
+    pub async fn send_auth_secret_message(&self, chat_id: i64, text: String) -> Result<i64> {
+        self.send_message_payload(chat_id, text, None, OutboundTextPolicy::AllowAuthSecret)
+            .await
     }
 
     pub async fn send_message_with_inline_keyboard(
@@ -154,8 +168,13 @@ impl TelegramClient {
         text: String,
         reply_markup: InlineKeyboardMarkup,
     ) -> Result<i64> {
-        self.send_message_payload(chat_id, text, Some(reply_markup))
-            .await
+        self.send_message_payload(
+            chat_id,
+            text,
+            Some(reply_markup),
+            OutboundTextPolicy::RedactCredentials,
+        )
+        .await
     }
 
     async fn send_message_payload(
@@ -163,7 +182,9 @@ impl TelegramClient {
         chat_id: i64,
         text: String,
         reply_markup: Option<InlineKeyboardMarkup>,
+        policy: OutboundTextPolicy,
     ) -> Result<i64> {
+        let text = prepare_outbound_text(text, policy);
         info!(
             chat_id,
             text = %redact_sensitive_text(&text),
@@ -230,6 +251,7 @@ impl TelegramClient {
         text: String,
         reply_markup: Option<InlineKeyboardMarkup>,
     ) -> Result<()> {
+        let text = redact_sensitive_text(&text);
         info!(
             chat_id,
             message_id,
@@ -291,6 +313,7 @@ impl TelegramClient {
         callback_query_id: String,
         text: String,
     ) -> Result<()> {
+        let text = redact_sensitive_text(&text);
         let payload = AnswerCallbackQueryRequest {
             callback_query_id,
             text: (!text.trim().is_empty()).then_some(text),
@@ -317,6 +340,7 @@ impl TelegramClient {
     }
 
     pub async fn send_photo(&self, chat_id: i64, caption: String, png: Vec<u8>) -> Result<()> {
+        let caption = redact_sensitive_text(&caption);
         info!(
             chat_id,
             caption = %redact_sensitive_text(&caption),
@@ -395,19 +419,11 @@ fn strip_reqwest_url(error: reqwest::Error) -> reqwest::Error {
     error.without_url()
 }
 
-fn redact_sensitive_text(text: &str) -> String {
-    let mut redacted = String::with_capacity(text.len());
-    for line in text.lines() {
-        if !redacted.is_empty() {
-            redacted.push('\n');
-        }
-        if line.contains("passport.bilibili.com") && line.contains("qrcode_key=") {
-            redacted.push_str("<redacted Bilibili login QR URL>");
-        } else {
-            redacted.push_str(line);
-        }
+fn prepare_outbound_text(text: String, policy: OutboundTextPolicy) -> String {
+    match policy {
+        OutboundTextPolicy::RedactCredentials => redact_sensitive_text(&text),
+        OutboundTextPolicy::AllowAuthSecret => text,
     }
-    redacted
 }
 
 #[cfg(test)]
@@ -445,6 +461,41 @@ mod tests {
             redact_sensitive_text("https://www.bilibili.com/video/BV123"),
             "https://www.bilibili.com/video/BV123"
         );
+        assert_eq!(
+            redact_sensitive_text(
+                "https://www.biliplus.com/login?balh_auth=1&balh_auth_origin=https%3A%2F%2Fwww.bilibili.com"
+            ),
+            "<redacted BBDown access-key authorization URL>"
+        );
+        assert_eq!(
+            redact_sensitive_text(
+                "https://www.bilibili.com/callback?access_token=secret&refresh_token=refresh"
+            ),
+            "<redacted BBDown access-key callback URL>"
+        );
+        assert_eq!(
+            redact_sensitive_text("https://www.bilibili.com/callback#access_key=secret"),
+            "<redacted BBDown access-key callback URL>"
+        );
+        assert_eq!(
+            redact_sensitive_text("balh-login-credentials: {\"access_key\":\"secret\"}"),
+            "<redacted BBDown access-key callback message>"
+        );
+        assert_eq!(
+            redact_sensitive_text("{\"access_key\":\"secret\",\"refresh_token\":\"refresh\"}"),
+            "<redacted BBDown access-key callback message>"
+        );
+    }
+
+    #[test]
+    fn redacts_credentials_from_standard_payloads_but_preserves_explicit_auth_links() {
+        let text = "Authorization link: https://example.test/?access_key=secret".to_string();
+
+        let redacted = prepare_outbound_text(text.clone(), OutboundTextPolicy::RedactCredentials);
+        let explicit = prepare_outbound_text(text.clone(), OutboundTextPolicy::AllowAuthSecret);
+
+        assert!(!redacted.contains("secret"));
+        assert_eq!(explicit, text);
     }
 
     #[test]

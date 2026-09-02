@@ -1,10 +1,25 @@
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobRequest {
-    Bilibili { url: String },
-    Youtube { url: String },
-    Pdf { url: String },
+    Bilibili {
+        url: String,
+        selection: Option<BilibiliSelection>,
+    },
+    Youtube {
+        url: String,
+    },
+    Pdf {
+        url: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum BilibiliSelection {
+    Latest,
+    All,
+    Page(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,9 +35,16 @@ pub enum RouteResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BilibiliAuthCommand {
-    Login,
+    Login(BilibiliAuthLoginMode),
     Status,
     Logout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BilibiliAuthLoginMode {
+    Web,
+    Tv,
+    AccessKey,
 }
 
 impl JobRequest {
@@ -31,6 +53,25 @@ impl JobRequest {
             Self::Bilibili { .. } => "Bilibili download",
             Self::Youtube { .. } => "YouTube download",
             Self::Pdf { .. } => "PDF capture",
+        }
+    }
+
+    pub fn requires_bilibili_selection(&self) -> bool {
+        match self {
+            Self::Bilibili { url, selection } => {
+                selection.is_none() && bilibili_url_requires_selection(url)
+            }
+            Self::Youtube { .. } | Self::Pdf { .. } => false,
+        }
+    }
+}
+
+impl BilibiliSelection {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Latest => "latest episode",
+            Self::All => "all episodes",
+            Self::Page(_) => "selected video page",
         }
     }
 }
@@ -48,7 +89,12 @@ pub fn route_message(text: &str, auto_pdf_domains: &[String]) -> RouteResult {
     if let Some(args) = bbdown_command_args(trimmed) {
         let mut parts = args.split_whitespace();
         return match (parts.next(), parts.next()) {
-            (Some("login"), None) => RouteResult::BilibiliAuth(BilibiliAuthCommand::Login),
+            (Some("login"), mode) => match parse_bilibili_auth_login_mode(mode) {
+                Some(mode) if parts.next().is_none() => {
+                    RouteResult::BilibiliAuth(BilibiliAuthCommand::Login(mode))
+                }
+                _ => RouteResult::BilibiliAuthUsage,
+            },
             (Some("status"), None) => RouteResult::BilibiliAuth(BilibiliAuthCommand::Status),
             (Some("logout"), None) => RouteResult::BilibiliAuth(BilibiliAuthCommand::Logout),
             _ => RouteResult::BilibiliAuthUsage,
@@ -109,6 +155,17 @@ fn classify_url(raw_url: &str, auto_pdf_domains: &[String]) -> Option<JobRequest
         .or_else(|| classify_auto_pdf_url(raw_url, auto_pdf_domains))
 }
 
+fn parse_bilibili_auth_login_mode(mode: Option<&str>) -> Option<BilibiliAuthLoginMode> {
+    match mode {
+        None | Some("web") | Some("cookie") => Some(BilibiliAuthLoginMode::Web),
+        Some("tv") => Some(BilibiliAuthLoginMode::Tv),
+        Some("access-key" | "access_key" | "accesskey" | "intl" | "bstar") => {
+            Some(BilibiliAuthLoginMode::AccessKey)
+        }
+        Some(_) => None,
+    }
+}
+
 fn classify_bilibili_opus_url(raw_url: &str) -> Option<JobRequest> {
     let url = Url::parse(raw_url).ok()?;
     let host = url.host_str()?.to_ascii_lowercase();
@@ -135,9 +192,10 @@ fn classify_video_url(raw_url: &str) -> Option<JobRequest> {
     let url = Url::parse(raw_url).ok()?;
     let host = url.host_str()?.to_ascii_lowercase();
 
-    if host == "b23.tv" || is_bilibili_video_url(&host, &url) {
+    if is_b23_short_link_url(raw_url) || is_bilibili_video_url(&host, &url) {
         Some(JobRequest::Bilibili {
             url: raw_url.to_string(),
+            selection: bilibili_selection_from_url(raw_url),
         })
     } else if is_youtube_host(&host) {
         Some(JobRequest::Youtube {
@@ -154,18 +212,92 @@ fn has_bilibili_opus_path(url: &Url) -> bool {
 }
 
 fn is_bilibili_video_url(host: &str, url: &Url) -> bool {
+    if domain_or_subdomain(host, "bilibili.tv") {
+        return is_bilibili_intl_video_url(url);
+    }
+
     if !domain_or_subdomain(host, "bilibili.com") || has_bilibili_opus_path(url) {
         return false;
     }
 
+    is_bilibili_standard_video_url(url)
+        || url.path_segments().is_some_and(|mut segments| {
+            matches!(
+                (segments.next(), segments.next()),
+                (Some("bangumi"), Some("play" | "media"))
+            )
+        })
+}
+
+fn is_bilibili_standard_video_url(url: &Url) -> bool {
     let Some(mut segments) = url.path_segments() else {
         return false;
     };
-    match segments.next() {
-        Some("video") => segments
-            .next()
-            .is_some_and(|id| id.starts_with("BV") || id.starts_with("av")),
-        Some("bangumi") => matches!(segments.next(), Some("play")),
+    matches!(
+        (segments.next(), segments.next()),
+        (Some("video"), Some(id)) if id.starts_with("BV") || id.starts_with("av")
+    )
+}
+
+fn is_bilibili_intl_video_url(url: &Url) -> bool {
+    let Some(mut segments) = url.path_segments() else {
+        return false;
+    };
+    matches!(
+        (segments.next(), segments.next(), segments.next(), segments.next()),
+        (Some(_locale), Some("play"), Some(_season_id), Some(episode_id))
+            if !episode_id.is_empty() && episode_id.chars().all(|ch| ch.is_ascii_digit())
+    )
+}
+
+pub(crate) fn bilibili_selection_from_url(raw_url: &str) -> Option<BilibiliSelection> {
+    let url = Url::parse(raw_url).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    if !is_b23_short_link_url(raw_url)
+        && (!domain_or_subdomain(&host, "bilibili.com") || !is_bilibili_standard_video_url(&url))
+    {
+        return None;
+    }
+
+    url.query_pairs()
+        .find(|(name, _)| name == "p")
+        .and_then(|(_, value)| value.parse::<u32>().ok())
+        .filter(|page| *page > 0)
+        .map(BilibiliSelection::Page)
+}
+
+pub(crate) fn is_b23_short_link_url(raw_url: &str) -> bool {
+    Url::parse(raw_url).ok().is_some_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url
+                .host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case("b23.tv"))
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
+}
+
+fn bilibili_url_requires_selection(raw_url: &str) -> bool {
+    let Ok(url) = Url::parse(raw_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    if !domain_or_subdomain(&host, "bilibili.com") {
+        return false;
+    }
+    if url.query_pairs().any(|(name, value)| {
+        name == "ep_id" && value.parse::<u64>().is_ok_and(|episode_id| episode_id > 0)
+    }) {
+        return false;
+    }
+    let Some(mut segments) = url.path_segments() else {
+        return false;
+    };
+    match (segments.next(), segments.next(), segments.next()) {
+        (Some("bangumi"), Some("play"), Some(id)) => id.starts_with("ss"),
+        (Some("bangumi"), Some("media"), Some(id)) => id.starts_with("md"),
         _ => false,
     }
 }
@@ -346,13 +478,15 @@ mod tests {
         assert_eq!(
             route_message("https://www.bilibili.com/video/BV123", &auto_pdf_domains()),
             RouteResult::Jobs(vec![JobRequest::Bilibili {
-                url: "https://www.bilibili.com/video/BV123".to_string()
+                url: "https://www.bilibili.com/video/BV123".to_string(),
+                selection: None
             }])
         );
         assert_eq!(
             route_message("https://b23.tv/abc", &auto_pdf_domains()),
             RouteResult::Jobs(vec![JobRequest::Bilibili {
-                url: "https://b23.tv/abc".to_string()
+                url: "https://b23.tv/abc".to_string(),
+                selection: None
             }])
         );
         assert_eq!(
@@ -361,8 +495,127 @@ mod tests {
                 &auto_pdf_domains()
             ),
             RouteResult::Jobs(vec![JobRequest::Bilibili {
-                url: "https://www.bilibili.com/bangumi/play/ep123456".to_string()
+                url: "https://www.bilibili.com/bangumi/play/ep123456".to_string(),
+                selection: None
             }])
+        );
+    }
+
+    #[test]
+    fn preserves_bilibili_video_page_selection() {
+        assert_eq!(
+            route_message(
+                "https://www.bilibili.com/video/BV12TRrBcEP8/?p=2&share_source=copy_web",
+                &auto_pdf_domains()
+            ),
+            RouteResult::Jobs(vec![JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV12TRrBcEP8/?p=2&share_source=copy_web"
+                    .to_string(),
+                selection: Some(BilibiliSelection::Page(2)),
+            }])
+        );
+        assert_eq!(
+            route_message("https://b23.tv/abc?p=3", &auto_pdf_domains()),
+            RouteResult::Jobs(vec![JobRequest::Bilibili {
+                url: "https://b23.tv/abc?p=3".to_string(),
+                selection: Some(BilibiliSelection::Page(3)),
+            }])
+        );
+        assert_eq!(
+            bilibili_selection_from_url("https://www.bilibili.com/video/BV12TRrBcEP8/?p=0"),
+            None
+        );
+        assert_eq!(
+            bilibili_selection_from_url("https://www.bilibili.com/video/BV12TRrBcEP8/?p=invalid"),
+            None
+        );
+        assert!(!is_b23_short_link_url("https://user:pass@b23.tv/abc"));
+    }
+
+    #[test]
+    fn routes_bilibili_season_media_and_intl() {
+        assert_eq!(
+            route_message(
+                "https://www.bilibili.com/bangumi/play/ss12345",
+                &auto_pdf_domains()
+            ),
+            RouteResult::Jobs(vec![JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
+                selection: None
+            }])
+        );
+        assert_eq!(
+            route_message(
+                "https://www.bilibili.com/bangumi/media/md12345",
+                &auto_pdf_domains()
+            ),
+            RouteResult::Jobs(vec![JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md12345".to_string(),
+                selection: None
+            }])
+        );
+        assert_eq!(
+            route_message(
+                "https://www.bilibili.tv/en/play/123/456",
+                &auto_pdf_domains()
+            ),
+            RouteResult::Jobs(vec![JobRequest::Bilibili {
+                url: "https://www.bilibili.tv/en/play/123/456".to_string(),
+                selection: None
+            }])
+        );
+    }
+
+    #[test]
+    fn requires_selection_for_bilibili_season_and_media_links() {
+        assert!(
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
+                selection: None
+            }
+            .requires_bilibili_selection()
+        );
+        assert!(
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md12345".to_string(),
+                selection: None
+            }
+            .requires_bilibili_selection()
+        );
+        assert!(
+            !JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/play/ep12345".to_string(),
+                selection: None
+            }
+            .requires_bilibili_selection()
+        );
+        assert!(
+            !JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
+                selection: Some(BilibiliSelection::Latest)
+            }
+            .requires_bilibili_selection()
+        );
+        assert!(
+            !JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/play/ss12345?ep_id=456".to_string(),
+                selection: None,
+            }
+            .requires_bilibili_selection()
+        );
+        assert!(
+            !JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md12345?ep_id=456".to_string(),
+                selection: None,
+            }
+            .requires_bilibili_selection()
+        );
+        assert!(
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/play/ss12345?ep_id=invalid".to_string(),
+                selection: None,
+            }
+            .requires_bilibili_selection()
         );
     }
 
@@ -391,7 +644,8 @@ mod tests {
                 &auto_pdf_domains()
             ),
             RouteResult::Jobs(vec![JobRequest::Bilibili {
-                url: "https://www.bilibili.com/video/BV12TRrBcEP8/?share_source=copy_web&vd_source=abc".to_string()
+                url: "https://www.bilibili.com/video/BV12TRrBcEP8/?share_source=copy_web&vd_source=abc".to_string(),
+                selection: None
             }])
         );
     }
@@ -502,7 +756,23 @@ mod tests {
     fn routes_bbdown_auth_commands() {
         assert_eq!(
             route_message("/bbdown login", &auto_pdf_domains()),
-            RouteResult::BilibiliAuth(BilibiliAuthCommand::Login)
+            RouteResult::BilibiliAuth(BilibiliAuthCommand::Login(BilibiliAuthLoginMode::Web))
+        );
+        assert_eq!(
+            route_message("/bbdown login web", &auto_pdf_domains()),
+            RouteResult::BilibiliAuth(BilibiliAuthCommand::Login(BilibiliAuthLoginMode::Web))
+        );
+        assert_eq!(
+            route_message("/bbdown login tv", &auto_pdf_domains()),
+            RouteResult::BilibiliAuth(BilibiliAuthCommand::Login(BilibiliAuthLoginMode::Tv))
+        );
+        assert_eq!(
+            route_message("/bbdown login access-key", &auto_pdf_domains()),
+            RouteResult::BilibiliAuth(BilibiliAuthCommand::Login(BilibiliAuthLoginMode::AccessKey))
+        );
+        assert_eq!(
+            route_message("/bbdown login intl", &auto_pdf_domains()),
+            RouteResult::BilibiliAuth(BilibiliAuthCommand::Login(BilibiliAuthLoginMode::AccessKey))
         );
         assert_eq!(
             route_message("/bbdown status", &auto_pdf_domains()),
@@ -526,6 +796,14 @@ mod tests {
         );
         assert_eq!(
             route_message("/bbdown status extra", &auto_pdf_domains()),
+            RouteResult::BilibiliAuthUsage
+        );
+        assert_eq!(
+            route_message("/bbdown login unknown", &auto_pdf_domains()),
+            RouteResult::BilibiliAuthUsage
+        );
+        assert_eq!(
+            route_message("/bbdown login web extra", &auto_pdf_domains()),
             RouteResult::BilibiliAuthUsage
         );
         assert_eq!(

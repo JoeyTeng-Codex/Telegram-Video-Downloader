@@ -2,9 +2,15 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use unicode_normalization::UnicodeNormalization;
 
-#[derive(Debug, Clone, Deserialize)]
+use crate::bilibili_auth::{
+    auth_mutation_control_paths, ensure_auth_state_path_has_no_symlink_components,
+};
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
     pub telegram: TelegramConfig,
     #[serde(default)]
@@ -23,7 +29,7 @@ pub struct AppConfig {
     project_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TelegramConfig {
     pub token: String,
     #[serde(default)]
@@ -32,7 +38,7 @@ pub struct TelegramConfig {
     pub allow_all_chats: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DownloadsConfig {
     #[serde(default = "default_video_dir")]
     pub video_dir: PathBuf,
@@ -40,7 +46,7 @@ pub struct DownloadsConfig {
     pub pdf_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ToolsConfig {
     #[serde(default = "default_bbdown")]
     pub bbdown: PathBuf,
@@ -56,13 +62,13 @@ pub struct ToolsConfig {
     pub ffmpeg: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PdfConfig {
     #[serde(default = "default_auto_pdf_domains")]
     pub auto_domains: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VideoConfig {
     #[serde(default = "default_subtitle_languages")]
     pub subtitle_languages: Vec<String>,
@@ -72,33 +78,54 @@ pub struct VideoConfig {
     pub keep_sidecars: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BilibiliConfig {
-    #[serde(default = "default_bilibili_extra_args")]
+    #[serde(default)]
     pub extra_args: Vec<String>,
+    #[serde(default)]
+    pub global_args: Vec<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub plan_args: Vec<String>,
+    #[serde(default)]
+    pub download_args: Vec<String>,
+    #[serde(default)]
+    pub playurl_mode: Option<String>,
+    #[serde(default)]
+    pub restricted_area: Option<String>,
+    #[serde(default)]
+    pub restricted_area_proxies: Vec<String>,
+    #[serde(default)]
+    pub restricted_api_proxies: Vec<String>,
+    #[serde(default = "default_bilibili_danmaku_formats")]
+    pub danmaku_formats: Vec<String>,
     #[serde(default)]
     pub danmaku: BilibiliDanmakuConfig,
     #[serde(default)]
     pub auth: BilibiliAuthConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BilibiliDanmakuConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BilibiliAuthConfig {
     #[serde(default = "default_bilibili_auth_state_path")]
     pub state_path: PathBuf,
+    #[serde(default = "default_bilibili_credential_file")]
+    pub credential_file: PathBuf,
+    #[serde(default)]
+    pub credential_profile: Option<String>,
     #[serde(default = "default_bilibili_login_timeout_seconds")]
     pub login_timeout_seconds: u64,
     #[serde(default = "default_bilibili_poll_interval_seconds")]
     pub poll_interval_seconds: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BotConfig {
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
@@ -113,6 +140,24 @@ pub struct BotConfig {
 }
 
 impl AppConfig {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            telegram: TelegramConfig {
+                token: "test-token".to_string(),
+                allowed_chat_ids: vec![123456789],
+                allow_all_chats: false,
+            },
+            downloads: DownloadsConfig::default(),
+            tools: ToolsConfig::default(),
+            pdf: PdfConfig::default(),
+            video: VideoConfig::default(),
+            bilibili: BilibiliConfig::default(),
+            bot: BotConfig::default(),
+            project_dir: PathBuf::from("."),
+        }
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
@@ -159,8 +204,10 @@ impl AppConfig {
     }
 
     fn expand_config_paths(&mut self) {
-        self.downloads.video_dir = expand_home_path(&self.downloads.video_dir);
-        self.downloads.pdf_dir = expand_home_path(&self.downloads.pdf_dir);
+        let video_dir = expand_home_path(&self.downloads.video_dir);
+        self.downloads.video_dir = self.resolve_project_path(&video_dir);
+        let pdf_dir = expand_home_path(&self.downloads.pdf_dir);
+        self.downloads.pdf_dir = self.resolve_project_path(&pdf_dir);
         self.tools.bbdown = expand_home_path(&self.tools.bbdown);
         self.tools.yt_dlp = expand_home_path(&self.tools.yt_dlp);
         self.tools.uv = expand_home_path(&self.tools.uv);
@@ -169,6 +216,8 @@ impl AppConfig {
         self.tools.ffmpeg = expand_home_path(&self.tools.ffmpeg);
         let state_path = expand_home_path(&self.bilibili.auth.state_path);
         self.bilibili.auth.state_path = self.resolve_project_path(&state_path);
+        let credential_file = expand_home_path(&self.bilibili.auth.credential_file);
+        self.bilibili.auth.credential_file = self.resolve_project_path(&credential_file);
     }
 
     fn validate(&self) -> Result<()> {
@@ -204,7 +253,265 @@ impl AppConfig {
                 "bilibili.auth.poll_interval_seconds must be less than bilibili.auth.login_timeout_seconds"
             );
         }
+        if let Some(profile) = &self.bilibili.auth.credential_profile
+            && profile.trim().is_empty()
+        {
+            bail!("bilibili.auth.credential_profile must not be empty when set");
+        }
+        ensure_auth_state_path_is_not_symlink(&self.bilibili.auth.state_path)?;
+        ensure_distinct_auth_paths(
+            &self.bilibili.auth.state_path,
+            &self.bilibili.auth.credential_file,
+        )?;
+        if let Some(playurl_mode) = &self.bilibili.playurl_mode
+            && !matches!(playurl_mode.as_str(), "web" | "tv" | "app")
+        {
+            bail!("bilibili.playurl_mode must be one of web, tv, or app");
+        }
+        if let Some(area) = &self.bilibili.restricted_area
+            && !matches!(area.as_str(), "cn" | "th" | "hk" | "tw")
+        {
+            bail!("bilibili.restricted_area must be one of cn, th, hk, or tw");
+        }
+        if self.bilibili.danmaku_formats.is_empty() {
+            bail!("bilibili.danmaku_formats must not be empty");
+        }
+        for format in &self.bilibili.danmaku_formats {
+            if !matches!(format.as_str(), "xml" | "ass") {
+                bail!("bilibili.danmaku_formats entries must be xml or ass");
+            }
+        }
+        crate::bilibili_core::validate_structured_restricted_proxy_config(self)?;
+        crate::bilibili_core::validate_legacy_direct_api_config(self)?;
         Ok(())
+    }
+}
+
+fn ensure_auth_state_path_is_not_symlink(state_path: &Path) -> Result<()> {
+    ensure_auth_state_path_has_no_symlink_components(state_path)
+        .context("invalid bilibili.auth.state_path")
+}
+
+fn ensure_distinct_auth_paths(state_path: &Path, credential_file: &Path) -> Result<()> {
+    let normalized_state = normalize_path_for_comparison(state_path)?;
+    let normalized_credential = normalize_path_for_comparison(credential_file)?;
+    let cleanup_files = legacy_auth_cleanup_files(state_path);
+    let cleanup_dir = legacy_auth_cleanup_dir(state_path);
+    let normalized_cleanup_dir = normalize_path_for_comparison(&cleanup_dir)?;
+    let aliases_cleanup_file = cleanup_files.iter().try_fold(false, |aliased, path| {
+        Ok::<_, anyhow::Error>(
+            aliased
+                || auth_paths_equal(
+                    &normalize_path_for_comparison(path)?,
+                    &normalized_credential,
+                )
+                || existing_paths_share_identity(path, credential_file)?,
+        )
+    })?;
+    let inside_cleanup_dir = auth_path_starts_with(&normalized_credential, &normalized_cleanup_dir);
+    let aliases_cleanup_dir_entry =
+        existing_file_alias_in_directory(credential_file, &cleanup_dir)?;
+    let conflicts_auth_control = auth_mutation_control_paths(credential_file)
+        .iter()
+        .try_fold(false, |conflict, control_path| {
+            let normalized_control = normalize_path_for_comparison(control_path)?;
+            Ok::<_, anyhow::Error>(
+                conflict
+                    || auth_paths_equal(&normalized_state, &normalized_control)
+                    || auth_paths_equal(&normalized_credential, &normalized_control)
+                    || existing_paths_share_identity(state_path, control_path)?
+                    || existing_paths_share_identity(credential_file, control_path)?,
+            )
+        })?;
+    if auth_paths_equal(&normalized_state, &normalized_credential)
+        || aliases_cleanup_file
+        || inside_cleanup_dir
+        || aliases_cleanup_dir_entry
+    {
+        bail!(
+            "bilibili.auth.state_path and bilibili.auth.credential_file must refer to distinct files, and credential_file must be outside legacy auth cleanup paths"
+        );
+    }
+    if conflicts_auth_control {
+        bail!(
+            "bilibili.auth.state_path and bilibili.auth.credential_file must not conflict with BBDown auth lock control paths"
+        );
+    }
+    Ok(())
+}
+
+fn legacy_auth_cleanup_files(state_path: &Path) -> [PathBuf; 3] {
+    [
+        state_path.to_path_buf(),
+        path_with_suffix(state_path, ".bbdown.config"),
+        path_with_suffix(state_path, ".bbdown.config.json"),
+    ]
+}
+
+fn legacy_auth_cleanup_dir(state_path: &Path) -> PathBuf {
+    path_with_suffix(state_path, ".bbdown.config.d")
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn existing_file_alias_in_directory(file: &Path, directory: &Path) -> Result<bool> {
+    if metadata_if_present(file)?.is_none() {
+        return Ok(false);
+    }
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to inspect legacy auth cleanup directory {}",
+                    directory.display()
+                )
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_file() && existing_paths_share_identity(file, &entry.path())? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn normalize_path_for_comparison(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .context("failed to resolve the current directory for auth path validation")?
+            .join(path)
+    };
+    let mut ancestor = absolute.clone();
+    let mut missing = Vec::new();
+    loop {
+        match fs::canonicalize(&ancestor) {
+            Ok(mut canonical) => {
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(lexical_normalize(&canonical));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let name = ancestor.file_name().with_context(|| {
+                    format!(
+                        "failed to find an existing ancestor for auth path {}",
+                        path.display()
+                    )
+                })?;
+                missing.push(name.to_os_string());
+                ancestor.pop();
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to resolve auth path for comparison: {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(name) => normalized.push(name),
+        }
+    }
+    normalized
+}
+
+fn auth_paths_equal(first: &Path, second: &Path) -> bool {
+    let mut first = first.components();
+    let mut second = second.components();
+    loop {
+        match (first.next(), second.next()) {
+            (Some(first), Some(second)) if auth_path_components_equal(first, second) => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+fn auth_path_starts_with(path: &Path, prefix: &Path) -> bool {
+    let mut path = path.components();
+    prefix.components().all(|prefix_component| {
+        path.next()
+            .is_some_and(|component| auth_path_components_equal(component, prefix_component))
+    })
+}
+
+fn auth_path_components_equal(
+    first: std::path::Component<'_>,
+    second: std::path::Component<'_>,
+) -> bool {
+    if first == second {
+        return true;
+    }
+
+    match (first.as_os_str().to_str(), second.as_os_str().to_str()) {
+        (Some(first), Some(second)) => {
+            auth_path_component_comparison_key(first) == auth_path_component_comparison_key(second)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn auth_path_component_comparison_key(value: &str) -> String {
+    value.nfd().flat_map(char::to_lowercase).collect()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn auth_path_component_comparison_key(value: &str) -> String {
+    value.to_lowercase()
+}
+
+fn existing_paths_share_identity(first: &Path, second: &Path) -> Result<bool> {
+    let first_metadata = metadata_if_present(first)?;
+    let second_metadata = metadata_if_present(second)?;
+    let (Some(first_metadata), Some(second_metadata)) = (first_metadata, second_metadata) else {
+        return Ok(false);
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(first_metadata.dev() == second_metadata.dev()
+            && first_metadata.ino() == second_metadata.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(false)
+    }
+}
+
+fn metadata_if_present(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to inspect auth path identity: {}", path.display())),
     }
 }
 
@@ -269,7 +576,15 @@ impl Default for BotConfig {
 impl Default for BilibiliConfig {
     fn default() -> Self {
         Self {
-            extra_args: default_bilibili_extra_args(),
+            extra_args: Vec::new(),
+            global_args: Vec::new(),
+            plan_args: Vec::new(),
+            download_args: Vec::new(),
+            playurl_mode: None,
+            restricted_area: None,
+            restricted_area_proxies: Vec::new(),
+            restricted_api_proxies: Vec::new(),
+            danmaku_formats: default_bilibili_danmaku_formats(),
             danmaku: BilibiliDanmakuConfig::default(),
             auth: BilibiliAuthConfig::default(),
         }
@@ -286,6 +601,8 @@ impl Default for BilibiliAuthConfig {
     fn default() -> Self {
         Self {
             state_path: default_bilibili_auth_state_path(),
+            credential_file: default_bilibili_credential_file(),
+            credential_profile: None,
             login_timeout_seconds: default_bilibili_login_timeout_seconds(),
             poll_interval_seconds: default_bilibili_poll_interval_seconds(),
         }
@@ -301,7 +618,7 @@ fn default_pdf_dir() -> PathBuf {
 }
 
 fn default_bbdown() -> PathBuf {
-    PathBuf::from("BBDown")
+    PathBuf::from("bbdown")
 }
 
 fn default_yt_dlp() -> PathBuf {
@@ -396,8 +713,8 @@ fn default_true() -> bool {
     true
 }
 
-fn default_bilibili_extra_args() -> Vec<String> {
-    vec!["--video-ascending".to_string(), "--skip-mux".to_string()]
+fn default_bilibili_danmaku_formats() -> Vec<String> {
+    vec!["xml".to_string(), "ass".to_string()]
 }
 
 fn default_bilibili_auth_state_path() -> PathBuf {
@@ -409,6 +726,18 @@ fn default_bilibili_auth_state_path() -> PathBuf {
             "bilibili-auth.json",
         ],
         "bilibili-auth.json",
+    )
+}
+
+fn default_bilibili_credential_file() -> PathBuf {
+    home_path(
+        &[
+            ".local",
+            "state",
+            "telegram-video-downloader",
+            "bbdown-credentials.json",
+        ],
+        "bbdown-credentials.json",
     )
 }
 
@@ -473,7 +802,7 @@ mod tests {
             config.downloads.pdf_dir,
             home.join("Documents").join("Downloads")
         );
-        assert_eq!(config.tools.bbdown, PathBuf::from("BBDown"));
+        assert_eq!(config.tools.bbdown, PathBuf::from("bbdown"));
         assert_eq!(config.tools.yt_dlp, PathBuf::from("yt-dlp"));
         assert_eq!(
             config.tools.pdf_helper,
@@ -492,10 +821,15 @@ mod tests {
         );
         assert!(config.video.write_nfo);
         assert!(config.video.keep_sidecars);
-        assert_eq!(
-            config.bilibili.extra_args,
-            vec!["--video-ascending", "--skip-mux"]
-        );
+        assert!(config.bilibili.extra_args.is_empty());
+        assert!(config.bilibili.global_args.is_empty());
+        assert!(config.bilibili.plan_args.is_empty());
+        assert!(config.bilibili.download_args.is_empty());
+        assert_eq!(config.bilibili.playurl_mode, None);
+        assert_eq!(config.bilibili.restricted_area, None);
+        assert!(config.bilibili.restricted_area_proxies.is_empty());
+        assert!(config.bilibili.restricted_api_proxies.is_empty());
+        assert_eq!(config.bilibili.danmaku_formats, vec!["xml", "ass"]);
         assert!(config.bilibili.danmaku.enabled);
         assert_eq!(
             config.bilibili.auth.state_path,
@@ -504,13 +838,21 @@ mod tests {
                 .join("telegram-video-downloader")
                 .join("bilibili-auth.json")
         );
+        assert_eq!(
+            config.bilibili.auth.credential_file,
+            home.join(".local")
+                .join("state")
+                .join("telegram-video-downloader")
+                .join("bbdown-credentials.json")
+        );
+        assert_eq!(config.bilibili.auth.credential_profile, None);
         assert_eq!(config.bilibili.auth.login_timeout_seconds, 180);
         assert_eq!(config.bilibili.auth.poll_interval_seconds, 2);
     }
 
     #[test]
-    fn preserves_explicit_bilibili_multi_thread_setting() {
-        let config = AppConfig::from_toml_str(
+    fn rejects_unmapped_legacy_bilibili_options_before_startup() {
+        let error = AppConfig::from_toml_str(
             r#"
             [telegram]
             token = "token"
@@ -521,12 +863,167 @@ mod tests {
             "#,
             PathBuf::from("/tmp/project"),
         )
-        .expect("config should parse");
+        .expect_err("unmapped BBDown options must fail before the bot starts");
+
+        assert!(
+            format!("{error:#}").contains("--video-ascending"),
+            "error should identify the unsupported option without showing a following value"
+        );
+    }
+
+    #[test]
+    fn accepts_mapped_legacy_bilibili_options() {
+        let root = temp_test_dir("mapped-legacy-bilibili-options");
+        fs::create_dir_all(&root).expect("test root should create");
+        let config_toml = format!(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [downloads]
+            video_dir = "{}"
+
+            [bilibili]
+            extra_args = ["--api-base", "https://api.example.test", "--audio-only"]
+            global_args = ["--request-timeout-seconds=45"]
+            download_args = ["--only", "subtitle"]
+            "#,
+            root.join("videos").display(),
+        );
+        let config = AppConfig::from_toml_str(&config_toml, root.clone())
+            .expect("mapped BBDown options should remain supported");
 
         assert_eq!(
             config.bilibili.extra_args,
-            vec!["--video-ascending", "--skip-mux", "--multi-thread", "true"]
+            vec!["--api-base", "https://api.example.test", "--audio-only"]
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_invalid_mapped_legacy_bilibili_values_before_startup() {
+        let root = temp_test_dir("invalid-mapped-legacy-bilibili-values");
+        fs::create_dir_all(&root).expect("test root should create");
+
+        for (argument, expected) in [
+            ("--api-base=not-a-url", "--api-base"),
+            ("--playurl-mode=unsupported", "--playurl-mode"),
+            ("--restricted-area=invalid", "--restricted-area"),
+            (
+                "--restricted-area-proxy=ftp://proxy.example.test",
+                "must use http or https",
+            ),
+            (
+                "--request-timeout-seconds=zero",
+                "--request-timeout-seconds",
+            ),
+        ] {
+            let config_toml = format!(
+                r#"
+                [telegram]
+                token = "token"
+                allow_all_chats = true
+
+                [downloads]
+                video_dir = "{}"
+
+                [bilibili]
+                extra_args = ["{argument}"]
+                "#,
+                root.join("videos").display(),
+            );
+            let error = AppConfig::from_toml_str(&config_toml, root.clone())
+                .expect_err("invalid mapped BBDown values must fail before the bot starts");
+
+            assert!(
+                format!("{error:#}").contains(expected),
+                "error for {argument} should mention {expected}: {error:#}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_invalid_structured_restricted_proxy_values_before_startup() {
+        let root = temp_test_dir("invalid-structured-restricted-proxy-values");
+        fs::create_dir_all(&root).expect("test root should create");
+
+        for setting in ["restricted_area_proxies", "restricted_api_proxies"] {
+            let config_toml = format!(
+                r#"
+                [telegram]
+                token = "token"
+                allow_all_chats = true
+
+                [downloads]
+                video_dir = "{}"
+
+                [bilibili]
+                {setting} = ["ftp://proxy.example.test"]
+                "#,
+                root.join("videos").display(),
+            );
+            let error = AppConfig::from_toml_str(&config_toml, root.clone())
+                .expect_err("invalid structured proxy values must fail before the bot starts");
+
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains(setting),
+                "error for {setting} should identify the setting: {rendered}"
+            );
+            assert!(
+                rendered.contains("must use http or https"),
+                "error for {setting} should reject unsupported URL schemes: {rendered}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_ignored_legacy_download_args_before_startup() {
+        let error = AppConfig::from_toml_str(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [bilibili]
+            download_args = ["--api-base", "https://api.example.test"]
+            "#,
+            PathBuf::from("/tmp/project"),
+        )
+        .expect_err("download_args must not silently accept ignored global options");
+
+        assert!(format!("{error:#}").contains("--api-base"));
+    }
+
+    #[test]
+    fn rejects_implicit_legacy_bbdown_config_before_startup() {
+        let root = temp_test_dir("implicit-legacy-bbdown-config");
+        let video_dir = root.join("videos");
+        fs::create_dir_all(&video_dir).expect("video directory should create");
+        fs::write(video_dir.join("BBDown.config"), "--multi-thread true\n")
+            .expect("legacy BBDown config should write");
+        let config = format!(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [downloads]
+            video_dir = "{}"
+            "#,
+            video_dir.display()
+        );
+
+        let error = AppConfig::from_toml_str(&config, root.clone())
+            .expect_err("implicit BBDown config must not be silently ignored");
+
+        assert!(format!("{error:#}").contains("legacy BBDown config"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -665,6 +1162,287 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rejects_bilibili_auth_state_path_leaf_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_test_dir("auth-state-leaf-symlink");
+        fs::create_dir_all(&root).expect("auth root should create");
+        let target = root.join("legacy-auth-target.json");
+        let state = root.join("bilibili-auth.json");
+        fs::write(&target, b"legacy-auth").expect("legacy auth target should write");
+        symlink(&target, &state).expect("legacy auth symlink should create");
+        let config = format!(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [bilibili.auth]
+            state_path = "{}"
+            credential_file = "{}"
+            "#,
+            state.display(),
+            root.join("credentials.json").display()
+        );
+
+        let error = AppConfig::from_toml_str(&config, root.clone())
+            .expect_err("leaf symlink auth state should fail validation");
+
+        assert!(format!("{error:#}").contains("must not resolve through a symbolic link"));
+        assert!(target.is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_bilibili_auth_state_path_through_a_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_test_dir("auth-state-parent-symlink");
+        let target = root.join("state-target");
+        let state_parent = root.join("state-link");
+        fs::create_dir_all(&target).expect("auth state target should create");
+        symlink(&target, &state_parent).expect("auth state parent symlink should create");
+        let state = state_parent.join("bilibili-auth.json");
+        let config = format!(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [bilibili.auth]
+            state_path = "{}"
+            credential_file = "{}"
+            "#,
+            state.display(),
+            root.join("credentials.json").display()
+        );
+
+        let error = AppConfig::from_toml_str(&config, root.clone())
+            .expect_err("symlinked auth state parent should fail validation");
+
+        assert!(format!("{error:#}").contains("must not resolve through a symbolic link"));
+        assert!(target.is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_relative_and_absolute_auth_path_aliases() {
+        let root = temp_test_dir("auth-relative-absolute-alias");
+        fs::create_dir_all(root.join("auth")).expect("auth dir should create");
+        let credential = root.join("auth/shared.json");
+        let config = format!(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [bilibili.auth]
+            state_path = "auth/shared.json"
+            credential_file = "{}"
+            "#,
+            credential.display()
+        );
+
+        let error = AppConfig::from_toml_str(&config, root.clone())
+            .expect_err("aliased auth paths should fail validation");
+
+        assert!(error.to_string().contains("must refer to distinct files"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_case_only_missing_auth_path_aliases() {
+        let root = temp_test_dir("auth-case-only-alias");
+        fs::create_dir_all(&root).expect("auth root should create");
+        let state = root.join("Auth.json");
+        let credential = root.join("auth.json");
+
+        let error = ensure_distinct_auth_paths(&state, &credential)
+            .expect_err("case-only auth paths should fail validation");
+
+        assert!(error.to_string().contains("must refer to distinct files"));
+        assert!(!state.exists());
+        assert!(!credential.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rejects_unicode_normalization_equivalent_missing_auth_paths() {
+        let root = temp_test_dir("auth-unicode-normalization-alias");
+        fs::create_dir_all(&root).expect("auth root should create");
+        let state = root.join("caf\u{e9}.json");
+        let credential = root.join("cafe\u{301}.json");
+
+        let error = ensure_distinct_auth_paths(&state, &credential)
+            .expect_err("normalization-equivalent auth paths should fail validation");
+
+        assert!(error.to_string().contains("must refer to distinct files"));
+        assert!(!state.exists());
+        assert!(!credential.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_auth_paths_through_symlinked_parent_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_test_dir("auth-symlink-parent-alias");
+        let real = root.join("real");
+        fs::create_dir_all(&real).expect("real auth dir should create");
+        symlink(&real, root.join("alias")).expect("auth dir alias should create");
+
+        let error = ensure_distinct_auth_paths(
+            &real.join("credentials.json"),
+            &root.join("alias/credentials.json"),
+        )
+        .expect_err("symlinked parent aliases should fail validation");
+
+        assert!(error.to_string().contains("must refer to distinct files"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_missing_auth_alias_after_symlink_and_parent_components() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_test_dir("auth-symlink-parent-components");
+        let safe = root.join("safe");
+        let alias = root.join("alias");
+        fs::create_dir_all(safe.join("child")).expect("symlink target should create");
+        fs::create_dir_all(&alias).expect("alias directory should create");
+        symlink(safe.join("child"), alias.join("jump")).expect("path alias should create");
+        let state = safe.join("auth.json");
+        let credential = alias.join("jump/../auth.json");
+
+        let error = ensure_distinct_auth_paths(&state, &credential)
+            .expect_err("filesystem-resolved parent components should expose the alias");
+
+        assert!(error.to_string().contains("must refer to distinct files"));
+        assert!(!state.exists());
+        assert!(!credential.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_existing_auth_paths_with_the_same_inode() {
+        let root = temp_test_dir("auth-hardlink-alias");
+        fs::create_dir_all(&root).expect("auth root should create");
+        let state = root.join("state.json");
+        let credential = root.join("credentials.json");
+        fs::write(&state, "{}").expect("auth state should write");
+        fs::hard_link(&state, &credential).expect("auth hard link should create");
+
+        let error = ensure_distinct_auth_paths(&state, &credential)
+            .expect_err("same-inode auth paths should fail validation");
+
+        assert!(error.to_string().contains("must refer to distinct files"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_credential_file_at_legacy_cleanup_paths() {
+        let root = temp_test_dir("auth-legacy-cleanup-paths");
+        fs::create_dir_all(&root).expect("auth root should create");
+        let state = root.join("state.json");
+
+        for credential in [
+            path_with_suffix(&state, ".bbdown.config"),
+            path_with_suffix(&state, ".bbdown.config.json"),
+            path_with_suffix(&state, ".bbdown.config.d").join("credentials.json"),
+        ] {
+            let error = ensure_distinct_auth_paths(&state, &credential)
+                .expect_err("legacy cleanup target must not hold credentials");
+            assert!(error.to_string().contains("legacy auth cleanup paths"));
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_auth_state_path_at_mutation_control_paths() {
+        let root = temp_test_dir("auth-mutation-control-paths");
+        let credential = root.join("credentials.json");
+
+        for state in auth_mutation_control_paths(&credential) {
+            let error = ensure_distinct_auth_paths(&state, &credential)
+                .expect_err("auth state must not occupy a mutation control path");
+            assert!(
+                error
+                    .to_string()
+                    .contains("must not conflict with BBDown auth lock control paths")
+            );
+        }
+
+        fs::create_dir_all(root.join("nested")).expect("nested parent should create");
+        let owner_leaf = auth_mutation_control_paths(&credential)[2]
+            .file_name()
+            .expect("owner control path should have a leaf")
+            .to_os_string();
+        let state = root.join("nested").join("..").join(owner_leaf);
+        let error = ensure_distinct_auth_paths(&state, &credential)
+            .expect_err("parent components must not bypass auth control validation");
+        assert!(
+            error
+                .to_string()
+                .contains("must not conflict with BBDown auth lock control paths")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_auth_state_control_path_through_a_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_test_dir("auth-mutation-control-symlink-parent");
+        let real = root.join("real");
+        let alias = root.join("alias");
+        fs::create_dir_all(&real).expect("real auth directory should create");
+        symlink(&real, &alias).expect("auth directory alias should create");
+        let credential = real.join("credentials.json");
+        let owner_leaf = auth_mutation_control_paths(&credential)[2]
+            .file_name()
+            .expect("owner control path should have a leaf")
+            .to_os_string();
+
+        let error = ensure_distinct_auth_paths(&alias.join(owner_leaf), &credential)
+            .expect_err("symlinked parent must not bypass auth control validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("must not conflict with BBDown auth lock control paths")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_credential_hardlink_to_legacy_cleanup_directory_entry() {
+        let root = temp_test_dir("auth-legacy-cleanup-hardlink");
+        let state = root.join("state.json");
+        let cleanup_dir = path_with_suffix(&state, ".bbdown.config.d");
+        fs::create_dir_all(&cleanup_dir).expect("cleanup directory should create");
+        let stale = cleanup_dir.join("stale.config");
+        let credential = root.join("credentials.json");
+        fs::write(&stale, "secret").expect("stale file should write");
+        fs::hard_link(&stale, &credential).expect("credential hard link should create");
+
+        let error = ensure_distinct_auth_paths(&state, &credential)
+            .expect_err("cleanup-directory hard link must be rejected");
+
+        assert!(error.to_string().contains("legacy auth cleanup paths"));
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn load_resolves_relative_config_and_auth_state_to_absolute_paths() {
         let root = temp_test_dir("relative-load");
@@ -675,6 +1453,10 @@ mod tests {
             [telegram]
             token = "token"
             allow_all_chats = true
+
+            [downloads]
+            video_dir = "relative-videos"
+            pdf_dir = "relative-pdfs"
 
             [bilibili.auth]
             state_path = "state/bilibili-auth.json"
@@ -687,6 +1469,14 @@ mod tests {
         let config = AppConfig::load(Path::new("config.toml")).expect("config should load");
 
         assert!(config.bilibili.auth.state_path.is_absolute());
+        assert_eq!(
+            config.downloads.video_dir,
+            expected_root.join("relative-videos")
+        );
+        assert_eq!(
+            config.downloads.pdf_dir,
+            expected_root.join("relative-pdfs")
+        );
         assert_eq!(
             config.bilibili.auth.state_path,
             expected_root.join("state/bilibili-auth.json")
@@ -713,6 +1503,7 @@ mod tests {
 
             [bilibili.auth]
             state_path = "~/Library/Application Support/Bot/bilibili-auth.json"
+            credential_file = "$HOME/Library/Application Support/Bot/bbdown-credentials.json"
             "#,
             PathBuf::from("."),
         )
@@ -730,6 +1521,13 @@ mod tests {
                 .join("Application Support")
                 .join("Bot")
                 .join("bilibili-auth.json")
+        );
+        assert_eq!(
+            config.bilibili.auth.credential_file,
+            home.join("Library")
+                .join("Application Support")
+                .join("Bot")
+                .join("bbdown-credentials.json")
         );
     }
 

@@ -8,7 +8,8 @@ video_dir = "~/Movies/Downloads"
 pdf_dir = "~/Documents/Downloads"
 
 [tools]
-bbdown = "BBDown"
+# Bilibili downloads/auth use the embedded bbdown-core crate; bbdown is kept for legacy helpers only.
+bbdown = "bbdown"
 yt_dlp = "yt-dlp"
 uv = "uv"
 pdf_helper = "scripts/pdf_helper.py"
@@ -24,13 +25,29 @@ write_nfo = true
 keep_sidecars = true
 
 [bilibili]
-extra_args = ["--video-ascending", "--skip-mux"]
+# Legacy CLI fields accept only mapped bbdown-core options. Unsupported values, non-empty
+# plan_args, and a BBDown.config file in video_dir fail startup instead of being ignored.
+# Direct bbdown-core integration reads supported global flags from extra_args, with global_args
+# and the structured fields below taking precedence for single values.
+extra_args = []
+global_args = []
+plan_args = []
+download_args = []
+# playurl_mode = "web" # web | tv | app
+# restricted_area = "cn" # cn | th | hk | tw
+restricted_area_proxies = []
+restricted_api_proxies = []
+danmaku_formats = ["xml", "ass"]
 
 [bilibili.danmaku]
 enabled = true
 
 [bilibili.auth]
+# Legacy bot-managed Web cookie state; BBDown-rust credentials live in credential_file.
 state_path = "~/.local/state/telegram-video-downloader/bilibili-auth.json"
+credential_file = "~/.local/state/telegram-video-downloader/bbdown-credentials.json"
+# The direct parent of credential_file must not be a symbolic link.
+# credential_profile = "default"
 login_timeout_seconds = 180
 poll_interval_seconds = 2
 
