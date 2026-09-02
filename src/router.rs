@@ -258,6 +258,9 @@ pub(crate) fn bilibili_selection_from_url(raw_url: &str) -> Option<BilibiliSelec
     {
         return None;
     }
+    if has_positive_episode_id(&url) {
+        return None;
+    }
 
     url.query_pairs()
         .find(|(name, _)| name == "p")
@@ -277,6 +280,12 @@ pub(crate) fn is_b23_short_link_url(raw_url: &str) -> bool {
     })
 }
 
+fn has_positive_episode_id(url: &Url) -> bool {
+    url.query_pairs().any(|(name, value)| {
+        name == "ep_id" && value.parse::<u64>().is_ok_and(|episode_id| episode_id > 0)
+    })
+}
+
 fn bilibili_url_requires_selection(raw_url: &str) -> bool {
     let Ok(url) = Url::parse(raw_url) else {
         return false;
@@ -287,9 +296,7 @@ fn bilibili_url_requires_selection(raw_url: &str) -> bool {
     if !domain_or_subdomain(&host, "bilibili.com") {
         return false;
     }
-    if url.query_pairs().any(|(name, value)| {
-        name == "ep_id" && value.parse::<u64>().is_ok_and(|episode_id| episode_id > 0)
-    }) {
+    if has_positive_episode_id(&url) {
         return false;
     }
     let Some(mut segments) = url.path_segments() else {
@@ -528,6 +535,22 @@ mod tests {
         assert_eq!(
             bilibili_selection_from_url("https://www.bilibili.com/video/BV12TRrBcEP8/?p=invalid"),
             None
+        );
+        assert_eq!(
+            bilibili_selection_from_url(
+                "https://www.bilibili.com/video/BV12TRrBcEP8/?ep_id=456&p=2"
+            ),
+            None
+        );
+        assert_eq!(
+            bilibili_selection_from_url("https://b23.tv/abc?ep_id=456&p=3"),
+            None
+        );
+        assert_eq!(
+            bilibili_selection_from_url(
+                "https://www.bilibili.com/video/BV12TRrBcEP8/?ep_id=invalid&p=2"
+            ),
+            Some(BilibiliSelection::Page(2))
         );
         assert!(!is_b23_short_link_url("https://user:pass@b23.tv/abc"));
     }

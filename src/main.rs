@@ -3290,6 +3290,17 @@ mod tests {
             "https://www.bilibili.com/bangumi/play/ss12345?ep_id=456".to_string(),
         );
         assert!(!episode.requires_bilibili_selection());
+
+        assert_eq!(
+            apply_bilibili_short_link_resolution(
+                None,
+                "https://www.bilibili.com/video/BV12TRrBcEP8/?ep_id=456&p=2".to_string(),
+            ),
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV12TRrBcEP8/?ep_id=456&p=2".to_string(),
+                selection: None,
+            }
+        );
     }
 
     #[test]
