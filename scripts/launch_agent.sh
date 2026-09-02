@@ -2,6 +2,8 @@
 set -euo pipefail
 
 DEFAULT_LABEL="io.github.telegram-local-downloader.bot"
+SERVICE_STOP_TIMEOUT_SECONDS=10
+SERVICE_STOP_POLL_SECONDS=0.1
 
 usage() {
   cat <<'EOF'
@@ -130,21 +132,97 @@ legacy_service_name() {
   service_name_for_domain "${legacy_domain}"
 }
 
-cleanup_legacy_service() {
-  if [[ "${use_default_domain}" == "1" ]]; then
-    launchctl bootout "$(legacy_service_name)" >/dev/null 2>&1 || true
+service_exists() {
+  local target="$1"
+  local output
+  local status
+
+  if output="$(launchctl print "${target}" 2>&1)"; then
+    return 0
+  else
+    status=$?
+  fi
+  if [[ "${status}" -eq 113 && "${output}" == *"Could not find service"* ]]; then
+    return 1
+  fi
+  printf '%s\n' "${output}" >&2
+  return "${status}"
+}
+
+wait_for_service_absence() {
+  local target="$1"
+  local deadline=$((SECONDS + SERVICE_STOP_TIMEOUT_SECONDS))
+  local status
+
+  while :; do
+    if service_exists "${target}"; then
+      if (( SECONDS >= deadline )); then
+        die "LaunchAgent remained registered after bootout: ${target}"
+      fi
+      sleep "${SERVICE_STOP_POLL_SECONDS}"
+    else
+      status=$?
+      [[ "${status}" -eq 1 ]] && return 0
+      return "${status}"
+    fi
+  done
+}
+
+stop_service_if_present() {
+  local target="$1"
+  local status
+
+  if service_exists "${target}"; then
+    if launchctl bootout "${target}"; then
+      :
+    else
+      status=$?
+      return "${status}"
+    fi
+    wait_for_service_absence "${target}"
+  else
+    status=$?
+    [[ "${status}" -eq 1 ]] && return 0
+    return "${status}"
   fi
 }
 
+verify_legacy_service_state() {
+  local status
+
+  [[ "${use_default_domain}" == "1" ]] || return 0
+  if service_exists "$(legacy_service_name)"; then
+    return 0
+  else
+    status=$?
+    [[ "${status}" -eq 1 ]] && return 0
+    return "${status}"
+  fi
+}
+
+cleanup_legacy_service() {
+  [[ "${use_default_domain}" == "1" ]] || return 0
+  stop_service_if_present "$(legacy_service_name)"
+}
+
 active_or_default_service_name() {
-  if launchctl print "$(service_name)" >/dev/null 2>&1; then
+  local status
+
+  if service_exists "$(service_name)"; then
     service_name
     return
+  else
+    status=$?
+    [[ "${status}" -eq 1 ]] || return "${status}"
   fi
-  if [[ "${use_default_domain}" == "1" ]] \
-    && launchctl print "$(legacy_service_name)" >/dev/null 2>&1; then
-    legacy_service_name
-    return
+  if [[ "${use_default_domain}" == "1" ]]; then
+    if service_exists "$(legacy_service_name)"; then
+      legacy_service_name
+      return
+    else
+      status=$?
+      [[ "${status}" -eq 1 ]] || return "${status}"
+    fi
   fi
   service_name
 }
@@ -297,21 +375,46 @@ install_agent() {
   runtime_root="$(detect_dotnet_root)"
   write_plist "${temp_plist}" "${binary}" "${config}" "${repo_dir}" "${log_dir}" "${runtime_root}"
   plutil -lint "${temp_plist}" >/dev/null
+  verify_legacy_service_state
   install -m 644 "${temp_plist}" "${plist}"
   rm -f "${temp_plist}"
 
-  cleanup_legacy_service
-  launchctl bootout "$(service_name)" >/dev/null 2>&1 || true
+  stop_service_if_present "$(service_name)"
   launchctl bootstrap "${domain}" "${plist}"
+  if cleanup_legacy_service; then
+    :
+  else
+    local legacy_status=$?
+    if stop_service_if_present "$(service_name)"; then
+      :
+    else
+      local rollback_status=$?
+      printf 'error: failed to stop new LaunchAgent after legacy migration failure (%s): %s\n' \
+        "${rollback_status}" "$(service_name)" >&2
+    fi
+    return "${legacy_status}"
+  fi
   launchctl print "$(service_name)"
 }
 
 uninstall_agent() {
   local plist
   plist="$(plist_path)"
-  launchctl bootout "$(service_name)" >/dev/null 2>&1 || true
+  stop_service_if_present "$(service_name)"
   cleanup_legacy_service
   rm -f "${plist}"
+}
+
+restart_agent() {
+  local target
+  target="$(active_or_default_service_name)"
+  launchctl kickstart -k "${target}"
+}
+
+status_agent() {
+  local target
+  target="$(active_or_default_service_name)"
+  launchctl print "${target}"
 }
 
 case "${action}" in
@@ -322,10 +425,10 @@ case "${action}" in
     uninstall_agent
     ;;
   restart)
-    launchctl kickstart -k "$(active_or_default_service_name)"
+    restart_agent
     ;;
   status)
-    launchctl print "$(active_or_default_service_name)"
+    status_agent
     ;;
   logs)
     tail -f "${log_dir}/stdout.log" "${log_dir}/stderr.log"
