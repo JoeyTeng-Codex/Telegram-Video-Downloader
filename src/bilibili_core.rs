@@ -13,9 +13,12 @@ use bbdown_core::{
 
 use crate::config::AppConfig;
 use crate::router::BilibiliSelection;
+use reqwest::redirect::Policy;
+use url::Url;
 
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const BILIBILI_BROWSER_USER_AGENT: &str = "Mozilla/5.0";
+const B23_SHORT_LINK_MAX_REDIRECTS: usize = 5;
 const DEFAULT_ACCESS_KEY_AUTH_BASE: &str = "https://www.biliplus.com";
 const DEFAULT_ACCESS_KEY_CALLBACK_ORIGIN: &str = "https://www.bilibili.com";
 const BALH_LOGIN_CREDENTIALS_PREFIX: &str = "balh-login-credentials:";
@@ -114,6 +117,86 @@ pub fn anonymous_client(config: &AppConfig) -> Result<BiliClient> {
     )?))
 }
 
+pub async fn resolve_b23_short_link(config: &AppConfig, raw_url: &str) -> Result<String> {
+    let mut current = Url::parse(raw_url).context("invalid Bilibili short link URL")?;
+    ensure!(
+        is_b23_short_link_url(&current),
+        "Bilibili short link must be an anonymous http(s) b23.tv URL"
+    );
+
+    let client = reqwest::Client::builder()
+        .redirect(Policy::none())
+        .timeout(request_timeout(config)?)
+        .user_agent(BILIBILI_BROWSER_USER_AGENT)
+        .build()
+        .context("failed to construct Bilibili short-link client")?;
+
+    for redirect_count in 0..=B23_SHORT_LINK_MAX_REDIRECTS {
+        let response = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("Bilibili short-link request failed"))?;
+        if response.status().is_success() {
+            ensure!(
+                is_bilibili_short_link_target(&current),
+                "Bilibili short link did not resolve to a Bilibili URL"
+            );
+            return Ok(current.into());
+        }
+        ensure!(
+            response.status().is_redirection(),
+            "Bilibili short link returned status {}",
+            response.status()
+        );
+        ensure!(
+            redirect_count < B23_SHORT_LINK_MAX_REDIRECTS,
+            "Bilibili short link exceeded redirect limit"
+        );
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .context("Bilibili short link redirect did not include a valid location")?;
+        let next = current
+            .join(location)
+            .context("Bilibili short link redirect location was invalid")?;
+        ensure!(
+            is_allowed_b23_redirect_hop(&next),
+            "Bilibili short link redirected to an unsupported host"
+        );
+        current = next;
+    }
+
+    bail!("Bilibili short link exceeded redirect limit")
+}
+
+fn is_b23_short_link_url(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("b23.tv"))
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
+fn is_bilibili_short_link_target(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.host_str().is_some_and(|host| {
+            let host = host.to_ascii_lowercase();
+            host == "bilibili.com"
+                || host.ends_with(".bilibili.com")
+                || host == "bilibili.tv"
+                || host.ends_with(".bilibili.tv")
+        })
+}
+
+fn is_allowed_b23_redirect_hop(url: &Url) -> bool {
+    is_b23_short_link_url(url) || is_bilibili_short_link_target(url)
+}
+
 pub async fn credential_health(config: &AppConfig) -> Result<CredentialHealthReport> {
     Ok(client(config)?.check_credential_health().await)
 }
@@ -146,6 +229,7 @@ pub fn selection(selection: Option<BilibiliSelection>) -> Option<Selection> {
     selection.map(|selection| match selection {
         BilibiliSelection::Latest => Selection::Latest,
         BilibiliSelection::All => Selection::All,
+        BilibiliSelection::Page(page) => Selection::Page(page),
     })
 }
 
@@ -963,7 +1047,27 @@ mod tests {
             selection(Some(BilibiliSelection::All)),
             Some(Selection::All)
         );
+        assert_eq!(
+            selection(Some(BilibiliSelection::Page(2))),
+            Some(Selection::Page(2))
+        );
         assert_eq!(selection(None), None);
+    }
+
+    #[test]
+    fn restricts_b23_short_link_redirect_hops() {
+        let b23 = Url::parse("https://b23.tv/abc").unwrap();
+        let b23_with_userinfo = Url::parse("https://user:pass@b23.tv/abc").unwrap();
+        let bilibili = Url::parse("https://www.bilibili.com/video/BV123?p=2").unwrap();
+        let bilibili_intl = Url::parse("https://www.bilibili.tv/en/play/123/456").unwrap();
+        let unexpected = Url::parse("https://example.test/redirect").unwrap();
+
+        assert!(is_b23_short_link_url(&b23));
+        assert!(!is_b23_short_link_url(&b23_with_userinfo));
+        assert!(is_allowed_b23_redirect_hop(&b23));
+        assert!(is_allowed_b23_redirect_hop(&bilibili));
+        assert!(is_allowed_b23_redirect_hop(&bilibili_intl));
+        assert!(!is_allowed_b23_redirect_hop(&unexpected));
     }
 
     #[test]

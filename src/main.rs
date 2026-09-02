@@ -34,7 +34,7 @@ use crate::downloader::{
 use crate::redaction::redact_sensitive_text;
 use crate::router::{
     BilibiliAuthCommand, BilibiliAuthLoginMode, BilibiliSelection, JobRequest, RouteResult,
-    route_message,
+    bilibili_selection_from_url, is_b23_short_link_url, route_message,
 };
 use crate::telegram::{
     BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient,
@@ -278,8 +278,9 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
     match route_message(&text, &config.pdf.auto_domains) {
         RouteResult::Jobs(jobs) => {
             let mut failed_jobs = Vec::new();
-            for (index, job) in jobs.iter().enumerate() {
+            for (index, job) in jobs.into_iter().enumerate() {
                 let job_id = index + 1;
+                let job = normalize_bilibili_short_link_job(&config, job).await;
                 println!("Queued replay job #{job_id}: {}", job.label());
                 if job.requires_bilibili_selection() {
                     println!(
@@ -298,11 +299,11 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
                         }
                     }
                 });
-                let result = match job {
+                let result = match &job {
                     JobRequest::Bilibili { .. } | JobRequest::Youtube { .. } => {
-                        run_video_job_staged_keep_both(&config, job, Some(progress_tx)).await
+                        run_video_job_staged_keep_both(&config, &job, Some(progress_tx)).await
                     }
-                    JobRequest::Pdf { .. } => run_job(&config, job, Some(progress_tx)).await,
+                    JobRequest::Pdf { .. } => run_job(&config, &job, Some(progress_tx)).await,
                 };
                 let _ = progress_handle.await;
                 match result {
@@ -1574,19 +1575,77 @@ fn queue_or_prompt_job(
     job_id: u64,
     job: JobRequest,
 ) {
+    tokio::spawn(async move {
+        let needs_short_link_normalization = matches!(
+            &job,
+            JobRequest::Bilibili { url, .. } if is_b23_short_link_url(url)
+        );
+        let job = if needs_short_link_normalization {
+            match Arc::clone(&job_dispatch.duplicate_scan_semaphore)
+                .acquire_owned()
+                .await
+            {
+                Ok(permit) => {
+                    let job = normalize_bilibili_short_link_job(config.as_ref(), job).await;
+                    drop(permit);
+                    job
+                }
+                Err(err) => {
+                    warn!(error = %err, "Bilibili short-link normalization skipped because the probe queue closed");
+                    job
+                }
+            }
+        } else {
+            job
+        };
+        queue_or_prompt_normalized_job(telegram, config, job_dispatch, chat_id, job_id, job).await;
+    });
+}
+
+async fn queue_or_prompt_normalized_job(
+    telegram: TelegramClient,
+    config: Arc<AppConfig>,
+    job_dispatch: JobDispatch,
+    chat_id: i64,
+    job_id: u64,
+    job: JobRequest,
+) {
     if job.requires_bilibili_selection() {
-        tokio::spawn(prompt_bilibili_selection(telegram, chat_id, job_id, job));
+        prompt_bilibili_selection(telegram, chat_id, job_id, job).await;
         return;
     }
 
-    tokio::spawn(process_job_after_duplicate_check(
-        telegram,
-        config,
-        job_dispatch,
-        chat_id,
-        job_id,
-        job,
-    ));
+    process_job_after_duplicate_check(telegram, config, job_dispatch, chat_id, job_id, job).await;
+}
+
+async fn normalize_bilibili_short_link_job(config: &AppConfig, job: JobRequest) -> JobRequest {
+    let JobRequest::Bilibili { url, selection } = job else {
+        return job;
+    };
+    if !is_b23_short_link_url(&url) {
+        return JobRequest::Bilibili { url, selection };
+    }
+
+    match bilibili_core::resolve_b23_short_link(config, &url).await {
+        Ok(resolved_url) => apply_bilibili_short_link_resolution(selection, resolved_url),
+        Err(err) => {
+            warn!(
+                error = %redact_sensitive_text(&format!("{err:#}")),
+                "Bilibili short-link normalization failed; preserving the original URL"
+            );
+            JobRequest::Bilibili { url, selection }
+        }
+    }
+}
+
+fn apply_bilibili_short_link_resolution(
+    selection: Option<BilibiliSelection>,
+    resolved_url: String,
+) -> JobRequest {
+    JobRequest::Bilibili {
+        selection: selection.or_else(|| bilibili_selection_from_url(&resolved_url)),
+        url: resolved_url,
+    }
 }
 
 async fn prompt_bilibili_selection(
@@ -3201,6 +3260,36 @@ mod tests {
                 selection: Some(BilibiliSelection::All),
             }
         );
+    }
+
+    #[test]
+    fn short_link_resolution_preserves_target_selection() {
+        assert_eq!(
+            apply_bilibili_short_link_resolution(
+                None,
+                "https://www.bilibili.com/video/BV12TRrBcEP8/?p=2".to_string(),
+            ),
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV12TRrBcEP8/?p=2".to_string(),
+                selection: Some(BilibiliSelection::Page(2)),
+            }
+        );
+        assert_eq!(
+            apply_bilibili_short_link_resolution(
+                Some(BilibiliSelection::All),
+                "https://www.bilibili.com/video/BV12TRrBcEP8/?p=2".to_string(),
+            ),
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV12TRrBcEP8/?p=2".to_string(),
+                selection: Some(BilibiliSelection::All),
+            }
+        );
+
+        let episode = apply_bilibili_short_link_resolution(
+            None,
+            "https://www.bilibili.com/bangumi/play/ss12345?ep_id=456".to_string(),
+        );
+        assert!(!episode.requires_bilibili_selection());
     }
 
     #[test]

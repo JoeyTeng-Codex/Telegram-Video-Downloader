@@ -19,6 +19,7 @@ pub enum JobRequest {
 pub enum BilibiliSelection {
     Latest,
     All,
+    Page(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +71,7 @@ impl BilibiliSelection {
         match self {
             Self::Latest => "latest episode",
             Self::All => "all episodes",
+            Self::Page(_) => "selected video page",
         }
     }
 }
@@ -190,10 +192,10 @@ fn classify_video_url(raw_url: &str) -> Option<JobRequest> {
     let url = Url::parse(raw_url).ok()?;
     let host = url.host_str()?.to_ascii_lowercase();
 
-    if host == "b23.tv" || is_bilibili_video_url(&host, &url) {
+    if is_b23_short_link_url(raw_url) || is_bilibili_video_url(&host, &url) {
         Some(JobRequest::Bilibili {
             url: raw_url.to_string(),
-            selection: None,
+            selection: bilibili_selection_from_url(raw_url),
         })
     } else if is_youtube_host(&host) {
         Some(JobRequest::Youtube {
@@ -218,16 +220,23 @@ fn is_bilibili_video_url(host: &str, url: &Url) -> bool {
         return false;
     }
 
+    is_bilibili_standard_video_url(url)
+        || url.path_segments().is_some_and(|mut segments| {
+            matches!(
+                (segments.next(), segments.next()),
+                (Some("bangumi"), Some("play" | "media"))
+            )
+        })
+}
+
+fn is_bilibili_standard_video_url(url: &Url) -> bool {
     let Some(mut segments) = url.path_segments() else {
         return false;
     };
-    match segments.next() {
-        Some("video") => segments
-            .next()
-            .is_some_and(|id| id.starts_with("BV") || id.starts_with("av")),
-        Some("bangumi") => matches!(segments.next(), Some("play" | "media")),
-        _ => false,
-    }
+    matches!(
+        (segments.next(), segments.next()),
+        (Some("video"), Some(id)) if id.starts_with("BV") || id.starts_with("av")
+    )
 }
 
 fn is_bilibili_intl_video_url(url: &Url) -> bool {
@@ -241,6 +250,33 @@ fn is_bilibili_intl_video_url(url: &Url) -> bool {
     )
 }
 
+pub(crate) fn bilibili_selection_from_url(raw_url: &str) -> Option<BilibiliSelection> {
+    let url = Url::parse(raw_url).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    if !is_b23_short_link_url(raw_url)
+        && (!domain_or_subdomain(&host, "bilibili.com") || !is_bilibili_standard_video_url(&url))
+    {
+        return None;
+    }
+
+    url.query_pairs()
+        .find(|(name, _)| name == "p")
+        .and_then(|(_, value)| value.parse::<u32>().ok())
+        .filter(|page| *page > 0)
+        .map(BilibiliSelection::Page)
+}
+
+pub(crate) fn is_b23_short_link_url(raw_url: &str) -> bool {
+    Url::parse(raw_url).ok().is_some_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url
+                .host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case("b23.tv"))
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
+}
+
 fn bilibili_url_requires_selection(raw_url: &str) -> bool {
     let Ok(url) = Url::parse(raw_url) else {
         return false;
@@ -249,6 +285,11 @@ fn bilibili_url_requires_selection(raw_url: &str) -> bool {
         return false;
     };
     if !domain_or_subdomain(&host, "bilibili.com") {
+        return false;
+    }
+    if url.query_pairs().any(|(name, value)| {
+        name == "ep_id" && value.parse::<u64>().is_ok_and(|episode_id| episode_id > 0)
+    }) {
         return false;
     }
     let Some(mut segments) = url.path_segments() else {
@@ -461,6 +502,37 @@ mod tests {
     }
 
     #[test]
+    fn preserves_bilibili_video_page_selection() {
+        assert_eq!(
+            route_message(
+                "https://www.bilibili.com/video/BV12TRrBcEP8/?p=2&share_source=copy_web",
+                &auto_pdf_domains()
+            ),
+            RouteResult::Jobs(vec![JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV12TRrBcEP8/?p=2&share_source=copy_web"
+                    .to_string(),
+                selection: Some(BilibiliSelection::Page(2)),
+            }])
+        );
+        assert_eq!(
+            route_message("https://b23.tv/abc?p=3", &auto_pdf_domains()),
+            RouteResult::Jobs(vec![JobRequest::Bilibili {
+                url: "https://b23.tv/abc?p=3".to_string(),
+                selection: Some(BilibiliSelection::Page(3)),
+            }])
+        );
+        assert_eq!(
+            bilibili_selection_from_url("https://www.bilibili.com/video/BV12TRrBcEP8/?p=0"),
+            None
+        );
+        assert_eq!(
+            bilibili_selection_from_url("https://www.bilibili.com/video/BV12TRrBcEP8/?p=invalid"),
+            None
+        );
+        assert!(!is_b23_short_link_url("https://user:pass@b23.tv/abc"));
+    }
+
+    #[test]
     fn routes_bilibili_season_media_and_intl() {
         assert_eq!(
             route_message(
@@ -521,6 +593,27 @@ mod tests {
             !JobRequest::Bilibili {
                 url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
                 selection: Some(BilibiliSelection::Latest)
+            }
+            .requires_bilibili_selection()
+        );
+        assert!(
+            !JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/play/ss12345?ep_id=456".to_string(),
+                selection: None,
+            }
+            .requires_bilibili_selection()
+        );
+        assert!(
+            !JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md12345?ep_id=456".to_string(),
+                selection: None,
+            }
+            .requires_bilibili_selection()
+        );
+        assert!(
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/play/ss12345?ep_id=invalid".to_string(),
+                selection: None,
             }
             .requires_bilibili_selection()
         );
