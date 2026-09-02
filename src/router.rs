@@ -253,12 +253,13 @@ fn is_bilibili_intl_video_url(url: &Url) -> bool {
 pub(crate) fn bilibili_selection_from_url(raw_url: &str) -> Option<BilibiliSelection> {
     let url = Url::parse(raw_url).ok()?;
     let host = url.host_str()?.to_ascii_lowercase();
-    if !is_b23_short_link_url(raw_url)
+    let is_b23_short_link = is_b23_short_link_url(raw_url);
+    if !is_b23_short_link
         && (!domain_or_subdomain(&host, "bilibili.com") || !is_bilibili_standard_video_url(&url))
     {
         return None;
     }
-    if has_positive_episode_id(&url) {
+    if !is_b23_short_link && has_positive_episode_id(&url) {
         return None;
     }
 
@@ -284,6 +285,16 @@ fn has_positive_episode_id(url: &Url) -> bool {
     url.query_pairs().any(|(name, value)| {
         name == "ep_id" && value.parse::<u64>().is_ok_and(|episode_id| episode_id > 0)
     })
+}
+
+pub(crate) fn bilibili_url_has_positive_episode_id(raw_url: &str) -> bool {
+    let Ok(url) = Url::parse(raw_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    domain_or_subdomain(&host, "bilibili.com") && has_positive_episode_id(&url)
 }
 
 fn bilibili_url_requires_selection(raw_url: &str) -> bool {
@@ -544,7 +555,7 @@ mod tests {
         );
         assert_eq!(
             bilibili_selection_from_url("https://b23.tv/abc?ep_id=456&p=3"),
-            None
+            Some(BilibiliSelection::Page(3))
         );
         assert_eq!(
             bilibili_selection_from_url(
